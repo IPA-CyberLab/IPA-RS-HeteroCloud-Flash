@@ -5,6 +5,7 @@ metadata:
 spec:
   group: flash.heterocloud.io
   names:
+    categories: []
     kind: FlashService
     plural: flashservices
     shortNames:
@@ -12,7 +13,8 @@ spec:
     singular: flashservice
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns: []
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for FlashServiceSpec via `CustomResource`
@@ -51,6 +53,12 @@ spec:
                       type: string
                     default: {}
                     type: object
+                  ephemeral_storage_gib:
+                    default: 20
+                    format: uint32
+                    maximum: 20.0
+                    minimum: 1.0
+                    type: integer
                   exposure:
                     properties:
                       traffic_mode:

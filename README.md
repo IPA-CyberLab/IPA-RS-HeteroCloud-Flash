@@ -49,10 +49,11 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.7",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.8",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
+  "ephemeral_storage_gib": 20,
   "ports": [
     {
       "name": "game-udp",
@@ -74,8 +75,9 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 `env` is durable management-plane data and is intended only for non-secret
 configuration. Application credentials must not be placed in a Flash spec.
 The management API assigns each service port from the cluster range. A single
-container is limited to 4,000 millicores and 8,128 MiB; replica resources count
-toward the organization's 20,000 millicore and 32 GiB limits.
+container is limited to 4,000 millicores, 8,128 MiB, and 20 GiB of ephemeral
+storage. Replica resources count toward the organization's 20,000 millicore,
+32 GiB memory, and 200 GiB ephemeral-storage limits.
 
 ## CLI
 

@@ -10,6 +10,9 @@ pub const MAX_PORTS: usize = 16;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 128;
 pub const MAX_CPU_MILLIS: u32 = 4_000;
 pub const MAX_MEMORY_MIB: u32 = 8_128;
+pub const MIN_EPHEMERAL_STORAGE_GIB: u32 = 1;
+pub const MAX_EPHEMERAL_STORAGE_GIB: u32 = 20;
+pub const DEFAULT_EPHEMERAL_STORAGE_GIB: u32 = 20;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +22,9 @@ pub struct FlashSpec {
     pub replicas: u32,
     pub cpu_millis: u32,
     pub memory_mib: u32,
+    #[serde(default = "default_ephemeral_storage_gib")]
+    #[schemars(range(min = 1, max = 20))]
+    pub ephemeral_storage_gib: u32,
     pub ports: Vec<FlashPort>,
     pub exposure: FlashExposure,
     #[serde(default)]
@@ -56,6 +62,13 @@ impl FlashSpec {
         if !(16..=MAX_MEMORY_MIB).contains(&self.memory_mib) {
             return Err(ValidationError::Field(format!(
                 "memory_mib must be between 16 and {MAX_MEMORY_MIB}"
+            )));
+        }
+        if !(MIN_EPHEMERAL_STORAGE_GIB..=MAX_EPHEMERAL_STORAGE_GIB)
+            .contains(&self.ephemeral_storage_gib)
+        {
+            return Err(ValidationError::Field(format!(
+                "ephemeral_storage_gib must be between {MIN_EPHEMERAL_STORAGE_GIB} and {MAX_EPHEMERAL_STORAGE_GIB}"
             )));
         }
         if self.ports.is_empty() || self.ports.len() > MAX_PORTS {
@@ -112,6 +125,10 @@ impl FlashSpec {
         validate_string_list("args", &self.args, 256)?;
         Ok(())
     }
+}
+
+const fn default_ephemeral_storage_gib() -> u32 {
+    DEFAULT_EPHEMERAL_STORAGE_GIB
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -249,6 +266,7 @@ mod tests {
             replicas: 3,
             cpu_millis: 500,
             memory_mib: 256,
+            ephemeral_storage_gib: 20,
             ports: vec![FlashPort {
                 name: "game-udp".into(),
                 protocol: TransportProtocol::Udp,
@@ -269,6 +287,22 @@ mod tests {
     #[test]
     fn accepts_udp_service() {
         assert!(valid_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn defaults_and_bounds_ephemeral_storage() -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(valid_spec())?;
+        value
+            .as_object_mut()
+            .ok_or("Flash spec must be an object")?
+            .remove("ephemeral_storage_gib");
+        let defaulted = serde_json::from_value::<FlashSpec>(value)?;
+        assert_eq!(defaulted.ephemeral_storage_gib, 20);
+
+        let mut oversized = valid_spec();
+        oversized.ephemeral_storage_gib = 21;
+        assert!(oversized.validate().is_err());
+        Ok(())
     }
 
     #[test]

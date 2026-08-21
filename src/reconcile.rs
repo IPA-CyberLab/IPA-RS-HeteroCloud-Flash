@@ -221,10 +221,12 @@ fn desired_deployment(
             "requests": {
                 "cpu": format!("{}m", workload.cpu_millis),
                 "memory": format!("{}Mi", workload.memory_mib),
+                "ephemeral-storage": format!("{}Gi", workload.ephemeral_storage_gib),
             },
             "limits": {
                 "cpu": format!("{}m", workload.cpu_millis),
                 "memory": format!("{}Mi", workload.memory_mib),
+                "ephemeral-storage": format!("{}Gi", workload.ephemeral_storage_gib),
             }
         },
         "securityContext": {
@@ -549,6 +551,7 @@ mod tests {
                     replicas: 3,
                     cpu_millis: 250,
                     memory_mib: 128,
+                    ephemeral_storage_gib: 20,
                     ports: vec![FlashPort {
                         name: "game-udp".into(),
                         protocol: TransportProtocol::Udp,
@@ -619,6 +622,14 @@ mod tests {
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/runAsGroup"),
             Some(&json!(65532))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/containers/0/resources/requests/ephemeral-storage"),
+            Some(&json!("20Gi"))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/containers/0/resources/limits/ephemeral-storage"),
+            Some(&json!("20Gi"))
         );
         Ok(())
     }
