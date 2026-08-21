@@ -229,6 +229,9 @@ fn desired_deployment(
         },
         "securityContext": {
             "allowPrivilegeEscalation": false,
+            "runAsNonRoot": true,
+            "runAsUser": 65532,
+            "runAsGroup": 65532,
             "capabilities": {"drop": ["ALL"]},
         }
     });
@@ -261,6 +264,9 @@ fn desired_deployment(
                     "enableServiceLinks": false,
                     "terminationGracePeriodSeconds": 30,
                     "securityContext": {
+                        "runAsNonRoot": true,
+                        "runAsUser": 65532,
+                        "runAsGroup": 65532,
                         "seccompProfile": {"type": "RuntimeDefault"}
                     },
                     "topologySpreadConstraints": [{
@@ -304,6 +310,35 @@ fn workload_failure_message(pods: &[Pod]) -> Option<String> {
             ));
         }
         for container in status.container_statuses.iter().flatten() {
+            if let Some(terminated) = container
+                .state
+                .as_ref()
+                .and_then(|state| state.terminated.as_ref())
+                .or_else(|| {
+                    container
+                        .last_state
+                        .as_ref()
+                        .and_then(|state| state.terminated.as_ref())
+                })
+            {
+                let detail = terminated
+                    .message
+                    .as_deref()
+                    .or(terminated.reason.as_deref())
+                    .unwrap_or("the image process stopped");
+                return Some(if terminated.exit_code == 0 {
+                    format!(
+                        "pod {} exited: {detail}; configure a long-running command for this service",
+                        pod.name_any()
+                    )
+                } else {
+                    format!(
+                        "pod {} exited with code {}: {detail}",
+                        pod.name_any(),
+                        terminated.exit_code
+                    )
+                });
+            }
             let Some(waiting) = container
                 .state
                 .as_ref()
@@ -575,8 +610,15 @@ mod tests {
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/runAsNonRoot"),
-            None,
-            "OCI images may select their own user inside the gVisor sandbox"
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/containers/0/securityContext/runAsUser"),
+            Some(&json!(65532))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/containers/0/securityContext/runAsGroup"),
+            Some(&json!(65532))
         );
         Ok(())
     }
@@ -631,6 +673,40 @@ mod tests {
             }
         }))?;
         assert_eq!(workload_failure_message(&[pod]), None);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_images_whose_default_process_exits() -> Result<(), Box<dyn std::error::Error>> {
+        let pod: Pod = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "flash-test-abc"},
+            "status": {
+                "containerStatuses": [{
+                    "name": "workload",
+                    "image": "ubuntu:22.04",
+                    "imageID": "example",
+                    "ready": false,
+                    "restartCount": 1,
+                    "started": false,
+                    "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                    "lastState": {
+                        "terminated": {
+                            "containerID": "containerd://example",
+                            "exitCode": 0,
+                            "finishedAt": "2026-08-21T00:00:01Z",
+                            "reason": "Completed",
+                            "startedAt": "2026-08-21T00:00:00Z"
+                        }
+                    }
+                }]
+            }
+        }))?;
+        let Some(message) = workload_failure_message(&[pod]) else {
+            return Err(std::io::Error::other("missing process exit failure").into());
+        };
+        assert!(message.contains("configure a long-running command"));
         Ok(())
     }
 
