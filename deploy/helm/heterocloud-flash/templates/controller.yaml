@@ -61,7 +61,7 @@ spec:
         - name: registry-auth
           secret:
             secretName: {{ required "registry.authSecretName is required" .Values.registry.authSecretName }}
-            defaultMode: 0400
+            defaultMode: 0440
             items:
               - key: {{ required "registry.passwordKey is required" .Values.registry.passwordKey }}
                 path: password
