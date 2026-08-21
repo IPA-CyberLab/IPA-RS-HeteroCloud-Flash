@@ -1,0 +1,28 @@
+{
+  "region": "heteronet-global",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.0",
+  "replicas": 3,
+  "cpu_millis": 250,
+  "memory_mib": 128,
+  "ports": [
+    {
+      "name": "game-udp",
+      "protocol": "udp",
+      "container_port": 7777,
+      "service_port": 7777
+    }
+  ],
+  "exposure": {
+    "type": "public",
+    "traffic_mode": "forwarded"
+  },
+  "env": {
+    "FLASH_ECHO_LISTEN": "0.0.0.0:7777"
+  },
+  "command": [
+    "/usr/local/bin/flash-udp-echo"
+  ],
+  "args": [],
+  "metadata": {}
+}
+

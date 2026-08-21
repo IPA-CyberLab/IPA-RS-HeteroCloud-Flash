@@ -1,0 +1,26 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "flash.fullname" . }}-api
+  labels:
+    {{- include "flash.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ div (add (int .Values.api.replicaCount) 1) 2 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "flash.name" . }}
+      app.kubernetes.io/component: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "flash.fullname" . }}-controller
+  labels:
+    {{- include "flash.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "flash.name" . }}
+      app.kubernetes.io/component: controller
+

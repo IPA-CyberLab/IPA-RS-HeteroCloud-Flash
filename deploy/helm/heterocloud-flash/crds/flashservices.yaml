@@ -1,0 +1,194 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: flashservices.flash.heterocloud.io
+spec:
+  group: flash.heterocloud.io
+  names:
+    categories: []
+    kind: FlashService
+    plural: flashservices
+    shortNames:
+    - flash
+    singular: flashservice
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FlashServiceSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              desired_generation:
+                format: int64
+                type: integer
+              display_name:
+                type: string
+              organization_id:
+                type: string
+              project_id:
+                type: string
+              service_instance_id:
+                type: string
+              workload:
+                properties:
+                  args:
+                    default: []
+                    items:
+                      type: string
+                    type: array
+                  command:
+                    default: []
+                    items:
+                      type: string
+                    type: array
+                  cpu_millis:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  env:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                  exposure:
+                    properties:
+                      traffic_mode:
+                        enum:
+                        - forwarded
+                        - direct
+                        type: string
+                      type:
+                        enum:
+                        - internal
+                        - public
+                        type: string
+                    required:
+                    - traffic_mode
+                    - type
+                    type: object
+                  image:
+                    type: string
+                  memory_mib:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  metadata:
+                    additionalProperties: true
+                    default: {}
+                    type: object
+                  ports:
+                    items:
+                      properties:
+                        container_port:
+                          format: uint16
+                          maximum: 65535.0
+                          minimum: 0.0
+                          type: integer
+                        name:
+                          type: string
+                        protocol:
+                          enum:
+                          - tcp
+                          - udp
+                          type: string
+                        service_port:
+                          format: uint16
+                          maximum: 65535.0
+                          minimum: 0.0
+                          type: integer
+                      required:
+                      - container_port
+                      - name
+                      - protocol
+                      - service_port
+                      type: object
+                    type: array
+                  region:
+                    type: string
+                  replicas:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                required:
+                - cpu_millis
+                - exposure
+                - image
+                - memory_mib
+                - ports
+                - region
+                - replicas
+                type: object
+            required:
+            - desired_generation
+            - display_name
+            - organization_id
+            - project_id
+            - service_instance_id
+            - workload
+            type: object
+          status:
+            nullable: true
+            properties:
+              desired_replicas:
+                format: int32
+                type: integer
+              endpoints:
+                default: []
+                items:
+                  properties:
+                    host:
+                      type: string
+                    name:
+                      type: string
+                    port:
+                      format: uint16
+                      maximum: 65535.0
+                      minimum: 0.0
+                      type: integer
+                    protocol:
+                      enum:
+                      - tcp
+                      - udp
+                      type: string
+                  required:
+                  - host
+                  - name
+                  - port
+                  - protocol
+                  type: object
+                type: array
+              message:
+                nullable: true
+                type: string
+              observed_generation:
+                format: int64
+                type: integer
+              phase:
+                enum:
+                - provisioning
+                - ready
+                - error
+                type: string
+              ready_replicas:
+                format: int32
+                type: integer
+              runtime_class:
+                type: string
+            required:
+            - desired_replicas
+            - observed_generation
+            - phase
+            - ready_replicas
+            - runtime_class
+            type: object
+        required:
+        - spec
+        title: FlashService
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

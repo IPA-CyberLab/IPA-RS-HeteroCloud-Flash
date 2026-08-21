@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flash.fullname" . }}-controller
+  labels:
+    {{- include "flash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.controller.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "flash.name" . }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "flash.name" . }}
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/part-of: heterocloud
+    spec:
+      serviceAccountName: {{ include "flash.serviceAccountName" . }}
+      securityContext:
+        {{- include "flash.podSecurityContext" . | nindent 8 }}
+      affinity:
+        {{- include "flash.affinity" (dict "root" . "component" "controller") | nindent 8 }}
+      containers:
+        - name: controller
+          image: {{ include "flash.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/flash-controller"]
+          env:
+            - name: FLASH_WORKLOAD_NAMESPACE
+              value: {{ .Values.workloadNamespace | quote }}
+          securityContext:
+            {{- include "flash.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+

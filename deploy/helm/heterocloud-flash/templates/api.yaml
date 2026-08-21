@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flash.fullname" . }}-api
+  labels:
+    {{- include "flash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.api.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "flash.name" . }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "flash.name" . }}
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: heterocloud
+    spec:
+      serviceAccountName: {{ include "flash.serviceAccountName" . }}
+      securityContext:
+        {{- include "flash.podSecurityContext" . | nindent 8 }}
+      affinity:
+        {{- include "flash.affinity" (dict "root" . "component" "api") | nindent 8 }}
+      containers:
+        - name: api
+          image: {{ include "flash.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/flash-api"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+          env:
+            - name: FLASH_API_BIND_ADDR
+              value: "0.0.0.0:{{ .Values.api.port }}"
+            - name: FLASH_WORKLOAD_NAMESPACE
+              value: {{ .Values.workloadNamespace | quote }}
+            - name: HETEROCLOUD_PROVIDER_ISSUER
+              value: {{ .Values.providerAuth.issuer | quote }}
+            - name: HETEROCLOUD_PROVIDER_AUDIENCE
+              value: {{ .Values.providerAuth.audience | quote }}
+            - name: HETEROCLOUD_PROVIDER_PUBLIC_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "flash.providerSecretName" . }}
+                  key: {{ .Values.providerAuth.publicKeysSecretKey }}
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+          securityContext:
+            {{- include "flash.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flash.fullname" . }}-api
+  labels:
+    {{- include "flash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "flash.name" . }}
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: {{ .Values.api.port }}
+      targetPort: http
+
