@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod crd;
 pub mod domain;
+pub mod image;
 pub mod reconcile;
 
 pub const PROVIDER_RECONCILE_ACTION: &str = "service-instance.reconcile";

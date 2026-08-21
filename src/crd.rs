@@ -35,6 +35,12 @@ pub struct FlashServiceStatus {
     #[serde(default)]
     pub endpoints: Vec<FlashEndpoint>,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writable_storage_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]

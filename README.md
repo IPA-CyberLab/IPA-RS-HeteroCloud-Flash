@@ -43,13 +43,18 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
   reported as service errors instead of remaining in provisioning indefinitely.
   Transient provisioning returns `503 Retry-After` to the transactional Outbox
   and is retried without losing desired state.
+- Before creating a Deployment, the controller resolves the OCI image, charges
+  its config and compressed layer bytes against the configured disk limit, and
+  pins the workload to the inspected digest. An image that fills or exceeds the
+  limit is rejected without starting a container; the remaining bytes become
+  the container's writable ephemeral-storage limit.
 
 ## Flash spec
 
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.8",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.9",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -75,9 +80,9 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 `env` is durable management-plane data and is intended only for non-secret
 configuration. Application credentials must not be placed in a Flash spec.
 The management API assigns each service port from the cluster range. A single
-container is limited to 4,000 millicores, 8,128 MiB, and 20 GiB of ephemeral
-storage. Replica resources count toward the organization's 20,000 millicore,
-32 GiB memory, and 200 GiB ephemeral-storage limits.
+container is limited to 4,000 millicores, 8,128 MiB, and 20 GiB of total logical
+disk including the OCI image. Replica resources count toward the organization's
+20,000 millicore, 32 GiB memory, and 200 GiB disk limits.
 
 ## CLI
 

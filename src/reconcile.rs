@@ -25,6 +25,7 @@ use crate::{
     LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME, TRAFFIC_MODE_ANNOTATION,
     crd::{FlashEndpoint, FlashService, FlashServicePhase, FlashServiceStatus},
     domain::{ExposureType, TrafficMode},
+    image::{GIB_BYTES, ImageInspection, ImageInspector},
 };
 
 const FIELD_MANAGER: &str = "heterocloud-flash-controller";
@@ -33,12 +34,17 @@ const FIELD_MANAGER: &str = "heterocloud-flash-controller";
 pub struct ControllerContext {
     client: Client,
     namespace: String,
+    image_inspector: ImageInspector,
 }
 
 impl ControllerContext {
     #[must_use]
     pub fn new(client: Client, namespace: String) -> Self {
-        Self { client, namespace }
+        Self {
+            client,
+            namespace,
+            image_inspector: ImageInspector::new(),
+        }
     }
 }
 
@@ -75,9 +81,10 @@ async fn reconcile(
     let services = Api::<FlashService>::namespaced(context.client.clone(), &context.namespace);
 
     if let Err(error) = flash.spec.workload.validate() {
-        patch_status(
+        patch_status_if_changed(
             &services,
             &name,
+            flash.status.as_ref(),
             FlashServiceStatus {
                 phase: FlashServicePhase::Error,
                 observed_generation: flash.spec.desired_generation,
@@ -91,10 +98,89 @@ async fn reconcile(
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
+    let desired_replicas = i32::try_from(flash.spec.workload.replicas)
+        .map_err(|_| ReconcileError::InvalidReplicaCount)?;
+    let disk_budget_bytes = u64::from(flash.spec.workload.ephemeral_storage_gib)
+        .checked_mul(GIB_BYTES)
+        .ok_or(ReconcileError::StorageBudgetOverflow)?;
+    let inspection = if let Some(inspection) = cached_image_inspection(&flash, disk_budget_bytes) {
+        inspection
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            context
+                .image_inspector
+                .inspect(&flash.spec.workload.image, disk_budget_bytes),
+        )
+        .await
+        {
+            Ok(Ok(inspection)) => inspection,
+            Ok(Err(error)) if error.retryable() => {
+                patch_status_if_changed(
+                    &services,
+                    &name,
+                    flash.status.as_ref(),
+                    FlashServiceStatus {
+                        phase: FlashServicePhase::Provisioning,
+                        observed_generation: flash.spec.desired_generation,
+                        desired_replicas,
+                        runtime_class: RUNTIME_CLASS_NAME.into(),
+                        message: Some(format!("waiting for image inspection: {error}")),
+                        ..FlashServiceStatus::default()
+                    },
+                )
+                .await?;
+                return Ok(Action::requeue(Duration::from_secs(30)));
+            }
+            Ok(Err(error)) => {
+                suspend_deployment(&context.client, &context.namespace, &name).await?;
+                patch_status_if_changed(
+                    &services,
+                    &name,
+                    flash.status.as_ref(),
+                    FlashServiceStatus {
+                        phase: FlashServicePhase::Error,
+                        observed_generation: flash.spec.desired_generation,
+                        desired_replicas,
+                        runtime_class: RUNTIME_CLASS_NAME.into(),
+                        message: Some(error.to_string()),
+                        ..FlashServiceStatus::default()
+                    },
+                )
+                .await?;
+                return Ok(Action::await_change());
+            }
+            Err(_) => {
+                patch_status_if_changed(
+                    &services,
+                    &name,
+                    flash.status.as_ref(),
+                    FlashServiceStatus {
+                        phase: FlashServicePhase::Provisioning,
+                        observed_generation: flash.spec.desired_generation,
+                        desired_replicas,
+                        runtime_class: RUNTIME_CLASS_NAME.into(),
+                        message: Some(
+                            "waiting for image inspection: OCI registry request timed out".into(),
+                        ),
+                        ..FlashServiceStatus::default()
+                    },
+                )
+                .await?;
+                return Ok(Action::requeue(Duration::from_secs(30)));
+            }
+        }
+    };
+
     let owner = flash
         .controller_owner_ref(&())
         .ok_or(ReconcileError::MissingOwnerReference)?;
-    let deployment = desired_deployment(&flash, &owner)?;
+    let deployment = desired_deployment(
+        &flash,
+        &owner,
+        &inspection.resolved_image,
+        inspection.writable_storage_bytes,
+    )?;
     let network_service = desired_service(&flash, &owner)?;
     let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
     let network_services = Api::<Service>::namespaced(context.client.clone(), &context.namespace);
@@ -107,8 +193,6 @@ async fn reconcile(
         .patch(&name, &params, &Patch::Apply(&network_service))
         .await?;
 
-    let desired_replicas = i32::try_from(flash.spec.workload.replicas)
-        .map_err(|_| ReconcileError::InvalidReplicaCount)?;
     let ready_replicas = deployment
         .status
         .as_ref()
@@ -147,10 +231,11 @@ async fn reconcile(
                 )
             })
         }),
+        resolved_image: Some(inspection.resolved_image),
+        image_size_bytes: Some(inspection.image_size_bytes),
+        writable_storage_bytes: Some(inspection.writable_storage_bytes),
     };
-    if flash.status.as_ref() != Some(&status) {
-        patch_status(&services, &name, status).await?;
-    }
+    patch_status_if_changed(&services, &name, flash.status.as_ref(), status).await?;
     if ready {
         Ok(Action::await_change())
     } else {
@@ -182,9 +267,23 @@ async fn patch_status(
     Ok(())
 }
 
+async fn patch_status_if_changed(
+    services: &Api<FlashService>,
+    name: &str,
+    current: Option<&FlashServiceStatus>,
+    status: FlashServiceStatus,
+) -> Result<(), ReconcileError> {
+    if current != Some(&status) {
+        patch_status(services, name, status).await?;
+    }
+    Ok(())
+}
+
 fn desired_deployment(
     flash: &FlashService,
     owner: &OwnerReference,
+    resolved_image: &str,
+    writable_storage_bytes: u64,
 ) -> Result<Deployment, ReconcileError> {
     let name = flash.name_any();
     let workload = &flash.spec.workload;
@@ -213,7 +312,7 @@ fn desired_deployment(
         .collect::<Vec<_>>();
     let mut container = json!({
         "name": "workload",
-        "image": workload.image,
+        "image": resolved_image,
         "imagePullPolicy": "IfNotPresent",
         "ports": ports,
         "env": env,
@@ -221,12 +320,12 @@ fn desired_deployment(
             "requests": {
                 "cpu": format!("{}m", workload.cpu_millis),
                 "memory": format!("{}Mi", workload.memory_mib),
-                "ephemeral-storage": format!("{}Gi", workload.ephemeral_storage_gib),
+                "ephemeral-storage": writable_storage_bytes.to_string(),
             },
             "limits": {
                 "cpu": format!("{}m", workload.cpu_millis),
                 "memory": format!("{}Mi", workload.memory_mib),
-                "ephemeral-storage": format!("{}Gi", workload.ephemeral_storage_gib),
+                "ephemeral-storage": writable_storage_bytes.to_string(),
             }
         },
         "securityContext": {
@@ -282,6 +381,48 @@ fn desired_deployment(
             }
         }
     }))
+}
+
+fn cached_image_inspection(
+    flash: &FlashService,
+    disk_budget_bytes: u64,
+) -> Option<ImageInspection> {
+    let status = flash.status.as_ref()?;
+    if status.observed_generation != flash.spec.desired_generation {
+        return None;
+    }
+    let resolved_image = status.resolved_image.clone()?;
+    let image_size_bytes = status.image_size_bytes?;
+    let writable_storage_bytes = status.writable_storage_bytes?;
+    let expected_writable = disk_budget_bytes.checked_sub(image_size_bytes)?;
+    if image_size_bytes >= disk_budget_bytes || writable_storage_bytes != expected_writable {
+        return None;
+    }
+    Some(ImageInspection {
+        resolved_image,
+        image_size_bytes,
+        writable_storage_bytes,
+    })
+}
+
+async fn suspend_deployment(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ReconcileError> {
+    let deployments = Api::<Deployment>::namespaced(client.clone(), namespace);
+    if deployments.get_opt(name).await?.is_some_and(|deployment| {
+        deployment.spec.as_ref().and_then(|spec| spec.replicas) != Some(0)
+    }) {
+        deployments
+            .patch(
+                name,
+                &PatchParams::default(),
+                &Patch::Merge(json!({"spec": {"replicas": 0}})),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 fn workload_failure_message(pods: &[Pod]) -> Option<String> {
@@ -513,6 +654,8 @@ pub enum ReconcileError {
     MissingOwnerReference,
     #[error("replica count cannot be represented by Kubernetes")]
     InvalidReplicaCount,
+    #[error("disk budget cannot be represented in bytes")]
+    StorageBudgetOverflow,
     #[error(transparent)]
     Kubernetes(#[from] kube::Error),
     #[error(transparent)]
@@ -587,6 +730,8 @@ mod tests {
         let value = serde_json::to_value(desired_deployment(
             &service(TrafficMode::Forwarded),
             &owner(),
+            "example.invalid/udp@sha256:verified",
+            20 * 1024 * 1024 * 1024 - 600,
         )?)?;
         assert_eq!(
             value.pointer("/spec/template/spec/runtimeClassName"),
@@ -625,11 +770,15 @@ mod tests {
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/resources/requests/ephemeral-storage"),
-            Some(&json!("20Gi"))
+            Some(&json!((20_u64 * 1024 * 1024 * 1024 - 600).to_string()))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/resources/limits/ephemeral-storage"),
-            Some(&json!("20Gi"))
+            Some(&json!((20_u64 * 1024 * 1024 * 1024 - 600).to_string()))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/containers/0/image"),
+            Some(&json!("example.invalid/udp@sha256:verified"))
         );
         Ok(())
     }

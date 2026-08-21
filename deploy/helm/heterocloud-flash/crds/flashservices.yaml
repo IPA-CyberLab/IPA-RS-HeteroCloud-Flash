@@ -166,6 +166,11 @@ spec:
                   - protocol
                   type: object
                 type: array
+              image_size_bytes:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               message:
                 nullable: true
                 type: string
@@ -181,8 +186,16 @@ spec:
               ready_replicas:
                 format: int32
                 type: integer
+              resolved_image:
+                nullable: true
+                type: string
               runtime_class:
                 type: string
+              writable_storage_bytes:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
             required:
             - desired_replicas
             - observed_generation
