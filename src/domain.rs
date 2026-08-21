@@ -108,7 +108,7 @@ impl FlashSpec {
                 )));
             }
         }
-        validate_string_list("command", &self.command, 64)?;
+        validate_string_list("command", &self.command, 128)?;
         validate_string_list("args", &self.args, 256)?;
         Ok(())
     }

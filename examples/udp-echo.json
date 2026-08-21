@@ -1,6 +1,6 @@
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.0",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.1",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -25,4 +25,3 @@
   "args": [],
   "metadata": {}
 }
-

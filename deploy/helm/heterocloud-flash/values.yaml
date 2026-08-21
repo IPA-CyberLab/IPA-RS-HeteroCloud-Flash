@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash
-  tag: "0.1.0"
+  tag: "0.1.1"
   pullPolicy: IfNotPresent
 
 api:
@@ -47,4 +47,3 @@ serviceAccount:
 
 nodeSelector: {}
 tolerations: []
-

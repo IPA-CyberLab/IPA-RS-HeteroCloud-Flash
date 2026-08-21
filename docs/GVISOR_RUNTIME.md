@@ -61,6 +61,28 @@ Run the read-only host check after installation:
 sudo ./scripts/check-gvisor.sh
 ```
 
+When SSH sudo is intentionally unavailable but Kubernetes administration is
+available, the same host installer can be applied one node at a time through a
+temporary privileged bootstrap Pod:
+
+```bash
+sudo ./scripts/rollout-gvisor-kubernetes.sh node-a node-b
+```
+
+The helper waits for one node to pass the full host check before moving to the
+next node, labels only successful nodes with
+`flash.heterocloud.io/gvisor-ready=true`, and removes its Pod and ConfigMap.
+The privilege is limited to the explicitly named bootstrap namespace and is
+not used by tenant workloads.
+
+After host installation, verify the CRI path itself on every node. This starts
+one restricted Pod per node, requires the sandbox kernel banner, and removes
+the scheduling label again if any node fails:
+
+```bash
+sudo ./scripts/verify-gvisor-kubernetes.sh node-a node-b
+```
+
 It verifies Ubuntu and CPU support, the signed official repository, installed
 gVisor binaries, the containerd version, the drop-in import, the effective
 `runsc` handler, and the active containerd service. It exits nonzero if any

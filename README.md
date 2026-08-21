@@ -41,7 +41,7 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.0",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.1",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -101,4 +101,3 @@ Generate the checked-in CRD after changing Rust schema types:
 
 See [gVisor runtime setup](docs/GVISOR_RUNTIME.md) and
 [UDP E2E verification](docs/UDP_E2E.md).
-

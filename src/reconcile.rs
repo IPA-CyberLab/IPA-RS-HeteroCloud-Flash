@@ -301,6 +301,7 @@ fn desired_service(
         "ports": ports,
     });
     if let Some(value) = load_balancer_class {
+        spec["allocateLoadBalancerNodePorts"] = json!(false);
         spec["loadBalancerClass"] = json!(value);
     }
     if let Some(value) = external_traffic_policy {
@@ -505,6 +506,10 @@ mod tests {
         assert_eq!(
             value.pointer("/spec/externalTrafficPolicy"),
             Some(&json!("Cluster"))
+        );
+        assert_eq!(
+            value.pointer("/spec/allocateLoadBalancerNodePorts"),
+            Some(&json!(false))
         );
         assert_eq!(
             value.pointer("/metadata/annotations/networking.heteronetwork.io~1traffic-mode"),
