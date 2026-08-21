@@ -137,7 +137,11 @@ async fn reconcile(
     if flash.status.as_ref() != Some(&status) {
         patch_status(&services, &name, status).await?;
     }
-    Ok(Action::requeue(Duration::from_secs(5)))
+    if ready {
+        Ok(Action::await_change())
+    } else {
+        Ok(Action::requeue(Duration::from_secs(5)))
+    }
 }
 
 fn error_policy(
