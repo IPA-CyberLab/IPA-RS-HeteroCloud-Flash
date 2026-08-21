@@ -32,6 +32,9 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 - Provider commands use 60-second Ed25519 JWTs, exact issuer/audience/action
   checks, opaque tenant identifiers, monotonic generations, and deterministic
   operation IDs.
+- The Web console can open `/bin/sh` in an owned, ready workload Pod. Exec uses
+  a separate IAM action, never exposes Kubernetes credentials, limits each
+  session to 30 minutes, and caps concurrent sessions per provider replica.
 - HeteroCloud marks an instance ready only after the requested gVisor replicas
   and its routable endpoint are ready. Provisioning returns `503 Retry-After`
   to the transactional Outbox and is retried without losing desired state.
@@ -41,7 +44,7 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.3",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.4",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -49,8 +52,7 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
     {
       "name": "game-udp",
       "protocol": "udp",
-      "container_port": 7777,
-      "service_port": 7777
+      "container_port": 7777
     }
   ],
   "exposure": {
@@ -66,6 +68,9 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 
 `env` is durable management-plane data and is intended only for non-secret
 configuration. Application credentials must not be placed in a Flash spec.
+The management API assigns each service port from the cluster range. A single
+container is limited to 4,000 millicores and 8,128 MiB; replica resources count
+toward the organization's 20,000 millicore and 32 GiB limits.
 
 ## CLI
 

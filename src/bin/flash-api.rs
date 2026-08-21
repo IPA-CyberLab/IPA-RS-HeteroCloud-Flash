@@ -1,36 +1,51 @@
-use std::{env, process::ExitCode, sync::Arc};
+use std::{env, process::ExitCode, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{
+        Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
+use futures_util::{SinkExt, StreamExt};
 use heterocloud_flash::{
-    PROVIDER_DELETE_ACTION, PROVIDER_RECONCILE_ACTION, RUNTIME_CLASS_NAME,
+    PROVIDER_DELETE_ACTION, PROVIDER_EXEC_ACTION, PROVIDER_LIST_CONTAINERS_ACTION,
+    PROVIDER_RECONCILE_ACTION, RUNTIME_CLASS_NAME,
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
     crd::{FlashService, FlashServicePhase, FlashServiceSpec},
     domain::FlashSpec,
 };
+use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Api, Client,
-    api::{DeleteParams, ListParams, Patch, PatchParams},
+    api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, TerminalSize},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const FIELD_MANAGER: &str = "heterocloud-flash-provider";
+const MAX_EXEC_SESSION_SECONDS: u64 = 1_800;
+const MAX_EXEC_MESSAGE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct AppState {
     services: Api<FlashService>,
+    pods: Api<Pod>,
     authenticator: ProviderAuthenticator,
+    exec_sessions: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -63,9 +78,16 @@ async fn run() -> Result<()> {
     let client = Client::try_default()
         .await
         .context("create Kubernetes client")?;
+    let max_exec_sessions = env::var("FLASH_MAX_EXEC_SESSIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(1, 256);
     let state = Arc::new(AppState {
-        services: Api::namespaced(client, &namespace),
+        services: Api::namespaced(client.clone(), &namespace),
+        pods: Api::namespaced(client, &namespace),
         authenticator,
+        exec_sessions: Arc::new(Semaphore::new(max_exec_sessions)),
     });
     let app = Router::new()
         .route("/health/live", get(live))
@@ -73,6 +95,14 @@ async fn run() -> Result<()> {
         .route(
             "/internal/v1/service-instances/{service_instance_id}",
             put(reconcile).delete(remove),
+        )
+        .route(
+            "/internal/v1/service-instances/{service_instance_id}/containers",
+            get(list_containers),
+        )
+        .route(
+            "/internal/v1/service-instances/{service_instance_id}/exec",
+            get(exec),
         )
         .with_state(state);
     let listener = TcpListener::bind(&bind_addr)
@@ -212,6 +242,236 @@ async fn remove(
     Err(ApiError::NotReady)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationQuery {
+    generation: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ContainerSummary {
+    name: String,
+    phase: String,
+    ready: bool,
+}
+
+async fn list_containers(
+    State(state): State<Arc<AppState>>,
+    Path(service_instance_id): Path<Uuid>,
+    Query(query): Query<GenerationQuery>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_LIST_CONTAINERS_ACTION)?;
+    validate_command(&claims, service_instance_id, query.generation)?;
+    validate_resource_scope(&state, &claims, service_instance_id, query.generation).await?;
+    let mut containers = state
+        .pods
+        .list(&service_pod_selector(service_instance_id))
+        .await?
+        .items
+        .into_iter()
+        .filter_map(container_summary)
+        .collect::<Vec<_>>();
+    containers.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(Json(json!({ "items": containers })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecQuery {
+    generation: i64,
+    pod: String,
+}
+
+async fn exec(
+    State(state): State<Arc<AppState>>,
+    Path(service_instance_id): Path<Uuid>,
+    Query(query): Query<ExecQuery>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_EXEC_ACTION)?;
+    validate_command(&claims, service_instance_id, query.generation)?;
+    validate_resource_scope(&state, &claims, service_instance_id, query.generation).await?;
+    let pod = state.pods.get(&query.pod).await?;
+    if !pod_belongs_to_service(&pod, service_instance_id) || !pod_is_exec_ready(&pod) {
+        return Err(ApiError::Forbidden);
+    }
+    let permit = Arc::clone(&state.exec_sessions)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::TooManyExecSessions)?;
+    let pods = state.pods.clone();
+    let pod_name = query.pod;
+    Ok(upgrade
+        .max_message_size(MAX_EXEC_MESSAGE_BYTES)
+        .on_upgrade(move |socket| exec_shell(socket, pods, pod_name, permit)))
+}
+
+async fn validate_resource_scope(
+    state: &AppState,
+    claims: &ProviderClaims,
+    service_instance_id: Uuid,
+    generation: i64,
+) -> Result<(), ApiError> {
+    let resource = state
+        .services
+        .get(&resource_name(service_instance_id))
+        .await?;
+    let status = resource.status.as_ref().ok_or(ApiError::NotReady)?;
+    if resource.spec.service_instance_id != service_instance_id.to_string()
+        || resource.spec.organization_id != claims.organization_id.to_string()
+        || resource.spec.project_id != claims.project_id.to_string()
+        || resource.spec.desired_generation != generation
+        || status.phase != FlashServicePhase::Ready
+        || status.observed_generation != generation
+    {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+fn service_pod_selector(service_instance_id: Uuid) -> ListParams {
+    ListParams::default().labels(&format!(
+        "flash.heterocloud.io/instance={service_instance_id}"
+    ))
+}
+
+fn pod_belongs_to_service(pod: &Pod, service_instance_id: Uuid) -> bool {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("flash.heterocloud.io/instance"))
+        .is_some_and(|value| value == &service_instance_id.to_string())
+}
+
+fn pod_is_exec_ready(pod: &Pod) -> bool {
+    pod.metadata.deletion_timestamp.is_none()
+        && pod
+            .status
+            .as_ref()
+            .and_then(|status| status.phase.as_deref())
+            == Some("Running")
+        && pod
+            .status
+            .as_ref()
+            .and_then(|status| status.container_statuses.as_ref())
+            .is_some_and(|statuses| {
+                statuses
+                    .iter()
+                    .any(|container| container.name == "workload" && container.ready)
+            })
+}
+
+fn container_summary(pod: Pod) -> Option<ContainerSummary> {
+    let name = pod.metadata.name?;
+    let status = pod.status?;
+    let phase = status.phase.unwrap_or_else(|| "Unknown".into());
+    let ready = phase == "Running"
+        && status
+            .container_statuses
+            .unwrap_or_default()
+            .iter()
+            .any(|container| container.name == "workload" && container.ready);
+    Some(ContainerSummary { name, phase, ready })
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum TerminalControl {
+    Resize { cols: u16, rows: u16 },
+}
+
+async fn exec_shell(
+    mut socket: WebSocket,
+    pods: Api<Pod>,
+    pod_name: String,
+    _permit: OwnedSemaphorePermit,
+) {
+    let params = AttachParams::interactive_tty()
+        .container("workload")
+        .max_stdin_buf_size(MAX_EXEC_MESSAGE_BYTES)
+        .max_stdout_buf_size(MAX_EXEC_MESSAGE_BYTES);
+    let mut process = match pods.exec(&pod_name, ["/bin/sh"], &params).await {
+        Ok(process) => process,
+        Err(error) => {
+            tracing::warn!(%pod_name, error = %error, "Flash container shell could not be started");
+            let _result = socket
+                .send(Message::Text(
+                    json!({"type": "error", "message": "container shell could not be started"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            let _result = socket.close().await;
+            return;
+        }
+    };
+    let Some(mut stdin) = process.stdin() else {
+        process.abort();
+        let _result = socket.close().await;
+        return;
+    };
+    let Some(mut stdout) = process.stdout() else {
+        process.abort();
+        let _result = socket.close().await;
+        return;
+    };
+    let Some(mut terminal_size) = process.terminal_size() else {
+        process.abort();
+        let _result = socket.close().await;
+        return;
+    };
+    let (mut sender, mut receiver) = socket.split();
+    let session = async {
+        let mut output = vec![0_u8; 8 * 1024];
+        loop {
+            tokio::select! {
+                read = stdout.read(&mut output) => {
+                    let count = read.unwrap_or(0);
+                    if count == 0
+                        || sender.send(Message::Binary(output[..count].to_vec().into())).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                message = receiver.next() => {
+                    match message {
+                        Some(Ok(Message::Binary(input))) => {
+                            if stdin.write_all(&input).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Text(control))) => {
+                            if let Ok(TerminalControl::Resize { cols, rows }) =
+                                serde_json::from_str::<TerminalControl>(&control)
+                                && cols > 0
+                                && rows > 0
+                            {
+                                let _result = terminal_size
+                                    .send(TerminalSize { width: cols, height: rows })
+                                    .await;
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            if sender.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        Some(Ok(Message::Pong(_))) => {}
+                    }
+                }
+            }
+        }
+    };
+    let _result = time::timeout(Duration::from_secs(MAX_EXEC_SESSION_SECONDS), session).await;
+    process.abort();
+}
+
 fn validate_command(
     claims: &ProviderClaims,
     service_instance_id: Uuid,
@@ -267,6 +527,8 @@ enum ApiError {
     Conflict(String),
     #[error("provider command is forbidden")]
     Forbidden,
+    #[error("too many active exec sessions")]
+    TooManyExecSessions,
     #[error("internal provider error")]
     Internal,
     #[error(transparent)]
@@ -282,6 +544,7 @@ impl IntoResponse for ApiError {
             Self::NotReady => (StatusCode::SERVICE_UNAVAILABLE, "operation_in_progress"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "generation_conflict"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::TooManyExecSessions => (StatusCode::TOO_MANY_REQUESTS, "exec_limit_reached"),
             Self::Auth(AuthError::MissingCredentials) => {
                 (StatusCode::UNAUTHORIZED, "missing_credentials")
             }
@@ -332,5 +595,78 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use k8s_openapi::api::core::v1::Pod;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{TerminalControl, container_summary, pod_belongs_to_service, pod_is_exec_ready};
+
+    fn pod(instance_id: Uuid, phase: &str, ready: bool) -> Result<Pod, serde_json::Error> {
+        serde_json::from_value(json!({
+            "metadata": {
+                "name": "flash-workload-abc123",
+                "labels": {"flash.heterocloud.io/instance": instance_id.to_string()}
+            },
+            "status": {
+                "phase": phase,
+                "containerStatuses": [{
+                    "name": "workload",
+                    "image": "example.invalid/workload:test",
+                    "imageID": "",
+                    "ready": ready,
+                    "restartCount": 0,
+                    "started": true,
+                    "state": {"running": {"startedAt": "2026-08-21T00:00:00Z"}}
+                }]
+            }
+        }))
+    }
+
+    #[test]
+    fn exec_requires_owned_running_ready_workload() -> Result<(), Box<dyn std::error::Error>> {
+        let instance_id = Uuid::from_u128(7);
+        let ready = pod(instance_id, "Running", true)?;
+        assert!(pod_belongs_to_service(&ready, instance_id));
+        assert!(pod_is_exec_ready(&ready));
+        assert!(!pod_belongs_to_service(&ready, Uuid::from_u128(8)));
+        assert!(!pod_is_exec_ready(&pod(instance_id, "Pending", true)?));
+        assert!(!pod_is_exec_ready(&pod(instance_id, "Running", false)?));
+        Ok(())
+    }
+
+    #[test]
+    fn container_list_reports_workload_readiness() -> Result<(), Box<dyn std::error::Error>> {
+        let instance_id = Uuid::from_u128(9);
+        let Some(summary) = container_summary(pod(instance_id, "Running", true)?) else {
+            return Err("named pod must have a summary".into());
+        };
+        assert_eq!(summary.name, "flash-workload-abc123");
+        assert_eq!(summary.phase, "Running");
+        assert!(summary.ready);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_resize_control_is_strict() {
+        assert!(matches!(
+            serde_json::from_value::<TerminalControl>(
+                json!({"type": "resize", "cols": 120, "rows": 40})
+            ),
+            Ok(TerminalControl::Resize {
+                cols: 120,
+                rows: 40
+            })
+        ));
+        assert!(
+            serde_json::from_value::<TerminalControl>(
+                json!({"type": "resize", "cols": 120, "rows": 40, "command": "id"})
+            )
+            .is_err()
+        );
     }
 }

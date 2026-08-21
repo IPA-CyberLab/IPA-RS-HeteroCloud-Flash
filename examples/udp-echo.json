@@ -1,6 +1,6 @@
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.3",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.4",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -8,8 +8,7 @@
     {
       "name": "game-udp",
       "protocol": "udp",
-      "container_port": 7777,
-      "service_port": 7777
+      "container_port": 7777
     }
   ],
   "exposure": {

@@ -1,11 +1,12 @@
 image:
   repository: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash
-  tag: "0.1.3"
+  tag: "0.1.4"
   pullPolicy: IfNotPresent
 
 api:
   replicaCount: 3
   port: 8080
+  maxExecSessions: 32
   resources:
     requests:
       cpu: 100m

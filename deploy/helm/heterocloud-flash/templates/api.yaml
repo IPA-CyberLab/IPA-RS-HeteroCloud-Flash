@@ -41,6 +41,8 @@ spec:
               value: "0.0.0.0:{{ .Values.api.port }}"
             - name: FLASH_WORKLOAD_NAMESPACE
               value: {{ .Values.workloadNamespace | quote }}
+            - name: FLASH_MAX_EXEC_SESSIONS
+              value: {{ .Values.api.maxExecSessions | quote }}
             - name: HETEROCLOUD_PROVIDER_ISSUER
               value: {{ .Values.providerAuth.issuer | quote }}
             - name: HETEROCLOUD_PROVIDER_AUDIENCE
@@ -89,4 +91,3 @@ spec:
     - name: http
       port: {{ .Values.api.port }}
       targetPort: http
-
