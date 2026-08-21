@@ -35,24 +35,41 @@ pub struct ControllerContext {
     client: Client,
     namespace: String,
     image_inspector: ImageInspector,
+    registry_pull_secret: Option<String>,
 }
 
 impl ControllerContext {
     #[must_use]
-    pub fn new(client: Client, namespace: String) -> Self {
+    pub fn new(
+        client: Client,
+        namespace: String,
+        image_inspector: ImageInspector,
+        registry_pull_secret: Option<String>,
+    ) -> Self {
         Self {
             client,
             namespace,
-            image_inspector: ImageInspector::new(),
+            image_inspector,
+            registry_pull_secret,
         }
     }
 }
 
-pub async fn run_controller(client: Client, namespace: String) -> Result<()> {
+pub async fn run_controller(
+    client: Client,
+    namespace: String,
+    image_inspector: ImageInspector,
+    registry_pull_secret: Option<String>,
+) -> Result<()> {
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
     let network_services = Api::<Service>::namespaced(client.clone(), &namespace);
-    let context = Arc::new(ControllerContext::new(client, namespace));
+    let context = Arc::new(ControllerContext::new(
+        client,
+        namespace,
+        image_inspector,
+        registry_pull_secret,
+    ));
 
     info!("FlashService controller started");
     Controller::new(services, watcher::Config::default())
@@ -180,6 +197,7 @@ async fn reconcile(
         &owner,
         &inspection.resolved_image,
         inspection.writable_storage_bytes,
+        context.registry_pull_secret.as_deref(),
     )?;
     let network_service = desired_service(&flash, &owner)?;
     let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
@@ -284,6 +302,7 @@ fn desired_deployment(
     owner: &OwnerReference,
     resolved_image: &str,
     writable_storage_bytes: u64,
+    registry_pull_secret: Option<&str>,
 ) -> Result<Deployment, ReconcileError> {
     let name = flash.name_any();
     let workload = &flash.spec.workload;
@@ -342,6 +361,28 @@ fn desired_deployment(
     if !workload.args.is_empty() {
         container["args"] = json!(workload.args);
     }
+    let mut pod_spec = json!({
+        "runtimeClassName": RUNTIME_CLASS_NAME,
+        "automountServiceAccountToken": false,
+        "enableServiceLinks": false,
+        "terminationGracePeriodSeconds": 30,
+        "securityContext": {
+            "runAsNonRoot": true,
+            "runAsUser": 65532,
+            "runAsGroup": 65532,
+            "seccompProfile": {"type": "RuntimeDefault"}
+        },
+        "topologySpreadConstraints": [{
+            "maxSkew": 1,
+            "topologyKey": "kubernetes.io/hostname",
+            "whenUnsatisfiable": "ScheduleAnyway",
+            "labelSelector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}}
+        }],
+        "containers": [container]
+    });
+    if let Some(secret) = registry_pull_secret {
+        pod_spec["imagePullSecrets"] = json!([{"name": secret}]);
+    }
     from_value(json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -359,25 +400,7 @@ fn desired_deployment(
             "selector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}},
             "template": {
                 "metadata": {"labels": labels},
-                "spec": {
-                    "runtimeClassName": RUNTIME_CLASS_NAME,
-                    "automountServiceAccountToken": false,
-                    "enableServiceLinks": false,
-                    "terminationGracePeriodSeconds": 30,
-                    "securityContext": {
-                        "runAsNonRoot": true,
-                        "runAsUser": 65532,
-                        "runAsGroup": 65532,
-                        "seccompProfile": {"type": "RuntimeDefault"}
-                    },
-                    "topologySpreadConstraints": [{
-                        "maxSkew": 1,
-                        "topologyKey": "kubernetes.io/hostname",
-                        "whenUnsatisfiable": "ScheduleAnyway",
-                        "labelSelector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}}
-                    }],
-                    "containers": [container]
-                }
+                "spec": pod_spec
             }
         }
     }))
@@ -694,7 +717,7 @@ mod tests {
                     replicas: 3,
                     cpu_millis: 250,
                     memory_mib: 128,
-                    ephemeral_storage_gib: 20,
+                    ephemeral_storage_gib: 10,
                     ports: vec![FlashPort {
                         name: "game-udp".into(),
                         protocol: TransportProtocol::Udp,
@@ -731,7 +754,8 @@ mod tests {
             &service(TrafficMode::Forwarded),
             &owner(),
             "example.invalid/udp@sha256:verified",
-            20 * 1024 * 1024 * 1024 - 600,
+            10 * 1024 * 1024 * 1024 - 600,
+            Some("heterocloud-registry-pull"),
         )?)?;
         assert_eq!(
             value.pointer("/spec/template/spec/runtimeClassName"),
@@ -770,11 +794,15 @@ mod tests {
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/resources/requests/ephemeral-storage"),
-            Some(&json!((20_u64 * 1024 * 1024 * 1024 - 600).to_string()))
+            Some(&json!((10_u64 * 1024 * 1024 * 1024 - 600).to_string()))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/resources/limits/ephemeral-storage"),
-            Some(&json!((20_u64 * 1024 * 1024 * 1024 - 600).to_string()))
+            Some(&json!((10_u64 * 1024 * 1024 * 1024 - 600).to_string()))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/imagePullSecrets/0/name"),
+            Some(&json!("heterocloud-registry-pull"))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/image"),

@@ -11,8 +11,8 @@ pub const MAX_ENVIRONMENT_VARIABLES: usize = 128;
 pub const MAX_CPU_MILLIS: u32 = 4_000;
 pub const MAX_MEMORY_MIB: u32 = 8_128;
 pub const MIN_EPHEMERAL_STORAGE_GIB: u32 = 1;
-pub const MAX_EPHEMERAL_STORAGE_GIB: u32 = 20;
-pub const DEFAULT_EPHEMERAL_STORAGE_GIB: u32 = 20;
+pub const MAX_EPHEMERAL_STORAGE_GIB: u32 = 10;
+pub const DEFAULT_EPHEMERAL_STORAGE_GIB: u32 = 10;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -266,7 +266,7 @@ mod tests {
             replicas: 3,
             cpu_millis: 500,
             memory_mib: 256,
-            ephemeral_storage_gib: 20,
+            ephemeral_storage_gib: 10,
             ports: vec![FlashPort {
                 name: "game-udp".into(),
                 protocol: TransportProtocol::Udp,
@@ -297,10 +297,10 @@ mod tests {
             .ok_or("Flash spec must be an object")?
             .remove("ephemeral_storage_gib");
         let defaulted = serde_json::from_value::<FlashSpec>(value)?;
-        assert_eq!(defaulted.ephemeral_storage_gib, 20);
+        assert_eq!(defaulted.ephemeral_storage_gib, 10);
 
         let mut oversized = valid_spec();
-        oversized.ephemeral_storage_gib = 21;
+        oversized.ephemeral_storage_gib = 11;
         assert!(oversized.validate().is_err());
         Ok(())
     }

@@ -1,10 +1,10 @@
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.9",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.10",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
-  "ephemeral_storage_gib": 20,
+  "ephemeral_storage_gib": 10,
   "ports": [
     {
       "name": "game-udp",

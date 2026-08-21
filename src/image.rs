@@ -20,6 +20,13 @@ pub struct ImageInspection {
 #[derive(Clone)]
 pub struct ImageInspector {
     client: Client,
+    registry_auth: Option<ScopedRegistryAuth>,
+}
+
+#[derive(Clone)]
+struct ScopedRegistryAuth {
+    registry: String,
+    auth: RegistryAuth,
 }
 
 impl ImageInspector {
@@ -33,7 +40,18 @@ impl ImageInspector {
         };
         Self {
             client: Client::new(config),
+            registry_auth: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_basic_auth(registry: String, username: String, password: String) -> Self {
+        let mut inspector = Self::new();
+        inspector.registry_auth = Some(ScopedRegistryAuth {
+            registry,
+            auth: RegistryAuth::Basic(username, password),
+        });
+        inspector
     }
 
     pub async fn inspect(
@@ -47,14 +65,15 @@ impl ImageInspector {
                 reason: error.to_string(),
             }
         })?;
-        let (manifest, digest) = self
-            .client
-            .pull_manifest(&reference, &RegistryAuth::Anonymous)
-            .await
-            .map_err(|error| ImageInspectionError::Registry {
-                image: image.to_owned(),
-                reason: error.to_string(),
-            })?;
+        let auth = self.auth_for(&reference);
+        let (manifest, digest) =
+            self.client
+                .pull_manifest(&reference, &auth)
+                .await
+                .map_err(|error| ImageInspectionError::Registry {
+                    image: image.to_owned(),
+                    reason: error.to_string(),
+                })?;
 
         let image_size_bytes = match manifest {
             OciManifest::Image(manifest) => manifest_size_bytes(&manifest)?,
@@ -79,7 +98,7 @@ impl ImageInspector {
                     let platform_reference = reference.clone_with_digest(entry.digest);
                     let (platform_manifest, _) = self
                         .client
-                        .pull_manifest(&platform_reference, &RegistryAuth::Anonymous)
+                        .pull_manifest(&platform_reference, &auth)
                         .await
                         .map_err(|error| ImageInspectionError::Registry {
                             image: image.to_owned(),
@@ -102,6 +121,19 @@ impl ImageInspector {
             image_size_bytes,
             writable_storage_bytes,
         })
+    }
+
+    fn auth_for(&self, reference: &Reference) -> RegistryAuth {
+        self.registry_auth
+            .as_ref()
+            .filter(|configured| {
+                configured
+                    .registry
+                    .eq_ignore_ascii_case(reference.registry())
+            })
+            .map_or(RegistryAuth::Anonymous, |configured| {
+                configured.auth.clone()
+            })
     }
 }
 

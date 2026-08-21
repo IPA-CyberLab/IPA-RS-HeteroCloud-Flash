@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash
-  tag: "0.1.9"
+  tag: "0.1.10"
   pullPolicy: IfNotPresent
 
 api:
@@ -24,6 +24,14 @@ controller:
     limits:
       cpu: 500m
       memory: 512Mi
+
+registry:
+  enabled: false
+  host: registry.heterocloud.example.com
+  username: admin
+  authSecretName: heterocloud-registry-pull-auth
+  passwordKey: password
+  workloadPullSecretName: heterocloud-registry-pull
 
 providerAuth:
   issuer: heterocloud

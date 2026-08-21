@@ -1,6 +1,7 @@
-use std::{env, process::ExitCode};
+use std::{env, fs, process::ExitCode};
 
 use anyhow::{Context, Result};
+use heterocloud_flash::image::ImageInspector;
 use heterocloud_flash::reconcile::run_controller;
 use tracing_subscriber::EnvFilter;
 
@@ -25,10 +26,49 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let namespace =
         env::var("FLASH_WORKLOAD_NAMESPACE").context("FLASH_WORKLOAD_NAMESPACE is required")?;
+    let registry_host = optional("FLASH_REGISTRY_HOST");
+    let registry_username = optional("FLASH_REGISTRY_USERNAME");
+    let registry_password_file = optional("FLASH_REGISTRY_PASSWORD_FILE");
+    let registry_pull_secret = optional("FLASH_REGISTRY_PULL_SECRET");
+    let configured = [
+        registry_host.is_some(),
+        registry_username.is_some(),
+        registry_password_file.is_some(),
+        registry_pull_secret.is_some(),
+    ];
+    if configured.iter().any(|value| *value) && !configured.iter().all(|value| *value) {
+        anyhow::bail!(
+            "FLASH_REGISTRY_HOST, FLASH_REGISTRY_USERNAME, FLASH_REGISTRY_PASSWORD_FILE and FLASH_REGISTRY_PULL_SECRET must be configured together"
+        );
+    }
+    let image_inspector = match (registry_host, registry_username, registry_password_file) {
+        (Some(host), Some(username), Some(password_file)) => {
+            if host.contains('/') || host.chars().any(char::is_whitespace) {
+                anyhow::bail!("FLASH_REGISTRY_HOST must be a registry host without a URL scheme");
+            }
+            let password = fs::read_to_string(&password_file)
+                .with_context(|| format!("read registry password from {password_file}"))?
+                .trim_end_matches(['\r', '\n'])
+                .to_owned();
+            if username.is_empty() || password.is_empty() {
+                anyhow::bail!("registry username and password must not be empty");
+            }
+            ImageInspector::with_basic_auth(host, username, password)
+        }
+        (None, None, None) => ImageInspector::new(),
+        _ => unreachable!("registry configuration completeness was checked"),
+    };
     let client = kube::Client::try_default()
         .await
         .context("create Kubernetes client")?;
-    run_controller(client, namespace).await
+    run_controller(client, namespace, image_inspector, registry_pull_secret).await
+}
+
+fn optional(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn install_crypto_provider() {

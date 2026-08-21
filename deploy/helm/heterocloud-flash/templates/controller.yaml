@@ -36,10 +36,36 @@ spec:
           env:
             - name: FLASH_WORKLOAD_NAMESPACE
               value: {{ .Values.workloadNamespace | quote }}
+            {{- if .Values.registry.enabled }}
+            - name: FLASH_REGISTRY_HOST
+              value: {{ required "registry.host is required" .Values.registry.host | quote }}
+            - name: FLASH_REGISTRY_USERNAME
+              value: {{ required "registry.username is required" .Values.registry.username | quote }}
+            - name: FLASH_REGISTRY_PASSWORD_FILE
+              value: /var/run/secrets/registry/password
+            - name: FLASH_REGISTRY_PULL_SECRET
+              value: {{ required "registry.workloadPullSecretName is required" .Values.registry.workloadPullSecretName | quote }}
+            {{- end }}
+          {{- if .Values.registry.enabled }}
+          volumeMounts:
+            - name: registry-auth
+              mountPath: /var/run/secrets/registry
+              readOnly: true
+          {{- end }}
           securityContext:
             {{- include "flash.containerSecurityContext" . | nindent 12 }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
+      {{- if .Values.registry.enabled }}
+      volumes:
+        - name: registry-auth
+          secret:
+            secretName: {{ required "registry.authSecretName is required" .Values.registry.authSecretName }}
+            defaultMode: 0400
+            items:
+              - key: {{ required "registry.passwordKey is required" .Values.registry.passwordKey }}
+                path: password
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -48,4 +74,3 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-
