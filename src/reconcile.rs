@@ -3,12 +3,15 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use k8s_openapi::{
-    api::{apps::v1::Deployment, core::v1::Service},
+    api::{
+        apps::v1::Deployment,
+        core::v1::{Pod, Service},
+    },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
-    api::{Patch, PatchParams},
+    api::{ListParams, Patch, PatchParams},
     runtime::{
         controller::{Action, Controller},
         watcher,
@@ -117,8 +120,17 @@ async fn reconcile(
         ExposureType::Public => !endpoints.is_empty(),
     };
     let ready = ready_replicas == desired_replicas && endpoint_ready;
+    let pods = Api::<Pod>::namespaced(context.client.clone(), &context.namespace)
+        .list(&ListParams::default().labels(&format!(
+            "flash.heterocloud.io/instance={}",
+            flash.spec.service_instance_id
+        )))
+        .await?;
+    let failure = workload_failure_message(&pods.items);
     let status = FlashServiceStatus {
-        phase: if ready {
+        phase: if failure.is_some() {
+            FlashServicePhase::Error
+        } else if ready {
             FlashServicePhase::Ready
         } else {
             FlashServicePhase::Provisioning
@@ -128,10 +140,12 @@ async fn reconcile(
         desired_replicas,
         runtime_class: RUNTIME_CLASS_NAME.into(),
         endpoints,
-        message: (!ready).then(|| {
-            format!(
-                "waiting for {desired_replicas} gVisor replicas and a routable service endpoint"
-            )
+        message: failure.or_else(|| {
+            (!ready).then(|| {
+                format!(
+                    "waiting for {desired_replicas} gVisor replicas and a routable service endpoint"
+                )
+            })
         }),
     };
     if flash.status.as_ref() != Some(&status) {
@@ -215,7 +229,6 @@ fn desired_deployment(
         },
         "securityContext": {
             "allowPrivilegeEscalation": false,
-            "runAsNonRoot": true,
             "capabilities": {"drop": ["ALL"]},
         }
     });
@@ -248,7 +261,6 @@ fn desired_deployment(
                     "enableServiceLinks": false,
                     "terminationGracePeriodSeconds": 30,
                     "securityContext": {
-                        "runAsNonRoot": true,
                         "seccompProfile": {"type": "RuntimeDefault"}
                     },
                     "topologySpreadConstraints": [{
@@ -262,6 +274,61 @@ fn desired_deployment(
             }
         }
     }))
+}
+
+fn workload_failure_message(pods: &[Pod]) -> Option<String> {
+    const FAILURE_REASONS: &[&str] = &[
+        "CreateContainerConfigError",
+        "CrashLoopBackOff",
+        "ErrImagePull",
+        "ImagePullBackOff",
+        "InvalidImageName",
+        "RunContainerError",
+    ];
+
+    for pod in pods {
+        let Some(status) = pod.status.as_ref() else {
+            continue;
+        };
+        if let Some(condition) = status.conditions.as_ref().and_then(|conditions| {
+            conditions.iter().find(|condition| {
+                condition.type_ == "PodScheduled"
+                    && condition.status == "False"
+                    && condition.reason.as_deref() == Some("Unschedulable")
+            })
+        }) {
+            return Some(format!(
+                "pod {} is unschedulable: {}",
+                pod.name_any(),
+                condition.message.as_deref().unwrap_or("no eligible node")
+            ));
+        }
+        for container in status.container_statuses.iter().flatten() {
+            let Some(waiting) = container
+                .state
+                .as_ref()
+                .and_then(|state| state.waiting.as_ref())
+            else {
+                continue;
+            };
+            let Some(reason) = waiting
+                .reason
+                .as_deref()
+                .filter(|reason| FAILURE_REASONS.contains(reason))
+            else {
+                continue;
+            };
+            return Some(format!(
+                "pod {} cannot start ({reason}): {}",
+                pod.name_any(),
+                waiting
+                    .message
+                    .as_deref()
+                    .unwrap_or("container startup failed")
+            ));
+        }
+    }
+    None
 }
 
 fn desired_service(
@@ -419,10 +486,11 @@ pub enum ReconcileError {
 mod tests {
     use std::collections::BTreeMap;
 
+    use k8s_openapi::api::core::v1::Pod;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use serde_json::json;
 
-    use super::{desired_deployment, desired_service};
+    use super::{desired_deployment, desired_service, workload_failure_message};
     use crate::{
         LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME,
         crd::{FlashService, FlashServiceSpec},
@@ -495,6 +563,74 @@ mod tests {
             None,
             "Flash must not bypass gVisor netstack"
         );
+        assert_eq!(
+            value.pointer(
+                "/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation"
+            ),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/containers/0/securityContext/capabilities/drop/0"),
+            Some(&json!("ALL"))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/containers/0/securityContext/runAsNonRoot"),
+            None,
+            "OCI images may select their own user inside the gVisor sandbox"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reports_terminal_container_startup_failures() -> Result<(), Box<dyn std::error::Error>> {
+        let pod: Pod = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "flash-test-abc"},
+            "status": {
+                "containerStatuses": [{
+                    "name": "workload",
+                    "image": "example.invalid/test:v1",
+                    "imageID": "",
+                    "ready": false,
+                    "restartCount": 0,
+                    "started": false,
+                    "state": {
+                        "waiting": {
+                            "reason": "CreateContainerConfigError",
+                            "message": "image configuration is incompatible"
+                        }
+                    }
+                }]
+            }
+        }))?;
+        let Some(message) = workload_failure_message(&[pod]) else {
+            return Err(std::io::Error::other("missing startup failure").into());
+        };
+        assert!(message.contains("CreateContainerConfigError"));
+        assert!(message.contains("image configuration is incompatible"));
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_transient_container_creation() -> Result<(), Box<dyn std::error::Error>> {
+        let pod: Pod = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "flash-test-abc"},
+            "status": {
+                "containerStatuses": [{
+                    "name": "workload",
+                    "image": "example.invalid/test:v1",
+                    "imageID": "",
+                    "ready": false,
+                    "restartCount": 0,
+                    "started": false,
+                    "state": {"waiting": {"reason": "ContainerCreating"}}
+                }]
+            }
+        }))?;
+        assert_eq!(workload_failure_message(&[pod]), None);
         Ok(())
     }
 

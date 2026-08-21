@@ -181,11 +181,24 @@ async fn reconcile(
             &Patch::Apply(&desired),
         )
         .await?;
-    let ready = resource.status.as_ref().is_some_and(|status| {
-        status.phase == FlashServicePhase::Ready
-            && status.observed_generation == request.generation
-            && status.runtime_class == RUNTIME_CLASS_NAME
+    let current_status = resource
+        .status
+        .as_ref()
+        .filter(|status| status.observed_generation == request.generation);
+    let ready = current_status.is_some_and(|status| {
+        status.phase == FlashServicePhase::Ready && status.runtime_class == RUNTIME_CLASS_NAME
     });
+    if current_status.is_some_and(|status| status.phase == FlashServicePhase::Error) {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(AcceptedOperation::for_resource(
+                service_instance_id,
+                request.generation,
+                PROVIDER_RECONCILE_ACTION,
+                serde_json::to_value(resource.status).map_err(|_| ApiError::Internal)?,
+            )),
+        ));
+    }
     if !ready {
         return Err(ApiError::NotReady);
     }
