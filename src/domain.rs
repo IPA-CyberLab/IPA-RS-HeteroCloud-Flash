@@ -8,8 +8,8 @@ use thiserror::Error;
 pub const MAX_REPLICAS: u32 = 100;
 pub const MAX_PORTS: usize = 16;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 128;
-pub const MAX_CPU_MILLIS: u32 = 64_000;
-pub const MAX_MEMORY_MIB: u32 = 262_144;
+pub const MAX_CPU_MILLIS: u32 = 4_000;
+pub const MAX_MEMORY_MIB: u32 = 8_128;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
