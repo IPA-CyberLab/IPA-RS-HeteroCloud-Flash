@@ -55,7 +55,7 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.10",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.14",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -69,7 +69,9 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
   ],
   "exposure": {
     "type": "public",
-    "traffic_mode": "forwarded"
+    "traffic_mode": "forwarded",
+    "allowed_source_cidrs": ["203.0.113.0/24"],
+    "denied_source_cidrs": ["203.0.113.128/25"]
   },
   "env": {"FLASH_ECHO_LISTEN": "0.0.0.0:7777"},
   "command": ["/usr/local/bin/flash-udp-echo"],
@@ -80,10 +82,14 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 
 `env` is durable management-plane data and is intended only for non-secret
 configuration. Application credentials must not be placed in a Flash spec.
-The management API assigns each service port from the cluster range. A single
-container is limited to 4,000 millicores, 8,128 MiB, and 20 GiB of total logical
-disk including the OCI image. Replica resources count toward the organization's
-20,000 millicore, 32 GiB memory, and 200 GiB disk limits.
+The management API assigns each service port from the cluster range. Ports can
+be added or removed by updating the service; an unchanged protocol/name pair
+keeps its assigned public port. Source entries accept individual IPv4/IPv6
+addresses or CIDRs. An empty allow list permits every source and deny entries
+always take precedence. A single container is limited to 4,000 millicores,
+8,128 MiB, and 10 GiB of total logical disk including the OCI image. Replica
+resources count toward the organization's 20,000 millicore, 32 GiB memory, and
+100 GiB disk limits.
 
 ## CLI
 

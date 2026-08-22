@@ -6,12 +6,13 @@ use k8s_openapi::{
     api::{
         apps::v1::Deployment,
         core::v1::{Pod, Service},
+        networking::v1::NetworkPolicy,
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
-    api::{ListParams, Patch, PatchParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams},
     runtime::{
         controller::{Action, Controller},
         watcher,
@@ -24,7 +25,7 @@ use tracing::{error, info, warn};
 use crate::{
     LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME, TRAFFIC_MODE_ANNOTATION,
     crd::{FlashEndpoint, FlashService, FlashServicePhase, FlashServiceStatus},
-    domain::{ExposureType, TrafficMode},
+    domain::{ExposureType, TrafficMode, ValidationError},
     image::{GIB_BYTES, ImageInspection, ImageInspector},
 };
 
@@ -64,6 +65,7 @@ pub async fn run_controller(
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
     let network_services = Api::<Service>::namespaced(client.clone(), &namespace);
+    let network_policies = Api::<NetworkPolicy>::namespaced(client.clone(), &namespace);
     let context = Arc::new(ControllerContext::new(
         client,
         namespace,
@@ -75,6 +77,7 @@ pub async fn run_controller(
     Controller::new(services, watcher::Config::default())
         .owns(deployments, watcher::Config::default())
         .owns(network_services, watcher::Config::default())
+        .owns(network_policies, watcher::Config::default())
         .run(reconcile, error_policy, context)
         .for_each(|result| async move {
             match result {
@@ -200,16 +203,29 @@ async fn reconcile(
         context.registry_pull_secret.as_deref(),
     )?;
     let network_service = desired_service(&flash, &owner)?;
+    let network_policy = desired_network_policy(&flash, &owner)?;
     let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
     let network_services = Api::<Service>::namespaced(context.client.clone(), &context.namespace);
+    let network_policies =
+        Api::<NetworkPolicy>::namespaced(context.client.clone(), &context.namespace);
     let params = PatchParams::apply(FIELD_MANAGER).force();
 
+    if let Some(network_policy) = &network_policy {
+        network_policies
+            .patch(&name, &params, &Patch::Apply(network_policy))
+            .await?;
+    }
     let deployment = deployments
         .patch(&name, &params, &Patch::Apply(&deployment))
         .await?;
     let network_service = network_services
         .patch(&name, &params, &Patch::Apply(&network_service))
         .await?;
+    if network_policy.is_none() && network_policies.get_opt(&name).await?.is_some() {
+        network_policies
+            .delete(&name, &DeleteParams::default())
+            .await?;
+    }
 
     let ready_replicas = deployment
         .status
@@ -578,6 +594,18 @@ fn desired_service(
     if let Some(value) = external_traffic_policy {
         spec["externalTrafficPolicy"] = json!(value);
     }
+    if workload.exposure.kind == ExposureType::Public && workload.exposure.has_source_policy() {
+        let mut source_ranges = workload
+            .exposure
+            .effective_source_networks()?
+            .into_iter()
+            .map(|network| network.to_string())
+            .collect::<Vec<_>>();
+        if source_ranges.is_empty() {
+            source_ranges = vec!["0.0.0.0/32".into(), "::/128".into()];
+        }
+        spec["loadBalancerSourceRanges"] = json!(source_ranges);
+    }
     from_value(json!({
         "apiVersion": "v1",
         "kind": "Service",
@@ -589,6 +617,49 @@ fn desired_service(
         },
         "spec": spec,
     }))
+}
+
+fn desired_network_policy(
+    flash: &FlashService,
+    owner: &OwnerReference,
+) -> Result<Option<NetworkPolicy>, ReconcileError> {
+    let exposure = &flash.spec.workload.exposure;
+    // Forwarded public traffic may be SNATed to the ingress node before a Pod
+    // NetworkPolicy is evaluated. The Service firewall handles that path.
+    if !exposure.has_source_policy()
+        || (exposure.kind == ExposureType::Public
+            && exposure.traffic_mode == TrafficMode::Forwarded)
+    {
+        return Ok(None);
+    }
+    let sources = exposure
+        .effective_source_networks()?
+        .into_iter()
+        .map(|network| json!({"ipBlock": {"cidr": network.to_string()}}))
+        .collect::<Vec<_>>();
+    let ingress = if sources.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({"from": sources})]
+    };
+    Ok(Some(from_value(json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": flash.name_any(),
+            "labels": base_labels(flash),
+            "ownerReferences": [owner],
+        },
+        "spec": {
+            "podSelector": {
+                "matchLabels": {
+                    "flash.heterocloud.io/instance": flash.spec.service_instance_id
+                }
+            },
+            "policyTypes": ["Ingress"],
+            "ingress": ingress,
+        }
+    }))?))
 }
 
 fn service_endpoints(flash: &FlashService, service: &Service) -> Vec<FlashEndpoint> {
@@ -682,6 +753,8 @@ pub enum ReconcileError {
     Kubernetes(#[from] kube::Error),
     #[error(transparent)]
     Resource(#[from] anyhow::Error),
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
 }
 
 #[cfg(test)]
@@ -692,7 +765,9 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use serde_json::json;
 
-    use super::{desired_deployment, desired_service, workload_failure_message};
+    use super::{
+        desired_deployment, desired_network_policy, desired_service, workload_failure_message,
+    };
     use crate::{
         LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME,
         crd::{FlashService, FlashServiceSpec},
@@ -726,6 +801,8 @@ mod tests {
                     exposure: FlashExposure {
                         kind: ExposureType::Public,
                         traffic_mode: mode,
+                        allowed_source_cidrs: Vec::new(),
+                        denied_source_cidrs: Vec::new(),
                     },
                     env: BTreeMap::new(),
                     command: Vec::new(),
@@ -934,6 +1011,54 @@ mod tests {
             value.pointer("/metadata/annotations/networking.heteronetwork.io~1traffic-mode"),
             Some(&json!("forwarded"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn source_policy_updates_load_balancer_and_pod_firewalls()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Direct);
+        flash.spec.workload.exposure.allowed_source_cidrs = vec!["192.0.2.0/24".into()];
+        flash.spec.workload.exposure.denied_source_cidrs = vec!["192.0.2.128/25".into()];
+
+        let service = serde_json::to_value(desired_service(&flash, &owner())?)?;
+        assert_eq!(
+            service.pointer("/spec/loadBalancerSourceRanges"),
+            Some(&json!(["192.0.2.0/25"]))
+        );
+
+        let policy = desired_network_policy(&flash, &owner())?
+            .ok_or_else(|| std::io::Error::other("source policy was not created"))?;
+        let policy = serde_json::to_value(policy)?;
+        assert_eq!(
+            policy.pointer("/spec/policyTypes"),
+            Some(&json!(["Ingress"]))
+        );
+        assert_eq!(
+            policy.pointer("/spec/ingress/0/from/0/ipBlock/cidr"),
+            Some(&json!("192.0.2.0/25"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn service_without_source_policy_does_not_install_a_firewall()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let flash = service(TrafficMode::Forwarded);
+        let service = serde_json::to_value(desired_service(&flash, &owner())?)?;
+        assert_eq!(service.pointer("/spec/loadBalancerSourceRanges"), None);
+        assert!(desired_network_policy(&flash, &owner())?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_public_policy_is_enforced_before_source_nat()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.exposure.denied_source_cidrs = vec!["198.51.100.0/24".into()];
+        let service = serde_json::to_value(desired_service(&flash, &owner())?)?;
+        assert!(service.pointer("/spec/loadBalancerSourceRanges").is_some());
+        assert!(desired_network_policy(&flash, &owner())?.is_none());
         Ok(())
     }
 }

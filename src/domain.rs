@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
+use ipnet::IpNet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,6 +10,8 @@ use thiserror::Error;
 pub const MAX_REPLICAS: u32 = 100;
 pub const MAX_PORTS: usize = 16;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 128;
+pub const MAX_SOURCE_CIDRS: usize = 64;
+pub const MAX_EFFECTIVE_SOURCE_CIDRS: usize = 4_096;
 pub const MAX_CPU_MILLIS: u32 = 4_000;
 pub const MAX_MEMORY_MIB: u32 = 8_128;
 pub const MIN_EPHEMERAL_STORAGE_GIB: u32 = 1;
@@ -23,7 +27,7 @@ pub struct FlashSpec {
     pub cpu_millis: u32,
     pub memory_mib: u32,
     #[serde(default = "default_ephemeral_storage_gib")]
-    #[schemars(range(min = 1, max = 20))]
+    #[schemars(range(min = 1, max = 10))]
     pub ephemeral_storage_gib: u32,
     pub ports: Vec<FlashPort>,
     pub exposure: FlashExposure,
@@ -108,6 +112,7 @@ impl FlashSpec {
                 "internal exposure requires forwarded traffic_mode".into(),
             ));
         }
+        self.exposure.effective_source_networks()?;
         if self.env.len() > MAX_ENVIRONMENT_VARIABLES {
             return Err(ValidationError::Field(format!(
                 "env must not contain more than {MAX_ENVIRONMENT_VARIABLES} entries"
@@ -165,6 +170,55 @@ pub struct FlashExposure {
     #[serde(rename = "type")]
     pub kind: ExposureType,
     pub traffic_mode: TrafficMode,
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    pub allowed_source_cidrs: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    pub denied_source_cidrs: Vec<String>,
+}
+
+impl FlashExposure {
+    pub fn source_networks(&self) -> Result<(Vec<IpNet>, Vec<IpNet>), ValidationError> {
+        Ok((
+            parse_source_networks("allowed_source_cidrs", &self.allowed_source_cidrs)?,
+            parse_source_networks("denied_source_cidrs", &self.denied_source_cidrs)?,
+        ))
+    }
+
+    pub fn effective_source_networks(&self) -> Result<Vec<IpNet>, ValidationError> {
+        let (allowed, denied) = self.source_networks()?;
+        let mut effective = if allowed.is_empty() {
+            vec![
+                "0.0.0.0/0"
+                    .parse::<IpNet>()
+                    .map_err(|_| ValidationError::Field("invalid IPv4 root network".into()))?,
+                "::/0"
+                    .parse::<IpNet>()
+                    .map_err(|_| ValidationError::Field("invalid IPv6 root network".into()))?,
+            ]
+        } else {
+            IpNet::aggregate(&allowed)
+        };
+        for denied_network in denied {
+            let mut next = Vec::new();
+            for allowed_network in effective {
+                subtract_network(allowed_network, denied_network, &mut next)?;
+                if next.len() > MAX_EFFECTIVE_SOURCE_CIDRS {
+                    return Err(ValidationError::Field(format!(
+                        "source access policy expands beyond {MAX_EFFECTIVE_SOURCE_CIDRS} CIDRs"
+                    )));
+                }
+            }
+            effective = IpNet::aggregate(&next);
+        }
+        Ok(effective)
+    }
+
+    #[must_use]
+    pub fn has_source_policy(&self) -> bool {
+        !self.allowed_source_cidrs.is_empty() || !self.denied_source_cidrs.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -186,6 +240,61 @@ fn validate_text(name: &str, value: &str, maximum: usize) -> Result<(), Validati
         return Err(ValidationError::Field(format!(
             "{name} must contain between 1 and {maximum} trimmed characters"
         )));
+    }
+    Ok(())
+}
+
+fn parse_source_networks(field: &str, values: &[String]) -> Result<Vec<IpNet>, ValidationError> {
+    if values.len() > MAX_SOURCE_CIDRS {
+        return Err(ValidationError::Field(format!(
+            "{field} must contain at most {MAX_SOURCE_CIDRS} entries"
+        )));
+    }
+    let mut networks = BTreeSet::new();
+    for value in values {
+        if value.is_empty() || value.trim() != value {
+            return Err(ValidationError::Field(format!(
+                "{field} entries must be trimmed IP addresses or CIDRs"
+            )));
+        }
+        let network = value
+            .parse::<IpNet>()
+            .or_else(|_| value.parse::<IpAddr>().map(IpNet::from))
+            .map_err(|_| {
+                ValidationError::Field(format!(
+                    "{field} entry {value:?} must be an IPv4/IPv6 address or CIDR"
+                ))
+            })?
+            .trunc();
+        if !networks.insert(network) {
+            return Err(ValidationError::Field(format!(
+                "{field} must not contain duplicate networks"
+            )));
+        }
+    }
+    Ok(networks.into_iter().collect())
+}
+
+fn subtract_network(
+    allowed: IpNet,
+    denied: IpNet,
+    output: &mut Vec<IpNet>,
+) -> Result<(), ValidationError> {
+    if denied.contains(&allowed) {
+        return Ok(());
+    }
+    if !allowed.contains(&denied) {
+        output.push(allowed);
+        return Ok(());
+    }
+    let child_prefix = allowed.prefix_len().checked_add(1).ok_or_else(|| {
+        ValidationError::Field("source access policy prefix cannot be subdivided".into())
+    })?;
+    let children = allowed.subnets(child_prefix).map_err(|_| {
+        ValidationError::Field("source access policy prefix cannot be subdivided".into())
+    })?;
+    for child in children {
+        subtract_network(child, denied, output)?;
     }
     Ok(())
 }
@@ -276,6 +385,8 @@ mod tests {
             exposure: FlashExposure {
                 kind: ExposureType::Public,
                 traffic_mode: TrafficMode::Forwarded,
+                allowed_source_cidrs: Vec::new(),
+                denied_source_cidrs: Vec::new(),
             },
             env: BTreeMap::new(),
             command: Vec::new(),
@@ -322,6 +433,31 @@ mod tests {
         let mut spec = valid_spec();
         spec.exposure.kind = ExposureType::Internal;
         spec.exposure.traffic_mode = TrafficMode::Direct;
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn source_policy_accepts_addresses_and_applies_denies_first() {
+        let mut spec = valid_spec();
+        spec.exposure.allowed_source_cidrs = vec!["192.0.2.0/24".into()];
+        spec.exposure.denied_source_cidrs = vec!["192.0.2.128/25".into()];
+        assert!(spec.validate().is_ok());
+        assert_eq!(
+            spec.exposure
+                .effective_source_networks()
+                .map(|values| values.into_iter().map(|value| value.to_string()).collect()),
+            Ok(vec!["192.0.2.0/25".to_string()])
+        );
+    }
+
+    #[test]
+    fn source_policy_rejects_invalid_and_duplicate_networks() {
+        let mut spec = valid_spec();
+        spec.exposure.allowed_source_cidrs = vec!["not-an-ip".into()];
+        assert!(spec.validate().is_err());
+
+        let mut spec = valid_spec();
+        spec.exposure.denied_source_cidrs = vec!["203.0.113.7".into(), "203.0.113.7/32".into()];
         assert!(spec.validate().is_err());
     }
 }

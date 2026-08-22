@@ -54,13 +54,25 @@ spec:
                     default: {}
                     type: object
                   ephemeral_storage_gib:
-                    default: 20
+                    default: 10
                     format: uint32
-                    maximum: 20.0
+                    maximum: 10.0
                     minimum: 1.0
                     type: integer
                   exposure:
                     properties:
+                      allowed_source_cidrs:
+                        default: []
+                        items:
+                          type: string
+                        maxItems: 64
+                        type: array
+                      denied_source_cidrs:
+                        default: []
+                        items:
+                          type: string
+                        maxItems: 64
+                        type: array
                       traffic_mode:
                         enum:
                         - forwarded
