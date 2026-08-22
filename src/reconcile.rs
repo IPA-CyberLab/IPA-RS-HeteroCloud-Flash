@@ -348,11 +348,9 @@ fn desired_deployment(
             }
         },
         "securityContext": {
-            "allowPrivilegeEscalation": false,
-            "runAsNonRoot": true,
-            "runAsUser": 65532,
-            "runAsGroup": 65532,
-            "capabilities": {"drop": ["ALL"]},
+            "runAsNonRoot": false,
+            "runAsUser": 0,
+            "runAsGroup": 0,
         }
     });
     if !workload.command.is_empty() {
@@ -367,9 +365,9 @@ fn desired_deployment(
         "enableServiceLinks": false,
         "terminationGracePeriodSeconds": 30,
         "securityContext": {
-            "runAsNonRoot": true,
-            "runAsUser": 65532,
-            "runAsGroup": 65532,
+            "runAsNonRoot": false,
+            "runAsUser": 0,
+            "runAsGroup": 0,
             "seccompProfile": {"type": "RuntimeDefault"}
         },
         "topologySpreadConstraints": [{
@@ -774,23 +772,39 @@ mod tests {
             value.pointer(
                 "/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation"
             ),
-            Some(&json!(false))
+            None
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/capabilities/drop/0"),
-            Some(&json!("ALL"))
+            None
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/runAsNonRoot"),
-            Some(&json!(true))
+            Some(&json!(false))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/runAsUser"),
-            Some(&json!(65532))
+            Some(&json!(0))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/runAsGroup"),
-            Some(&json!(65532))
+            Some(&json!(0))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/securityContext/runAsNonRoot"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/securityContext/runAsUser"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/securityContext/runAsGroup"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/securityContext/seccompProfile/type"),
+            Some(&json!("RuntimeDefault"))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/resources/requests/ephemeral-storage"),
