@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -221,10 +225,15 @@ async fn reconcile(
     let network_service = network_services
         .patch(&name, &params, &Patch::Apply(&network_service))
         .await?;
-    if network_policy.is_none() && network_policies.get_opt(&name).await?.is_some() {
-        network_policies
+    if network_policy.is_none() {
+        match network_policies
             .delete(&name, &DeleteParams::default())
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(response)) if response.code == 404 => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 
     let ready_replicas = deployment
@@ -330,9 +339,11 @@ fn desired_deployment(
             TrafficMode::Direct.as_annotation().into(),
         );
     }
+    let mut seen_ports = BTreeSet::new();
     let ports = workload
         .ports
         .iter()
+        .filter(|port| seen_ports.insert((port.container_port, port.protocol)))
         .map(|port| {
             json!({
                 "name": port.name,
@@ -560,7 +571,7 @@ fn desired_service(
                 "name": port.name,
                 "port": port.service_port,
                 "protocol": port.protocol.as_kubernetes(),
-                "targetPort": port.name,
+                "targetPort": port.container_port,
             })
         })
         .collect::<Vec<_>>();
@@ -899,6 +910,44 @@ mod tests {
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/image"),
             Some(&json!("example.invalid/udp@sha256:verified"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_endpoints_can_share_a_container_port() -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.ports.push(FlashPort {
+            name: "alternate-udp".into(),
+            protocol: TransportProtocol::Udp,
+            container_port: 7777,
+            service_port: 30_001,
+        });
+
+        let deployment = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "example.invalid/udp@sha256:verified",
+            1024,
+            None,
+        )?)?;
+        let service = serde_json::to_value(desired_service(&flash, &owner())?)?;
+
+        assert_eq!(
+            deployment.pointer("/spec/template/spec/containers/0/ports"),
+            Some(&json!([{
+                "name": "game-udp",
+                "containerPort": 7777,
+                "protocol": "UDP"
+            }]))
+        );
+        assert_eq!(
+            service.pointer("/spec/ports/0/targetPort"),
+            Some(&json!(7777))
+        );
+        assert_eq!(
+            service.pointer("/spec/ports/1/targetPort"),
+            Some(&json!(7777))
         );
         Ok(())
     }
