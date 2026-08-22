@@ -253,8 +253,9 @@ async fn reconcile(
         image_size_bytes: Some(inspection.image_size_bytes),
         writable_storage_bytes: Some(inspection.writable_storage_bytes),
     };
+    let settled = status.phase == FlashServicePhase::Ready;
     patch_status_if_changed(&services, &name, flash.status.as_ref(), status).await?;
-    if ready {
+    if settled {
         Ok(Action::await_change())
     } else {
         Ok(Action::requeue(Duration::from_secs(5)))
