@@ -55,7 +55,7 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.15",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.16",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -83,8 +83,9 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 `env` is durable management-plane data and is intended only for non-secret
 configuration. Application credentials must not be placed in a Flash spec.
 The management API assigns each service port from the cluster range. Ports can
-be added or removed by updating the service; an unchanged protocol/name pair
-keeps its assigned public port. Source entries accept individual IPv4/IPv6
+be added or removed by updating the service; removing every endpoint deletes
+the Kubernetes Service while the workload remains running, and an unchanged
+protocol/name pair keeps its assigned public port. Source entries accept individual IPv4/IPv6
 addresses or CIDRs. An empty allow list permits every source and deny entries
 always take precedence. A single container is limited to 4,000 millicores,
 8,128 MiB, and 10 GiB of total logical disk including the OCI image. Replica

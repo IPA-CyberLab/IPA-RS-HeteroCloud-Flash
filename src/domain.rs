@@ -75,9 +75,9 @@ impl FlashSpec {
                 "ephemeral_storage_gib must be between {MIN_EPHEMERAL_STORAGE_GIB} and {MAX_EPHEMERAL_STORAGE_GIB}"
             )));
         }
-        if self.ports.is_empty() || self.ports.len() > MAX_PORTS {
+        if self.ports.len() > MAX_PORTS {
             return Err(ValidationError::Field(format!(
-                "ports must contain between 1 and {MAX_PORTS} entries"
+                "ports must contain at most {MAX_PORTS} entries"
             )));
         }
 
@@ -398,6 +398,13 @@ mod tests {
     #[test]
     fn accepts_udp_service() {
         assert!(valid_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_service_without_endpoints() {
+        let mut spec = valid_spec();
+        spec.ports.clear();
+        assert!(spec.validate().is_ok());
     }
 
     #[test]

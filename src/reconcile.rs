@@ -206,7 +206,7 @@ async fn reconcile(
         inspection.writable_storage_bytes,
         context.registry_pull_secret.as_deref(),
     )?;
-    let network_service = desired_service(&flash, &owner)?;
+    let desired_network_service = desired_service(&flash, &owner)?;
     let network_policy = desired_network_policy(&flash, &owner)?;
     let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
     let network_services = Api::<Service>::namespaced(context.client.clone(), &context.namespace);
@@ -222,9 +222,23 @@ async fn reconcile(
     let deployment = deployments
         .patch(&name, &params, &Patch::Apply(&deployment))
         .await?;
-    let network_service = network_services
-        .patch(&name, &params, &Patch::Apply(&network_service))
-        .await?;
+    let network_service = if let Some(network_service) = &desired_network_service {
+        Some(
+            network_services
+                .patch(&name, &params, &Patch::Apply(network_service))
+                .await?,
+        )
+    } else {
+        match network_services
+            .delete(&name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(response)) if response.code == 404 => {}
+            Err(error) => return Err(error.into()),
+        }
+        None
+    };
     if network_policy.is_none() {
         match network_policies
             .delete(&name, &DeleteParams::default())
@@ -241,11 +255,11 @@ async fn reconcile(
         .as_ref()
         .and_then(|status| status.ready_replicas)
         .unwrap_or(0);
-    let endpoints = service_endpoints(&flash, &network_service);
-    let endpoint_ready = match flash.spec.workload.exposure.kind {
-        ExposureType::Internal => !endpoints.is_empty(),
-        ExposureType::Public => !endpoints.is_empty(),
-    };
+    let endpoints = network_service
+        .as_ref()
+        .map(|service| service_endpoints(&flash, service))
+        .unwrap_or_default();
+    let endpoint_ready = flash.spec.workload.ports.is_empty() || !endpoints.is_empty();
     let ready = ready_replicas == desired_replicas && endpoint_ready;
     let pods = Api::<Pod>::namespaced(context.client.clone(), &context.namespace)
         .list(&ListParams::default().labels(&format!(
@@ -269,9 +283,13 @@ async fn reconcile(
         endpoints,
         message: failure.or_else(|| {
             (!ready).then(|| {
-                format!(
-                    "waiting for {desired_replicas} gVisor replicas and a routable service endpoint"
-                )
+                if flash.spec.workload.ports.is_empty() {
+                    format!("waiting for {desired_replicas} gVisor replicas")
+                } else {
+                    format!(
+                        "waiting for {desired_replicas} gVisor replicas and a routable service endpoint"
+                    )
+                }
             })
         }),
         resolved_image: Some(inspection.resolved_image),
@@ -561,8 +579,11 @@ fn workload_failure_message(pods: &[Pod]) -> Option<String> {
 fn desired_service(
     flash: &FlashService,
     owner: &OwnerReference,
-) -> Result<Service, ReconcileError> {
+) -> Result<Option<Service>, ReconcileError> {
     let workload = &flash.spec.workload;
+    if workload.ports.is_empty() {
+        return Ok(None);
+    }
     let ports = workload
         .ports
         .iter()
@@ -617,7 +638,7 @@ fn desired_service(
         }
         spec["loadBalancerSourceRanges"] = json!(source_ranges);
     }
-    from_value(json!({
+    Ok(Some(from_value(json!({
         "apiVersion": "v1",
         "kind": "Service",
         "metadata": {
@@ -627,7 +648,7 @@ fn desired_service(
             "ownerReferences": [owner],
         },
         "spec": spec,
-    }))
+    }))?))
 }
 
 fn desired_network_policy(
@@ -637,7 +658,8 @@ fn desired_network_policy(
     let exposure = &flash.spec.workload.exposure;
     // Forwarded public traffic may be SNATed to the ingress node before a Pod
     // NetworkPolicy is evaluated. The Service firewall handles that path.
-    if !exposure.has_source_policy()
+    if flash.spec.workload.ports.is_empty()
+        || !exposure.has_source_policy()
         || (exposure.kind == ExposureType::Public
             && exposure.traffic_mode == TrafficMode::Forwarded)
     {
@@ -772,7 +794,7 @@ pub enum ReconcileError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use k8s_openapi::api::core::v1::Pod;
+    use k8s_openapi::api::core::v1::{Pod, Service};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use serde_json::json;
 
@@ -833,6 +855,11 @@ mod tests {
             name: "flash-test".into(),
             uid: "test-uid".into(),
         }
+    }
+
+    fn exposed_service(flash: &FlashService) -> Result<Service, Box<dyn std::error::Error>> {
+        desired_service(flash, &owner())?
+            .ok_or_else(|| std::io::Error::other("expected a Kubernetes Service").into())
     }
 
     #[test]
@@ -931,7 +958,7 @@ mod tests {
             1024,
             None,
         )?)?;
-        let service = serde_json::to_value(desired_service(&flash, &owner())?)?;
+        let service = serde_json::to_value(exposed_service(&flash)?)?;
 
         assert_eq!(
             deployment.pointer("/spec/template/spec/containers/0/ports"),
@@ -1042,8 +1069,7 @@ mod tests {
     #[test]
     fn public_service_uses_heteronetwork_forwarding_policy()
     -> Result<(), Box<dyn std::error::Error>> {
-        let value =
-            serde_json::to_value(desired_service(&service(TrafficMode::Forwarded), &owner())?)?;
+        let value = serde_json::to_value(exposed_service(&service(TrafficMode::Forwarded))?)?;
         assert_eq!(
             value.pointer("/spec/loadBalancerClass"),
             Some(&json!(LOAD_BALANCER_CLASS))
@@ -1070,7 +1096,7 @@ mod tests {
         flash.spec.workload.exposure.allowed_source_cidrs = vec!["192.0.2.0/24".into()];
         flash.spec.workload.exposure.denied_source_cidrs = vec!["192.0.2.128/25".into()];
 
-        let service = serde_json::to_value(desired_service(&flash, &owner())?)?;
+        let service = serde_json::to_value(exposed_service(&flash)?)?;
         assert_eq!(
             service.pointer("/spec/loadBalancerSourceRanges"),
             Some(&json!(["192.0.2.0/25"]))
@@ -1094,7 +1120,7 @@ mod tests {
     fn service_without_source_policy_does_not_install_a_firewall()
     -> Result<(), Box<dyn std::error::Error>> {
         let flash = service(TrafficMode::Forwarded);
-        let service = serde_json::to_value(desired_service(&flash, &owner())?)?;
+        let service = serde_json::to_value(exposed_service(&flash)?)?;
         assert_eq!(service.pointer("/spec/loadBalancerSourceRanges"), None);
         assert!(desired_network_policy(&flash, &owner())?.is_none());
         Ok(())
@@ -1105,9 +1131,31 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut flash = service(TrafficMode::Forwarded);
         flash.spec.workload.exposure.denied_source_cidrs = vec!["198.51.100.0/24".into()];
-        let service = serde_json::to_value(desired_service(&flash, &owner())?)?;
+        let service = serde_json::to_value(exposed_service(&flash)?)?;
         assert!(service.pointer("/spec/loadBalancerSourceRanges").is_some());
         assert!(desired_network_policy(&flash, &owner())?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn service_without_endpoints_has_no_network_resources() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.ports.clear();
+
+        assert!(desired_service(&flash, &owner())?.is_none());
+        assert!(desired_network_policy(&flash, &owner())?.is_none());
+        let deployment = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "example.invalid/udp@sha256:verified",
+            1024,
+            None,
+        )?)?;
+        assert_eq!(
+            deployment.pointer("/spec/template/spec/containers/0/ports"),
+            Some(&json!([]))
+        );
         Ok(())
     }
 }
