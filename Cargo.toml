@@ -1,6 +1,6 @@
 [package]
 name = "heterocloud-flash"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash"

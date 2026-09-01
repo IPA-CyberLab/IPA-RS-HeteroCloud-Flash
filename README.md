@@ -55,7 +55,7 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.16",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.18",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -87,10 +87,9 @@ be added or removed by updating the service; removing every endpoint deletes
 the Kubernetes Service while the workload remains running, and an unchanged
 protocol/name pair keeps its assigned public port. Source entries accept individual IPv4/IPv6
 addresses or CIDRs. An empty allow list permits every source and deny entries
-always take precedence. A single container is limited to 4,000 millicores,
-8,128 MiB, and 10 GiB of total logical disk including the OCI image. Replica
-resources count toward the organization's 20,000 millicore, 32 GiB memory, and
-100 GiB disk limits.
+always take precedence. Per-VM and organization-wide resource limits are
+managed by the HeteroCloud owner quota policy. The OCI image counts toward each
+VM's configured disk limit.
 
 ## CLI
 

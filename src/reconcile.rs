@@ -34,6 +34,7 @@ use crate::{
 };
 
 const FIELD_MANAGER: &str = "heterocloud-flash-controller";
+const GENERATION_LABEL: &str = "flash.heterocloud.io/generation";
 
 #[derive(Clone)]
 pub struct ControllerContext {
@@ -219,7 +220,7 @@ async fn reconcile(
             .patch(&name, &params, &Patch::Apply(network_policy))
             .await?;
     }
-    let deployment = deployments
+    deployments
         .patch(&name, &params, &Patch::Apply(&deployment))
         .await?;
     let network_service = if let Some(network_service) = &desired_network_service {
@@ -250,23 +251,20 @@ async fn reconcile(
         }
     }
 
-    let ready_replicas = deployment
-        .status
-        .as_ref()
-        .and_then(|status| status.ready_replicas)
-        .unwrap_or(0);
     let endpoints = network_service
         .as_ref()
         .map(|service| service_endpoints(&flash, service))
         .unwrap_or_default();
     let endpoint_ready = flash.spec.workload.ports.is_empty() || !endpoints.is_empty();
-    let ready = ready_replicas == desired_replicas && endpoint_ready;
     let pods = Api::<Pod>::namespaced(context.client.clone(), &context.namespace)
         .list(&ListParams::default().labels(&format!(
-            "flash.heterocloud.io/instance={}",
-            flash.spec.service_instance_id
+            "flash.heterocloud.io/instance={},{}={}",
+            flash.spec.service_instance_id, GENERATION_LABEL, flash.spec.desired_generation
         )))
         .await?;
+    let ready_replicas = i32::try_from(pods.items.iter().filter(|pod| pod_is_ready(pod)).count())
+        .unwrap_or(i32::MAX);
+    let ready = ready_replicas == desired_replicas && endpoint_ready;
     let failure = workload_failure_message(&pods.items);
     let status = FlashServiceStatus {
         phase: if failure.is_some() {
@@ -351,6 +349,10 @@ fn desired_deployment(
     let name = flash.name_any();
     let workload = &flash.spec.workload;
     let mut labels = base_labels(flash);
+    labels.insert(
+        GENERATION_LABEL.into(),
+        flash.spec.desired_generation.to_string(),
+    );
     if workload.exposure.traffic_mode == TrafficMode::Direct {
         labels.insert(
             TRAFFIC_MODE_ANNOTATION.into(),
@@ -490,6 +492,19 @@ async fn suspend_deployment(
             .await?;
     }
     Ok(())
+}
+
+fn pod_is_ready(pod: &Pod) -> bool {
+    pod.metadata.deletion_timestamp.is_none()
+        && pod
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.as_ref())
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+            })
 }
 
 fn workload_failure_message(pods: &[Pod]) -> Option<String> {
@@ -874,6 +889,10 @@ mod tests {
         assert_eq!(
             value.pointer("/spec/template/spec/runtimeClassName"),
             Some(&json!(RUNTIME_CLASS_NAME))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/metadata/labels/flash.heterocloud.io~1generation"),
+            Some(&json!("1"))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/ports/0/protocol"),
