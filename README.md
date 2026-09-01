@@ -55,7 +55,7 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.18",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.19",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,

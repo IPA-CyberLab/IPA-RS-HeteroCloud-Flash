@@ -39,6 +39,9 @@ use uuid::Uuid;
 const FIELD_MANAGER: &str = "heterocloud-flash-provider";
 const MAX_EXEC_SESSION_SECONDS: u64 = 1_800;
 const MAX_EXEC_MESSAGE_BYTES: usize = 64 * 1024;
+const EXEC_SHUTDOWN_GRACE_SECONDS: u64 = 2;
+const EXEC_SHELL_SCRIPT: &str =
+    "export TERM=xterm-256color COLORTERM=truecolor LANG=C.UTF-8 LC_ALL=C.UTF-8; exec /bin/sh";
 
 #[derive(Clone)]
 struct AppState {
@@ -408,7 +411,10 @@ async fn exec_shell(
         .container("workload")
         .max_stdin_buf_size(MAX_EXEC_MESSAGE_BYTES)
         .max_stdout_buf_size(MAX_EXEC_MESSAGE_BYTES);
-    let mut process = match pods.exec(&pod_name, ["/bin/sh"], &params).await {
+    let mut process = match pods
+        .exec(&pod_name, ["/bin/sh", "-c", EXEC_SHELL_SCRIPT], &params)
+        .await
+    {
         Ok(process) => process,
         Err(error) => {
             tracing::warn!(%pod_name, error = %error, "Flash container shell could not be started");
@@ -482,6 +488,12 @@ async fn exec_shell(
         }
     };
     let _result = time::timeout(Duration::from_secs(MAX_EXEC_SESSION_SECONDS), session).await;
+    let status = process.take_status();
+    let _result = stdin.shutdown().await;
+    drop(stdin);
+    if let Some(status) = status {
+        let _result = time::timeout(Duration::from_secs(EXEC_SHUTDOWN_GRACE_SECONDS), status).await;
+    }
     process.abort();
 }
 
@@ -617,7 +629,10 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{TerminalControl, container_summary, pod_belongs_to_service, pod_is_exec_ready};
+    use super::{
+        EXEC_SHELL_SCRIPT, TerminalControl, container_summary, pod_belongs_to_service,
+        pod_is_exec_ready,
+    };
 
     fn pod(instance_id: Uuid, phase: &str, ready: bool) -> Result<Pod, serde_json::Error> {
         serde_json::from_value(json!({
@@ -681,5 +696,13 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn exec_shell_uses_utf8_truecolor_terminal_environment() {
+        assert!(EXEC_SHELL_SCRIPT.contains("TERM=xterm-256color"));
+        assert!(EXEC_SHELL_SCRIPT.contains("COLORTERM=truecolor"));
+        assert!(EXEC_SHELL_SCRIPT.contains("LANG=C.UTF-8"));
+        assert!(EXEC_SHELL_SCRIPT.contains("LC_ALL=C.UTF-8"));
     }
 }
