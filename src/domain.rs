@@ -7,15 +7,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-pub const MAX_REPLICAS: u32 = 100;
+// These are provider protocol ceilings, not tenant defaults. HeteroCloud
+// enforces the owner-configured per-tenant quota before emitting a request.
+pub const MAX_REPLICAS: u32 = 100_000;
 pub const MAX_PORTS: usize = 16;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 128;
 pub const MAX_SOURCE_CIDRS: usize = 64;
 pub const MAX_EFFECTIVE_SOURCE_CIDRS: usize = 4_096;
-pub const MAX_CPU_MILLIS: u32 = 4_000;
-pub const MAX_MEMORY_MIB: u32 = 8_128;
+pub const MAX_CPU_MILLIS: u32 = 100_000_000;
+pub const MAX_MEMORY_MIB: u32 = 1_048_576;
 pub const MIN_EPHEMERAL_STORAGE_GIB: u32 = 1;
-pub const MAX_EPHEMERAL_STORAGE_GIB: u32 = 10;
+pub const MAX_EPHEMERAL_STORAGE_GIB: u32 = 1_000_000;
 pub const DEFAULT_EPHEMERAL_STORAGE_GIB: u32 = 10;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -27,7 +29,7 @@ pub struct FlashSpec {
     pub cpu_millis: u32,
     pub memory_mib: u32,
     #[serde(default = "default_ephemeral_storage_gib")]
-    #[schemars(range(min = 1, max = 10))]
+    #[schemars(range(min = 1, max = 1_000_000))]
     pub ephemeral_storage_gib: u32,
     pub ports: Vec<FlashPort>,
     pub exposure: FlashExposure,
@@ -365,7 +367,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ExposureType, FlashExposure, FlashPort, FlashSpec, TrafficMode, TransportProtocol,
+        ExposureType, FlashExposure, FlashPort, FlashSpec, MAX_EPHEMERAL_STORAGE_GIB, TrafficMode,
+        TransportProtocol,
     };
 
     fn valid_spec() -> FlashSpec {
@@ -418,9 +421,18 @@ mod tests {
         assert_eq!(defaulted.ephemeral_storage_gib, 10);
 
         let mut oversized = valid_spec();
-        oversized.ephemeral_storage_gib = 11;
+        oversized.ephemeral_storage_gib = MAX_EPHEMERAL_STORAGE_GIB + 1;
         assert!(oversized.validate().is_err());
         Ok(())
+    }
+
+    #[test]
+    fn accepts_owner_configured_resource_envelope() {
+        let mut spec = valid_spec();
+        spec.cpu_millis = 8_000;
+        spec.memory_mib = 16_384;
+        spec.ephemeral_storage_gib = 30;
+        assert!(spec.validate().is_ok());
     }
 
     #[test]
