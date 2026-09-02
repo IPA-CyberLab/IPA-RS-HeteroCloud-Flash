@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use k8s_openapi::{
     api::{
         apps::v1::Deployment,
-        core::v1::{Pod, Service},
+        core::v1::{PersistentVolumeClaim, Pod, Service},
         networking::v1::NetworkPolicy,
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
@@ -19,6 +19,7 @@ use kube::{
     api::{DeleteParams, ListParams, Patch, PatchParams},
     runtime::{
         controller::{Action, Controller},
+        reflector::ObjectRef,
         watcher,
     },
 };
@@ -35,6 +36,12 @@ use crate::{
 
 const FIELD_MANAGER: &str = "heterocloud-flash-controller";
 const GENERATION_LABEL: &str = "flash.heterocloud.io/generation";
+const PERSISTENT_HOME_VOLUME: &str = "persistent-home";
+const PERSISTENT_HOME_MOUNT_PATH: &str = "/root";
+const MIB_BYTES: u64 = 1024 * 1024;
+const MIN_PERSISTENT_STORAGE_BYTES: u64 = 64 * MIB_BYTES;
+const MIN_ROOTFS_STORAGE_BYTES: u64 = 64 * MIB_BYTES;
+const MAX_ROOTFS_STORAGE_BYTES: u64 = GIB_BYTES;
 
 #[derive(Clone)]
 pub struct ControllerContext {
@@ -42,6 +49,7 @@ pub struct ControllerContext {
     namespace: String,
     image_inspector: ImageInspector,
     registry_pull_secret: Option<String>,
+    persistent_storage_class: Option<String>,
 }
 
 impl ControllerContext {
@@ -51,12 +59,14 @@ impl ControllerContext {
         namespace: String,
         image_inspector: ImageInspector,
         registry_pull_secret: Option<String>,
+        persistent_storage_class: Option<String>,
     ) -> Self {
         Self {
             client,
             namespace,
             image_inspector,
             registry_pull_secret,
+            persistent_storage_class,
         }
     }
 }
@@ -66,16 +76,21 @@ pub async fn run_controller(
     namespace: String,
     image_inspector: ImageInspector,
     registry_pull_secret: Option<String>,
+    persistent_storage_class: Option<String>,
 ) -> Result<()> {
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
     let network_services = Api::<Service>::namespaced(client.clone(), &namespace);
     let network_policies = Api::<NetworkPolicy>::namespaced(client.clone(), &namespace);
+    let persistent_volume_claims =
+        Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace);
+    let pods = Api::<Pod>::namespaced(client.clone(), &namespace);
     let context = Arc::new(ControllerContext::new(
         client,
         namespace,
         image_inspector,
         registry_pull_secret,
+        persistent_storage_class,
     ));
 
     info!("FlashService controller started");
@@ -83,6 +98,8 @@ pub async fn run_controller(
         .owns(deployments, watcher::Config::default())
         .owns(network_services, watcher::Config::default())
         .owns(network_policies, watcher::Config::default())
+        .owns(persistent_volume_claims, watcher::Config::default())
+        .watches(pods, watcher::Config::default(), flash_service_for_pod)
         .run(reconcile, error_policy, context)
         .for_each(|result| async move {
             match result {
@@ -200,11 +217,25 @@ async fn reconcile(
     let owner = flash
         .controller_owner_ref(&())
         .ok_or(ReconcileError::MissingOwnerReference)?;
+    let storage = storage_allocation(
+        inspection.writable_storage_bytes,
+        context.persistent_storage_class.is_some(),
+    )?;
+    let persistent_volume_claim = context
+        .persistent_storage_class
+        .as_deref()
+        .map(|storage_class| {
+            desired_persistent_volume_claim(&flash, &owner, storage_class, storage.persistent_bytes)
+        })
+        .transpose()?;
     let deployment = desired_deployment(
         &flash,
         &owner,
         &inspection.resolved_image,
-        inspection.writable_storage_bytes,
+        storage.rootfs_bytes,
+        persistent_volume_claim
+            .as_ref()
+            .and_then(|claim| claim.metadata.name.as_deref()),
         context.registry_pull_secret.as_deref(),
     )?;
     let desired_network_service = desired_service(&flash, &owner)?;
@@ -213,8 +244,19 @@ async fn reconcile(
     let network_services = Api::<Service>::namespaced(context.client.clone(), &context.namespace);
     let network_policies =
         Api::<NetworkPolicy>::namespaced(context.client.clone(), &context.namespace);
+    let persistent_volume_claims =
+        Api::<PersistentVolumeClaim>::namespaced(context.client.clone(), &context.namespace);
     let params = PatchParams::apply(FIELD_MANAGER).force();
 
+    if let Some(persistent_volume_claim) = &persistent_volume_claim {
+        persistent_volume_claims
+            .patch(
+                &persistent_volume_claim.name_any(),
+                &params,
+                &Patch::Apply(persistent_volume_claim),
+            )
+            .await?;
+    }
     if let Some(network_policy) = &network_policy {
         network_policies
             .patch(&name, &params, &Patch::Apply(network_policy))
@@ -266,30 +308,33 @@ async fn reconcile(
         .unwrap_or(i32::MAX);
     let ready = ready_replicas == desired_replicas && endpoint_ready;
     let failure = workload_failure_message(&pods.items);
-    let status = FlashServiceStatus {
-        phase: if failure.is_some() {
-            FlashServicePhase::Error
-        } else if ready {
-            FlashServicePhase::Ready
+    let restart_warning = workload_restart_message(&pods.items);
+    let phase = if failure.is_some() {
+        FlashServicePhase::Error
+    } else if ready {
+        FlashServicePhase::Ready
+    } else {
+        FlashServicePhase::Provisioning
+    };
+    let message = failure.or_else(|| {
+        if ready {
+            restart_warning
+        } else if flash.spec.workload.ports.is_empty() {
+            Some(format!("waiting for {desired_replicas} gVisor replicas"))
         } else {
-            FlashServicePhase::Provisioning
-        },
+            Some(format!(
+                "waiting for {desired_replicas} gVisor replicas and a routable service endpoint"
+            ))
+        }
+    });
+    let status = FlashServiceStatus {
+        phase,
         observed_generation: flash.spec.desired_generation,
         ready_replicas,
         desired_replicas,
         runtime_class: RUNTIME_CLASS_NAME.into(),
         endpoints,
-        message: failure.or_else(|| {
-            (!ready).then(|| {
-                if flash.spec.workload.ports.is_empty() {
-                    format!("waiting for {desired_replicas} gVisor replicas")
-                } else {
-                    format!(
-                        "waiting for {desired_replicas} gVisor replicas and a routable service endpoint"
-                    )
-                }
-            })
-        }),
+        message,
         resolved_image: Some(inspection.resolved_image),
         image_size_bytes: Some(inspection.image_size_bytes),
         writable_storage_bytes: Some(inspection.writable_storage_bytes),
@@ -343,7 +388,8 @@ fn desired_deployment(
     flash: &FlashService,
     owner: &OwnerReference,
     resolved_image: &str,
-    writable_storage_bytes: u64,
+    rootfs_storage_bytes: u64,
+    persistent_volume_claim: Option<&str>,
     registry_pull_secret: Option<&str>,
 ) -> Result<Deployment, ReconcileError> {
     let name = flash.name_any();
@@ -387,12 +433,12 @@ fn desired_deployment(
             "requests": {
                 "cpu": format!("{}m", workload.cpu_millis),
                 "memory": format!("{}Mi", workload.memory_mib),
-                "ephemeral-storage": writable_storage_bytes.to_string(),
+                "ephemeral-storage": rootfs_storage_bytes.to_string(),
             },
             "limits": {
                 "cpu": format!("{}m", workload.cpu_millis),
                 "memory": format!("{}Mi", workload.memory_mib),
-                "ephemeral-storage": writable_storage_bytes.to_string(),
+                "ephemeral-storage": rootfs_storage_bytes.to_string(),
             }
         },
         "securityContext": {
@@ -406,6 +452,12 @@ fn desired_deployment(
     }
     if !workload.args.is_empty() {
         container["args"] = json!(workload.args);
+    }
+    if persistent_volume_claim.is_some() {
+        container["volumeMounts"] = json!([{
+            "name": PERSISTENT_HOME_VOLUME,
+            "mountPath": PERSISTENT_HOME_MOUNT_PATH,
+        }]);
     }
     let mut pod_spec = json!({
         "runtimeClassName": RUNTIME_CLASS_NAME,
@@ -429,6 +481,12 @@ fn desired_deployment(
     if let Some(secret) = registry_pull_secret {
         pod_spec["imagePullSecrets"] = json!([{"name": secret}]);
     }
+    if let Some(claim_name) = persistent_volume_claim {
+        pod_spec["volumes"] = json!([{
+            "name": PERSISTENT_HOME_VOLUME,
+            "persistentVolumeClaim": {"claimName": claim_name},
+        }]);
+    }
     from_value(json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -449,6 +507,62 @@ fn desired_deployment(
                 "spec": pod_spec
             }
         }
+    }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StorageAllocation {
+    rootfs_bytes: u64,
+    persistent_bytes: u64,
+}
+
+fn storage_allocation(
+    writable_storage_bytes: u64,
+    persistent: bool,
+) -> Result<StorageAllocation, ReconcileError> {
+    if !persistent {
+        return Ok(StorageAllocation {
+            rootfs_bytes: writable_storage_bytes,
+            persistent_bytes: 0,
+        });
+    }
+    let minimum = MIN_ROOTFS_STORAGE_BYTES
+        .checked_add(MIN_PERSISTENT_STORAGE_BYTES)
+        .ok_or(ReconcileError::StorageBudgetOverflow)?;
+    if writable_storage_bytes < minimum {
+        return Err(ReconcileError::InsufficientWritableStorage);
+    }
+    let rootfs_bytes = (writable_storage_bytes / 10)
+        .clamp(MIN_ROOTFS_STORAGE_BYTES, MAX_ROOTFS_STORAGE_BYTES)
+        .min(writable_storage_bytes - MIN_PERSISTENT_STORAGE_BYTES);
+    Ok(StorageAllocation {
+        rootfs_bytes,
+        persistent_bytes: writable_storage_bytes - rootfs_bytes,
+    })
+}
+
+fn desired_persistent_volume_claim(
+    flash: &FlashService,
+    owner: &OwnerReference,
+    storage_class: &str,
+    storage_bytes: u64,
+) -> Result<PersistentVolumeClaim, ReconcileError> {
+    from_value(json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": format!("{}-home", flash.name_any()),
+            "labels": base_labels(flash),
+            "ownerReferences": [owner],
+        },
+        "spec": {
+            "accessModes": ["ReadWriteMany"],
+            "storageClassName": storage_class,
+            "volumeMode": "Filesystem",
+            "resources": {
+                "requests": {"storage": storage_bytes.to_string()},
+            },
+        },
     }))
 }
 
@@ -539,12 +653,6 @@ fn workload_failure_message(pods: &[Pod]) -> Option<String> {
                 .state
                 .as_ref()
                 .and_then(|state| state.terminated.as_ref())
-                .or_else(|| {
-                    container
-                        .last_state
-                        .as_ref()
-                        .and_then(|state| state.terminated.as_ref())
-                })
             {
                 let detail = terminated
                     .message
@@ -589,6 +697,39 @@ fn workload_failure_message(pods: &[Pod]) -> Option<String> {
         }
     }
     None
+}
+
+fn workload_restart_message(pods: &[Pod]) -> Option<String> {
+    for pod in pods.iter().filter(|pod| pod_is_ready(pod)) {
+        let status = pod.status.as_ref()?;
+        for container in status.container_statuses.iter().flatten() {
+            let Some(terminated) = container
+                .last_state
+                .as_ref()
+                .and_then(|state| state.terminated.as_ref())
+            else {
+                continue;
+            };
+            let reason = terminated.reason.as_deref().unwrap_or("process failure");
+            return Some(format!(
+                "pod {} recovered after container restart {} ({reason}, exit code {})",
+                pod.name_any(),
+                container.restart_count,
+                terminated.exit_code
+            ));
+        }
+    }
+    None
+}
+
+fn flash_service_for_pod(pod: Pod) -> Option<ObjectRef<FlashService>> {
+    let service_instance_id = pod
+        .metadata
+        .labels
+        .as_ref()?
+        .get("flash.heterocloud.io/instance")?;
+    let namespace = pod.namespace()?;
+    Some(ObjectRef::new(&format!("flash-{service_instance_id}")).within(&namespace))
 }
 
 fn desired_service(
@@ -797,6 +938,8 @@ pub enum ReconcileError {
     InvalidReplicaCount,
     #[error("disk budget cannot be represented in bytes")]
     StorageBudgetOverflow,
+    #[error("disk budget leaves less than 128 MiB for writable storage")]
+    InsufficientWritableStorage,
     #[error(transparent)]
     Kubernetes(#[from] kube::Error),
     #[error(transparent)]
@@ -814,7 +957,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        desired_deployment, desired_network_policy, desired_service, workload_failure_message,
+        desired_deployment, desired_network_policy, desired_persistent_volume_claim,
+        desired_service, storage_allocation, workload_failure_message, workload_restart_message,
     };
     use crate::{
         LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME,
@@ -884,6 +1028,7 @@ mod tests {
             &owner(),
             "example.invalid/udp@sha256:verified",
             10 * 1024 * 1024 * 1024 - 600,
+            None,
             Some("heterocloud-registry-pull"),
         )?)?;
         assert_eq!(
@@ -976,6 +1121,7 @@ mod tests {
             "example.invalid/udp@sha256:verified",
             1024,
             None,
+            None,
         )?)?;
         let service = serde_json::to_value(exposed_service(&flash)?)?;
 
@@ -994,6 +1140,58 @@ mod tests {
         assert_eq!(
             service.pointer("/spec/ports/1/targetPort"),
             Some(&json!(7777))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_home_and_rootfs_share_the_writable_disk_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let allocation = storage_allocation(10 * 1024 * 1024 * 1024, true)?;
+        assert_eq!(allocation.rootfs_bytes, 1024 * 1024 * 1024);
+        assert_eq!(allocation.persistent_bytes, 9 * 1024 * 1024 * 1024);
+
+        let flash = service(TrafficMode::Forwarded);
+        let claim = desired_persistent_volume_claim(
+            &flash,
+            &owner(),
+            "longhorn-static",
+            allocation.persistent_bytes,
+        )?;
+        let claim = serde_json::to_value(claim)?;
+        assert_eq!(
+            claim.pointer("/spec/accessModes/0"),
+            Some(&json!("ReadWriteMany"))
+        );
+        assert_eq!(
+            claim.pointer("/spec/storageClassName"),
+            Some(&json!("longhorn-static"))
+        );
+        assert_eq!(
+            claim.pointer("/spec/resources/requests/storage"),
+            Some(&json!(allocation.persistent_bytes.to_string()))
+        );
+
+        let deployment = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "example.invalid/udp@sha256:verified",
+            allocation.rootfs_bytes,
+            Some("flash-test-home"),
+            None,
+        )?)?;
+        assert_eq!(
+            deployment.pointer("/spec/template/spec/containers/0/volumeMounts/0/mountPath"),
+            Some(&json!("/root"))
+        );
+        assert_eq!(
+            deployment.pointer("/spec/template/spec/volumes/0/persistentVolumeClaim/claimName"),
+            Some(&json!("flash-test-home"))
+        );
+        assert_eq!(
+            deployment
+                .pointer("/spec/template/spec/containers/0/resources/limits/ephemeral-storage"),
+            Some(&json!(allocation.rootfs_bytes.to_string()))
         );
         Ok(())
     }
@@ -1086,6 +1284,44 @@ mod tests {
     }
 
     #[test]
+    fn reports_a_recovered_oom_without_marking_the_running_pod_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pod: Pod = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "flash-test-abc"},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{
+                    "name": "workload",
+                    "image": "ubuntu:24.04",
+                    "imageID": "example",
+                    "ready": true,
+                    "restartCount": 1,
+                    "started": true,
+                    "state": {"running": {"startedAt": "2026-09-01T22:29:36Z"}},
+                    "lastState": {
+                        "terminated": {
+                            "containerID": "containerd://example",
+                            "exitCode": 128,
+                            "finishedAt": "2026-09-01T22:29:16Z",
+                            "reason": "OOMKilled",
+                            "startedAt": "2026-09-01T03:30:22Z"
+                        }
+                    }
+                }]
+            }
+        }))?;
+        assert_eq!(workload_failure_message(std::slice::from_ref(&pod)), None);
+        let warning = workload_restart_message(&[pod])
+            .ok_or_else(|| std::io::Error::other("missing restart warning"))?;
+        assert!(warning.contains("OOMKilled"));
+        assert!(warning.contains("restart 1"));
+        Ok(())
+    }
+
+    #[test]
     fn public_service_uses_heteronetwork_forwarding_policy()
     -> Result<(), Box<dyn std::error::Error>> {
         let value = serde_json::to_value(exposed_service(&service(TrafficMode::Forwarded))?)?;
@@ -1169,6 +1405,7 @@ mod tests {
             &owner(),
             "example.invalid/udp@sha256:verified",
             1024,
+            None,
             None,
         )?)?;
         assert_eq!(

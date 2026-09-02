@@ -47,15 +47,17 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 - Before creating a Deployment, the controller resolves the OCI image, charges
   its config and compressed layer bytes against the configured disk limit, and
   pins the workload to the inspected digest. An image that fills or exceeds the
-  limit is rejected without starting a container; the remaining bytes become
-  the container's writable ephemeral-storage limit.
+  limit is rejected without starting a container. When persistent storage is
+  enabled, the remaining budget is split between a restart-safe `/root` volume
+  and a bounded writable root filesystem. The volume uses `ReadWriteMany`, so a
+  rolling update starts its replacement before retiring the current Pod.
 
 ## Flash spec
 
 ```json
 {
   "region": "heteronet-global",
-  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.19",
+  "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.20",
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
@@ -90,6 +92,19 @@ addresses or CIDRs. An empty allow list permits every source and deny entries
 always take precedence. Per-VM and organization-wide resource limits are
 managed by the HeteroCloud owner quota policy. The OCI image counts toward each
 VM's configured disk limit.
+
+Production clusters should enable restart-safe Web Shell homes and select a
+CSI storage class that supports `ReadWriteMany`:
+
+```yaml
+persistence:
+  enabled: true
+  storageClass: longhorn-static
+```
+
+Files below `/root` then survive container restarts, Pod replacement, and node
+rescheduling. Other image filesystem changes remain ephemeral. Web Shell starts
+in `/root` and uses `/root/.local` for user-installed CLI tools.
 
 ## CLI
 

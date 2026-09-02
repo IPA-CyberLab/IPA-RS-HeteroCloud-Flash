@@ -40,8 +40,7 @@ const FIELD_MANAGER: &str = "heterocloud-flash-provider";
 const MAX_EXEC_SESSION_SECONDS: u64 = 1_800;
 const MAX_EXEC_MESSAGE_BYTES: usize = 64 * 1024;
 const EXEC_SHUTDOWN_GRACE_SECONDS: u64 = 2;
-const EXEC_SHELL_SCRIPT: &str =
-    "export TERM=xterm-256color COLORTERM=truecolor LANG=C.UTF-8 LC_ALL=C.UTF-8; exec /bin/sh";
+const EXEC_SHELL_SCRIPT: &str = "export TERM=xterm-256color COLORTERM=truecolor LANG=C.UTF-8 LC_ALL=C.UTF-8 HOME=/root NPM_CONFIG_PREFIX=/root/.local PATH=/root/.local/bin:$PATH; mkdir -p /root/.local/bin; cd /root || cd /; exec /bin/sh";
 
 #[derive(Clone)]
 struct AppState {
@@ -704,5 +703,7 @@ mod tests {
         assert!(EXEC_SHELL_SCRIPT.contains("COLORTERM=truecolor"));
         assert!(EXEC_SHELL_SCRIPT.contains("LANG=C.UTF-8"));
         assert!(EXEC_SHELL_SCRIPT.contains("LC_ALL=C.UTF-8"));
+        assert!(EXEC_SHELL_SCRIPT.contains("NPM_CONFIG_PREFIX=/root/.local"));
+        assert!(EXEC_SHELL_SCRIPT.contains("cd /root"));
     }
 }

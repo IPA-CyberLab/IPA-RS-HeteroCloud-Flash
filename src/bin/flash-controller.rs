@@ -30,6 +30,7 @@ async fn run() -> Result<()> {
     let registry_username = optional("FLASH_REGISTRY_USERNAME");
     let registry_password_file = optional("FLASH_REGISTRY_PASSWORD_FILE");
     let registry_pull_secret = optional("FLASH_REGISTRY_PULL_SECRET");
+    let persistent_storage_class = optional("FLASH_PERSISTENT_STORAGE_CLASS");
     let configured = [
         registry_host.is_some(),
         registry_username.is_some(),
@@ -61,7 +62,14 @@ async fn run() -> Result<()> {
     let client = kube::Client::try_default()
         .await
         .context("create Kubernetes client")?;
-    run_controller(client, namespace, image_inspector, registry_pull_secret).await
+    run_controller(
+        client,
+        namespace,
+        image_inspector,
+        registry_pull_secret,
+        persistent_storage_class,
+    )
+    .await
 }
 
 fn optional(name: &str) -> Option<String> {
