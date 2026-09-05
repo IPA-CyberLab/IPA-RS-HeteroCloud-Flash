@@ -40,6 +40,10 @@ spec:
             - name: FLASH_PERSISTENT_STORAGE_CLASS
               value: {{ required "persistence.storageClass is required" .Values.persistence.storageClass | quote }}
             {{- end }}
+            {{- if .Values.adminVolumeMounts }}
+            - name: FLASH_ADMIN_VOLUME_MOUNTS_JSON
+              value: {{ .Values.adminVolumeMounts | toJson | quote }}
+            {{- end }}
             {{- if .Values.registry.enabled }}
             - name: FLASH_REGISTRY_HOST
               value: {{ required "registry.host is required" .Values.registry.host | quote }}

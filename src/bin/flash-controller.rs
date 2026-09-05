@@ -2,7 +2,9 @@ use std::{env, fs, process::ExitCode};
 
 use anyhow::{Context, Result};
 use heterocloud_flash::image::ImageInspector;
-use heterocloud_flash::reconcile::run_controller;
+use heterocloud_flash::reconcile::{
+    AdminVolumeMounts, run_controller, validate_admin_volume_mounts,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -31,6 +33,12 @@ async fn run() -> Result<()> {
     let registry_password_file = optional("FLASH_REGISTRY_PASSWORD_FILE");
     let registry_pull_secret = optional("FLASH_REGISTRY_PULL_SECRET");
     let persistent_storage_class = optional("FLASH_PERSISTENT_STORAGE_CLASS");
+    let admin_volume_mounts = optional("FLASH_ADMIN_VOLUME_MOUNTS_JSON")
+        .map(|value| serde_json::from_str::<AdminVolumeMounts>(&value))
+        .transpose()
+        .context("FLASH_ADMIN_VOLUME_MOUNTS_JSON is invalid")?
+        .unwrap_or_default();
+    validate_admin_volume_mounts(&admin_volume_mounts)?;
     let configured = [
         registry_host.is_some(),
         registry_username.is_some(),
@@ -68,6 +76,7 @@ async fn run() -> Result<()> {
         image_inspector,
         registry_pull_secret,
         persistent_storage_class,
+        admin_volume_mounts,
     )
     .await
 }

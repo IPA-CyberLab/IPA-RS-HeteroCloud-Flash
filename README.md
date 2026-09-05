@@ -106,6 +106,13 @@ Files below `/root` then survive container restarts, Pod replacement, and node
 rescheduling. Other image filesystem changes remain ephemeral. Web Shell starts
 in `/root` and uses `/root/.local` for user-installed CLI tools.
 
+Platform operators can attach an additional pre-approved PVC to one service
+without exposing Kubernetes claim selection through the tenant API. The claim
+is declared with `adminVolumeClaims`, then assigned by service instance ID with
+`adminVolumeMounts`. Credentials remain in the CSI driver Secret and are never
+added to the workload environment. This is intended for managed object-storage
+mounts such as a Syouyu-backed S3 CSI volume.
+
 ## CLI
 
 Create a HeteroCloud API key, store it in a mode-0600 file, and run:

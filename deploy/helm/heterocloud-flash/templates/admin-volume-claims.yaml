@@ -1,0 +1,18 @@
+{{- range .Values.adminVolumeClaims }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ required "adminVolumeClaims[].name is required" .name }}
+  namespace: {{ $.Values.workloadNamespace }}
+  labels:
+    {{- include "flash.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: admin-volume
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: {{ required "adminVolumeClaims[].storageClass is required" .storageClass }}
+  resources:
+    requests:
+      storage: {{ required "adminVolumeClaims[].size is required" .size }}
+{{- end }}

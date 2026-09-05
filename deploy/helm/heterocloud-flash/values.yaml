@@ -29,6 +29,19 @@ persistence:
   enabled: false
   storageClass: ""
 
+# Platform-administered PVCs can be mounted into selected services without
+# exposing Kubernetes volume selection to tenant API callers.
+adminVolumeClaims: []
+# - name: escape-syouyu-workspace
+#   storageClass: syouyu-flash-escape
+#   size: 10Gi
+adminVolumeMounts: {}
+# "00000000-0000-0000-0000-000000000001":
+#   - name: syouyu-workspace
+#     claimName: escape-syouyu-workspace
+#     mountPath: /root/syouyu
+#     readOnly: false
+
 registry:
   enabled: false
   host: registry.heterocloud.example.com

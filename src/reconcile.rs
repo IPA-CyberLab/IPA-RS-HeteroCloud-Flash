@@ -23,9 +23,11 @@ use kube::{
         watcher,
     },
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::{
     LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME, TRAFFIC_MODE_ANNOTATION,
@@ -42,6 +44,85 @@ const MIB_BYTES: u64 = 1024 * 1024;
 const MIN_PERSISTENT_STORAGE_BYTES: u64 = 64 * MIB_BYTES;
 const MIN_ROOTFS_STORAGE_BYTES: u64 = 64 * MIB_BYTES;
 const MAX_ROOTFS_STORAGE_BYTES: u64 = GIB_BYTES;
+const MAX_ADMIN_VOLUME_MOUNTS_PER_SERVICE: usize = 8;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdminVolumeMount {
+    pub name: String,
+    pub claim_name: String,
+    pub mount_path: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+pub type AdminVolumeMounts = BTreeMap<String, Vec<AdminVolumeMount>>;
+
+pub fn validate_admin_volume_mounts(mounts: &AdminVolumeMounts) -> Result<()> {
+    if mounts.len() > 256 {
+        anyhow::bail!("admin volume mounts must target at most 256 services");
+    }
+    for (service_instance_id, service_mounts) in mounts {
+        Uuid::parse_str(service_instance_id)
+            .with_context(|| format!("invalid admin volume service ID {service_instance_id}"))?;
+        if service_mounts.is_empty() || service_mounts.len() > MAX_ADMIN_VOLUME_MOUNTS_PER_SERVICE {
+            anyhow::bail!(
+                "admin volume service {service_instance_id} must contain between one and {MAX_ADMIN_VOLUME_MOUNTS_PER_SERVICE} mounts"
+            );
+        }
+        let mut names = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        for mount in service_mounts {
+            if mount.name == PERSISTENT_HOME_VOLUME || !valid_dns_subdomain(&mount.name, 63) {
+                anyhow::bail!("invalid admin volume name for service {service_instance_id}");
+            }
+            if !valid_dns_subdomain(&mount.claim_name, 253) {
+                anyhow::bail!("invalid admin volume claim for service {service_instance_id}");
+            }
+            if !valid_admin_mount_path(&mount.mount_path) {
+                anyhow::bail!("invalid admin volume path for service {service_instance_id}");
+            }
+            if !names.insert(&mount.name) || !paths.insert(&mount.mount_path) {
+                anyhow::bail!(
+                    "duplicate admin volume name or path for service {service_instance_id}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_dns_subdomain(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label.bytes().all(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || character == b'-'
+                })
+        })
+}
+
+fn valid_admin_mount_path(value: &str) -> bool {
+    (value.starts_with("/root/") || value.starts_with("/mnt/"))
+        && value.len() <= 4_096
+        && !value.contains("//")
+        && value
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
 
 #[derive(Clone)]
 pub struct ControllerContext {
@@ -50,6 +131,7 @@ pub struct ControllerContext {
     image_inspector: ImageInspector,
     registry_pull_secret: Option<String>,
     persistent_storage_class: Option<String>,
+    admin_volume_mounts: AdminVolumeMounts,
 }
 
 impl ControllerContext {
@@ -60,6 +142,7 @@ impl ControllerContext {
         image_inspector: ImageInspector,
         registry_pull_secret: Option<String>,
         persistent_storage_class: Option<String>,
+        admin_volume_mounts: AdminVolumeMounts,
     ) -> Self {
         Self {
             client,
@@ -67,6 +150,7 @@ impl ControllerContext {
             image_inspector,
             registry_pull_secret,
             persistent_storage_class,
+            admin_volume_mounts,
         }
     }
 }
@@ -77,6 +161,7 @@ pub async fn run_controller(
     image_inspector: ImageInspector,
     registry_pull_secret: Option<String>,
     persistent_storage_class: Option<String>,
+    admin_volume_mounts: AdminVolumeMounts,
 ) -> Result<()> {
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
@@ -91,6 +176,7 @@ pub async fn run_controller(
         image_inspector,
         registry_pull_secret,
         persistent_storage_class,
+        admin_volume_mounts,
     ));
 
     info!("FlashService controller started");
@@ -237,6 +323,11 @@ async fn reconcile(
             .as_ref()
             .and_then(|claim| claim.metadata.name.as_deref()),
         context.registry_pull_secret.as_deref(),
+        context
+            .admin_volume_mounts
+            .get(&flash.spec.service_instance_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
     )?;
     let desired_network_service = desired_service(&flash, &owner)?;
     let network_policy = desired_network_policy(&flash, &owner)?;
@@ -391,6 +482,7 @@ fn desired_deployment(
     rootfs_storage_bytes: u64,
     persistent_volume_claim: Option<&str>,
     registry_pull_secret: Option<&str>,
+    admin_volume_mounts: &[AdminVolumeMount],
 ) -> Result<Deployment, ReconcileError> {
     let name = flash.name_any();
     let workload = &flash.spec.workload;
@@ -453,11 +545,22 @@ fn desired_deployment(
     if !workload.args.is_empty() {
         container["args"] = json!(workload.args);
     }
+    let mut volume_mounts = Vec::new();
     if persistent_volume_claim.is_some() {
-        container["volumeMounts"] = json!([{
+        volume_mounts.push(json!({
             "name": PERSISTENT_HOME_VOLUME,
             "mountPath": PERSISTENT_HOME_MOUNT_PATH,
-        }]);
+        }));
+    }
+    volume_mounts.extend(admin_volume_mounts.iter().map(|mount| {
+        json!({
+            "name": mount.name,
+            "mountPath": mount.mount_path,
+            "readOnly": mount.read_only,
+        })
+    }));
+    if !volume_mounts.is_empty() {
+        container["volumeMounts"] = Value::Array(volume_mounts);
     }
     let mut pod_spec = json!({
         "runtimeClassName": RUNTIME_CLASS_NAME,
@@ -481,11 +584,21 @@ fn desired_deployment(
     if let Some(secret) = registry_pull_secret {
         pod_spec["imagePullSecrets"] = json!([{"name": secret}]);
     }
+    let mut volumes = Vec::new();
     if let Some(claim_name) = persistent_volume_claim {
-        pod_spec["volumes"] = json!([{
+        volumes.push(json!({
             "name": PERSISTENT_HOME_VOLUME,
             "persistentVolumeClaim": {"claimName": claim_name},
-        }]);
+        }));
+    }
+    volumes.extend(admin_volume_mounts.iter().map(|mount| {
+        json!({
+            "name": mount.name,
+            "persistentVolumeClaim": {"claimName": mount.claim_name},
+        })
+    }));
+    if !volumes.is_empty() {
+        pod_spec["volumes"] = Value::Array(volumes);
     }
     from_value(json!({
         "apiVersion": "apps/v1",
@@ -649,11 +762,18 @@ fn workload_failure_message(pods: &[Pod]) -> Option<String> {
             ));
         }
         for container in status.container_statuses.iter().flatten() {
-            if let Some(terminated) = container
+            let current_terminated = container
                 .state
                 .as_ref()
-                .and_then(|state| state.terminated.as_ref())
-            {
+                .and_then(|state| state.terminated.as_ref());
+            let crash_loop_terminated = container
+                .state
+                .as_ref()
+                .and_then(|state| state.waiting.as_ref())
+                .filter(|waiting| waiting.reason.as_deref() == Some("CrashLoopBackOff"))
+                .and_then(|_| container.last_state.as_ref())
+                .and_then(|state| state.terminated.as_ref());
+            if let Some(terminated) = current_terminated.or(crash_loop_terminated) {
                 let detail = terminated
                     .message
                     .as_deref()
@@ -957,8 +1077,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        desired_deployment, desired_network_policy, desired_persistent_volume_claim,
-        desired_service, storage_allocation, workload_failure_message, workload_restart_message,
+        AdminVolumeMount, desired_deployment, desired_network_policy,
+        desired_persistent_volume_claim, desired_service, storage_allocation,
+        validate_admin_volume_mounts, workload_failure_message, workload_restart_message,
     };
     use crate::{
         LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME,
@@ -1030,6 +1151,7 @@ mod tests {
             10 * 1024 * 1024 * 1024 - 600,
             None,
             Some("heterocloud-registry-pull"),
+            &[],
         )?)?;
         assert_eq!(
             value.pointer("/spec/template/spec/runtimeClassName"),
@@ -1122,6 +1244,7 @@ mod tests {
             1024,
             None,
             None,
+            &[],
         )?)?;
         let service = serde_json::to_value(exposed_service(&flash)?)?;
 
@@ -1179,6 +1302,7 @@ mod tests {
             allocation.rootfs_bytes,
             Some("flash-test-home"),
             None,
+            &[],
         )?)?;
         assert_eq!(
             deployment.pointer("/spec/template/spec/containers/0/volumeMounts/0/mountPath"),
@@ -1224,6 +1348,53 @@ mod tests {
         };
         assert!(message.contains("CreateContainerConfigError"));
         assert!(message.contains("image configuration is incompatible"));
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_admin_volume_is_mounted_without_exposing_its_credentials()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mount = AdminVolumeMount {
+            name: "syouyu-workspace".into(),
+            claim_name: "escape-syouyu-workspace".into(),
+            mount_path: "/root/syouyu".into(),
+            read_only: false,
+        };
+        let mut configured = BTreeMap::new();
+        configured.insert(
+            "00000000-0000-0000-0000-000000000001".into(),
+            vec![mount.clone()],
+        );
+        validate_admin_volume_mounts(&configured)?;
+
+        let deployment = serde_json::to_value(desired_deployment(
+            &service(TrafficMode::Forwarded),
+            &owner(),
+            "example.invalid/udp@sha256:verified",
+            1024,
+            Some("flash-test-home"),
+            None,
+            &[mount],
+        )?)?;
+        assert_eq!(
+            deployment.pointer("/spec/template/spec/containers/0/volumeMounts/1"),
+            Some(&json!({
+                "name": "syouyu-workspace",
+                "mountPath": "/root/syouyu",
+                "readOnly": false
+            }))
+        );
+        assert_eq!(
+            deployment.pointer("/spec/template/spec/volumes/1"),
+            Some(&json!({
+                "name": "syouyu-workspace",
+                "persistentVolumeClaim": {"claimName": "escape-syouyu-workspace"}
+            }))
+        );
+        assert_eq!(
+            deployment.pointer("/spec/template/spec/containers/0/env"),
+            Some(&json!([]))
+        );
         Ok(())
     }
 
@@ -1407,6 +1578,7 @@ mod tests {
             1024,
             None,
             None,
+            &[],
         )?)?;
         assert_eq!(
             deployment.pointer("/spec/template/spec/containers/0/ports"),
