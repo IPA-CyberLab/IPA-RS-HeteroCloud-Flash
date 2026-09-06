@@ -67,6 +67,14 @@ runtimeClass:
   nodeSelector:
     flash.heterocloud.io/gvisor-ready: "true"
 
+networkPolicy:
+  # These networks are removed from tenant egress even when Internet access
+  # is enabled. RFC1918, CGNAT, loopback and link-local ranges are protected
+  # by the provider itself; add deployment-specific public infrastructure here.
+  additionalProtectedCidrs: []
+  dnsCidrs:
+    - 10.96.0.10/32
+
 serviceAccount:
   create: true
   name: ""

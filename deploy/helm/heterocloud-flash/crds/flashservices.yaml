@@ -48,6 +48,36 @@ spec:
                     format: uint32
                     minimum: 0.0
                     type: integer
+                  egress:
+                    default:
+                      allow_same_organization: false
+                      allowed_destination_cidrs: []
+                      denied_destination_cidrs: []
+                      mode: internet
+                    properties:
+                      allow_same_organization:
+                        default: false
+                        type: boolean
+                      allowed_destination_cidrs:
+                        default: []
+                        items:
+                          type: string
+                        maxItems: 64
+                        type: array
+                      denied_destination_cidrs:
+                        default: []
+                        items:
+                          type: string
+                        maxItems: 64
+                        type: array
+                      mode:
+                        default: internet
+                        enum:
+                        - disabled
+                        - restricted
+                        - internet
+                        type: string
+                    type: object
                   env:
                     additionalProperties:
                       type: string

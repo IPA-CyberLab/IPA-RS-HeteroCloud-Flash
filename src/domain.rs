@@ -20,6 +20,26 @@ pub const MIN_EPHEMERAL_STORAGE_GIB: u32 = 1;
 pub const MAX_EPHEMERAL_STORAGE_GIB: u32 = 1_000_000;
 pub const DEFAULT_EPHEMERAL_STORAGE_GIB: u32 = 10;
 
+const PUBLIC_EGRESS_ROOTS: [&str; 2] = ["0.0.0.0/0", "2000::/3"];
+const PROTECTED_EGRESS_CIDRS: [&str; 16] = [
+    "::/128",
+    "::1/128",
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.88.99.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "224.0.0.0/3",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+];
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlashSpec {
@@ -33,6 +53,8 @@ pub struct FlashSpec {
     pub ephemeral_storage_gib: u32,
     pub ports: Vec<FlashPort>,
     pub exposure: FlashExposure,
+    #[serde(default)]
+    pub egress: FlashEgress,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -115,6 +137,7 @@ impl FlashSpec {
             ));
         }
         self.exposure.effective_source_networks()?;
+        self.egress.validate()?;
         if self.env.len() > MAX_ENVIRONMENT_VARIABLES {
             return Err(ValidationError::Field(format!(
                 "env must not contain more than {MAX_ENVIRONMENT_VARIABLES} entries"
@@ -132,6 +155,130 @@ impl FlashSpec {
         validate_string_list("args", &self.args, 256)?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlashEgressMode {
+    Disabled,
+    Restricted,
+    #[default]
+    Internet,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlashEgress {
+    #[serde(default)]
+    pub mode: FlashEgressMode,
+    #[serde(default)]
+    pub allow_same_organization: bool,
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    pub allowed_destination_cidrs: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    pub denied_destination_cidrs: Vec<String>,
+}
+
+impl Default for FlashEgress {
+    fn default() -> Self {
+        Self {
+            mode: FlashEgressMode::Internet,
+            allow_same_organization: false,
+            allowed_destination_cidrs: Vec::new(),
+            denied_destination_cidrs: Vec::new(),
+        }
+    }
+}
+
+impl FlashEgress {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let allowed =
+            parse_source_networks("allowed_destination_cidrs", &self.allowed_destination_cidrs)?;
+        parse_source_networks("denied_destination_cidrs", &self.denied_destination_cidrs)?;
+        if self.mode != FlashEgressMode::Restricted && !allowed.is_empty() {
+            return Err(ValidationError::Field(
+                "allowed_destination_cidrs requires restricted egress mode".into(),
+            ));
+        }
+        let protected = protected_egress_networks()?;
+        if let Some(network) = allowed.iter().find(|network| {
+            protected
+                .iter()
+                .any(|protected| networks_overlap(network, protected))
+        }) {
+            return Err(ValidationError::Field(format!(
+                "allowed destination {network} overlaps a protected private or infrastructure network"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn destination_ip_blocks(
+        &self,
+        additional_protected: &[IpNet],
+    ) -> Result<Vec<DestinationIpBlock>, ValidationError> {
+        self.validate()?;
+        let roots = match self.mode {
+            FlashEgressMode::Disabled => Vec::new(),
+            FlashEgressMode::Restricted => {
+                parse_source_networks("allowed_destination_cidrs", &self.allowed_destination_cidrs)?
+            }
+            FlashEgressMode::Internet => PUBLIC_EGRESS_ROOTS
+                .iter()
+                .map(|value| parse_network(value, "public egress root"))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let mut denied = protected_egress_networks()?;
+        denied.extend(additional_protected.iter().copied());
+        denied.extend(parse_source_networks(
+            "denied_destination_cidrs",
+            &self.denied_destination_cidrs,
+        )?);
+        Ok(ip_blocks(&roots, &denied))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestinationIpBlock {
+    pub cidr: IpNet,
+    pub except: Vec<IpNet>,
+}
+
+fn protected_egress_networks() -> Result<Vec<IpNet>, ValidationError> {
+    PROTECTED_EGRESS_CIDRS
+        .iter()
+        .map(|value| parse_network(value, "protected egress network"))
+        .collect()
+}
+
+fn parse_network(value: &str, name: &str) -> Result<IpNet, ValidationError> {
+    value
+        .parse::<IpNet>()
+        .map(|network| network.trunc())
+        .map_err(|_| ValidationError::Field(format!("invalid {name} {value}")))
+}
+
+fn networks_overlap(left: &IpNet, right: &IpNet) -> bool {
+    left.contains(right) || right.contains(left)
+}
+
+fn ip_blocks(roots: &[IpNet], denied: &[IpNet]) -> Vec<DestinationIpBlock> {
+    let denied = IpNet::aggregate(&denied.to_vec());
+    let mut blocks = Vec::new();
+    for cidr in IpNet::aggregate(&roots.to_vec()) {
+        if denied.iter().any(|network| network.contains(&cidr)) {
+            continue;
+        }
+        let except = denied
+            .iter()
+            .copied()
+            .filter(|network| cidr.contains(network))
+            .collect();
+        blocks.push(DestinationIpBlock { cidr, except });
+    }
+    blocks
 }
 
 const fn default_ephemeral_storage_gib() -> u32 {
@@ -215,6 +362,20 @@ impl FlashExposure {
             effective = IpNet::aggregate(&next);
         }
         Ok(effective)
+    }
+
+    pub fn public_source_ip_blocks(&self) -> Result<Vec<DestinationIpBlock>, ValidationError> {
+        let (allowed, mut denied) = self.source_networks()?;
+        let roots = if allowed.is_empty() {
+            PUBLIC_EGRESS_ROOTS
+                .iter()
+                .map(|value| parse_network(value, "public ingress root"))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            allowed
+        };
+        denied.extend(protected_egress_networks()?);
+        Ok(ip_blocks(&roots, &denied))
     }
 
     #[must_use]
@@ -367,8 +528,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        ExposureType, FlashExposure, FlashPort, FlashSpec, MAX_EPHEMERAL_STORAGE_GIB, TrafficMode,
-        TransportProtocol,
+        ExposureType, FlashEgress, FlashEgressMode, FlashExposure, FlashPort, FlashSpec,
+        MAX_EPHEMERAL_STORAGE_GIB, TrafficMode, TransportProtocol,
     };
 
     fn valid_spec() -> FlashSpec {
@@ -391,6 +552,7 @@ mod tests {
                 allowed_source_cidrs: Vec::new(),
                 denied_source_cidrs: Vec::new(),
             },
+            egress: FlashEgress::default(),
             env: BTreeMap::new(),
             command: Vec::new(),
             args: Vec::new(),
@@ -478,5 +640,50 @@ mod tests {
         let mut spec = valid_spec();
         spec.exposure.denied_source_cidrs = vec!["203.0.113.7".into(), "203.0.113.7/32".into()];
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn internet_egress_excludes_private_and_cluster_networks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let spec = valid_spec();
+        let blocks = spec.egress.destination_ip_blocks(&[])?;
+        let ipv4 = blocks
+            .iter()
+            .find(|block| block.cidr.to_string() == "0.0.0.0/0")
+            .ok_or("missing IPv4 Internet block")?;
+        assert!(
+            ipv4.except
+                .iter()
+                .any(|network| network.to_string() == "10.0.0.0/8")
+        );
+        assert!(
+            ipv4.except
+                .iter()
+                .any(|network| network.to_string() == "100.64.0.0/10")
+        );
+        assert_eq!(blocks[1].cidr.to_string(), "2000::/3");
+        Ok(())
+    }
+
+    #[test]
+    fn restricted_egress_rejects_private_destinations() {
+        let mut spec = valid_spec();
+        spec.egress.mode = FlashEgressMode::Restricted;
+        spec.egress.allowed_destination_cidrs = vec!["10.250.0.0/16".into()];
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn missing_egress_defaults_to_public_internet_without_peer_access()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(valid_spec())?;
+        value
+            .as_object_mut()
+            .ok_or("Flash spec must be an object")?
+            .remove("egress");
+        let spec = serde_json::from_value::<FlashSpec>(value)?;
+        assert_eq!(spec.egress.mode, FlashEgressMode::Internet);
+        assert!(!spec.egress.allow_same_organization);
+        Ok(())
     }
 }

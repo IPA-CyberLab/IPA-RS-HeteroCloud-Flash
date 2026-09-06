@@ -1,10 +1,11 @@
-use std::{env, fs, process::ExitCode};
+use std::{collections::BTreeSet, env, fs, process::ExitCode};
 
 use anyhow::{Context, Result};
 use heterocloud_flash::image::ImageInspector;
 use heterocloud_flash::reconcile::{
     AdminVolumeMounts, run_controller, validate_admin_volume_mounts,
 };
+use ipnet::IpNet;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -39,6 +40,11 @@ async fn run() -> Result<()> {
         .context("FLASH_ADMIN_VOLUME_MOUNTS_JSON is invalid")?
         .unwrap_or_default();
     validate_admin_volume_mounts(&admin_volume_mounts)?;
+    let additional_protected_networks = network_cidrs("FLASH_ADDITIONAL_PROTECTED_CIDRS_JSON")?;
+    let dns_networks = network_cidrs("FLASH_DNS_CIDRS_JSON")?;
+    if dns_networks.is_empty() {
+        anyhow::bail!("FLASH_DNS_CIDRS_JSON must contain at least one DNS service address");
+    }
     let configured = [
         registry_host.is_some(),
         registry_username.is_some(),
@@ -77,8 +83,29 @@ async fn run() -> Result<()> {
         registry_pull_secret,
         persistent_storage_class,
         admin_volume_mounts,
+        additional_protected_networks,
+        dns_networks,
     )
     .await
+}
+
+fn network_cidrs(name: &str) -> Result<Vec<IpNet>> {
+    let values = optional(name)
+        .map(|value| serde_json::from_str::<Vec<String>>(&value))
+        .transpose()
+        .with_context(|| format!("{name} must be a JSON string array"))?
+        .unwrap_or_default();
+    let mut networks = BTreeSet::new();
+    for value in values {
+        let network = value
+            .parse::<IpNet>()
+            .with_context(|| format!("{name} contains invalid CIDR {value}"))?
+            .trunc();
+        if !networks.insert(network) {
+            anyhow::bail!("{name} contains duplicate CIDR {network}");
+        }
+    }
+    Ok(networks.into_iter().collect())
 }
 
 fn optional(name: &str) -> Option<String> {

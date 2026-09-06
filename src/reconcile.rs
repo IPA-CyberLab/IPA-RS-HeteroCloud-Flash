@@ -6,10 +6,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use ipnet::IpNet;
 use k8s_openapi::{
     api::{
         apps::v1::Deployment,
-        core::v1::{PersistentVolumeClaim, Pod, Service},
+        core::v1::{Node, PersistentVolumeClaim, Pod, Service},
         networking::v1::NetworkPolicy,
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
@@ -38,6 +39,7 @@ use crate::{
 
 const FIELD_MANAGER: &str = "heterocloud-flash-controller";
 const GENERATION_LABEL: &str = "flash.heterocloud.io/generation";
+const ASSIGNED_NODES_ANNOTATION: &str = "networking.heteronetwork.io/assigned-nodes";
 const PERSISTENT_HOME_VOLUME: &str = "persistent-home";
 const PERSISTENT_HOME_MOUNT_PATH: &str = "/root";
 const MIB_BYTES: u64 = 1024 * 1024;
@@ -132,6 +134,8 @@ pub struct ControllerContext {
     registry_pull_secret: Option<String>,
     persistent_storage_class: Option<String>,
     admin_volume_mounts: AdminVolumeMounts,
+    additional_protected_networks: Vec<IpNet>,
+    dns_networks: Vec<IpNet>,
 }
 
 impl ControllerContext {
@@ -143,6 +147,8 @@ impl ControllerContext {
         registry_pull_secret: Option<String>,
         persistent_storage_class: Option<String>,
         admin_volume_mounts: AdminVolumeMounts,
+        additional_protected_networks: Vec<IpNet>,
+        dns_networks: Vec<IpNet>,
     ) -> Self {
         Self {
             client,
@@ -151,6 +157,8 @@ impl ControllerContext {
             registry_pull_secret,
             persistent_storage_class,
             admin_volume_mounts,
+            additional_protected_networks,
+            dns_networks,
         }
     }
 }
@@ -162,6 +170,8 @@ pub async fn run_controller(
     registry_pull_secret: Option<String>,
     persistent_storage_class: Option<String>,
     admin_volume_mounts: AdminVolumeMounts,
+    additional_protected_networks: Vec<IpNet>,
+    dns_networks: Vec<IpNet>,
 ) -> Result<()> {
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
@@ -177,6 +187,8 @@ pub async fn run_controller(
         registry_pull_secret,
         persistent_storage_class,
         admin_volume_mounts,
+        additional_protected_networks,
+        dns_networks,
     ));
 
     info!("FlashService controller started");
@@ -330,7 +342,6 @@ async fn reconcile(
             .unwrap_or_default(),
     )?;
     let desired_network_service = desired_service(&flash, &owner)?;
-    let network_policy = desired_network_policy(&flash, &owner)?;
     let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
     let network_services = Api::<Service>::namespaced(context.client.clone(), &context.namespace);
     let network_policies =
@@ -338,6 +349,21 @@ async fn reconcile(
     let persistent_volume_claims =
         Api::<PersistentVolumeClaim>::namespaced(context.client.clone(), &context.namespace);
     let params = PatchParams::apply(FIELD_MANAGER).force();
+    let current_network_service = network_services.get_opt(&name).await?;
+    let forwarded_ingress_networks = if flash.spec.workload.exposure.kind == ExposureType::Public
+        && flash.spec.workload.exposure.traffic_mode == TrafficMode::Forwarded
+    {
+        assigned_forwarder_networks(&context.client, current_network_service.as_ref()).await?
+    } else {
+        Vec::new()
+    };
+    let network_policy = desired_network_policy_with_networks(
+        &flash,
+        &owner,
+        &context.additional_protected_networks,
+        &context.dns_networks,
+        &forwarded_ingress_networks,
+    )?;
 
     if let Some(persistent_volume_claim) = &persistent_volume_claim {
         persistent_volume_claims
@@ -348,11 +374,9 @@ async fn reconcile(
             )
             .await?;
     }
-    if let Some(network_policy) = &network_policy {
-        network_policies
-            .patch(&name, &params, &Patch::Apply(network_policy))
-            .await?;
-    }
+    network_policies
+        .patch(&name, &params, &Patch::Apply(&network_policy))
+        .await?;
     deployments
         .patch(&name, &params, &Patch::Apply(&deployment))
         .await?;
@@ -373,17 +397,6 @@ async fn reconcile(
         }
         None
     };
-    if network_policy.is_none() {
-        match network_policies
-            .delete(&name, &DeleteParams::default())
-            .await
-        {
-            Ok(_) => {}
-            Err(kube::Error::Api(response)) if response.code == 404 => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-
     let endpoints = network_service
         .as_ref()
         .map(|service| service_endpoints(&flash, service))
@@ -537,6 +550,8 @@ fn desired_deployment(
             "runAsNonRoot": false,
             "runAsUser": 0,
             "runAsGroup": 0,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {"drop": ["ALL"]},
         }
     });
     if !workload.command.is_empty() {
@@ -927,31 +942,121 @@ fn desired_service(
     }))?))
 }
 
+#[cfg(test)]
 fn desired_network_policy(
     flash: &FlashService,
     owner: &OwnerReference,
-) -> Result<Option<NetworkPolicy>, ReconcileError> {
+) -> Result<NetworkPolicy, ReconcileError> {
+    desired_network_policy_with_networks(flash, owner, &[], &[], &[])
+}
+
+fn desired_network_policy_with_networks(
+    flash: &FlashService,
+    owner: &OwnerReference,
+    additional_protected_networks: &[IpNet],
+    dns_networks: &[IpNet],
+    forwarded_ingress_networks: &[IpNet],
+) -> Result<NetworkPolicy, ReconcileError> {
     let exposure = &flash.spec.workload.exposure;
-    // Forwarded public traffic may be SNATed to the ingress node before a Pod
-    // NetworkPolicy is evaluated. The Service firewall handles that path.
-    if flash.spec.workload.ports.is_empty()
-        || !exposure.has_source_policy()
-        || (exposure.kind == ExposureType::Public
-            && exposure.traffic_mode == TrafficMode::Forwarded)
-    {
-        return Ok(None);
-    }
-    let sources = exposure
-        .effective_source_networks()?
-        .into_iter()
-        .map(|network| json!({"ipBlock": {"cidr": network.to_string()}}))
+    let mut seen_ports = BTreeSet::new();
+    let ports = flash
+        .spec
+        .workload
+        .ports
+        .iter()
+        .filter(|port| seen_ports.insert((port.container_port, port.protocol)))
+        .map(|port| {
+            json!({
+                "protocol": port.protocol.as_kubernetes(),
+                "port": port.container_port,
+            })
+        })
         .collect::<Vec<_>>();
-    let ingress = if sources.is_empty() {
+    let ingress = if ports.is_empty() {
         Vec::new()
     } else {
-        vec![json!({"from": sources})]
+        match (exposure.kind, exposure.traffic_mode) {
+            (ExposureType::Internal, _) => vec![json!({
+                "from": [{
+                    "podSelector": {"matchLabels": {
+                        "flash.heterocloud.io/organization": flash.spec.organization_id
+                    }}
+                }],
+                "ports": ports,
+            })],
+            (ExposureType::Public, mode) => {
+                let mut sources = exposure
+                    .public_source_ip_blocks()?
+                    .into_iter()
+                    .map(|block| {
+                        json!({"ipBlock": {
+                            "cidr": block.cidr.to_string(),
+                            "except": block.except.into_iter().map(|network| network.to_string()).collect::<Vec<_>>(),
+                        }})
+                    })
+                    .collect::<Vec<_>>();
+                if mode == TrafficMode::Forwarded {
+                    // Cross-node kube-proxy forwarding is source-NATed to the
+                    // assigned public node's Flannel address. Permit only
+                    // those host /32s, never the complete Pod CIDR.
+                    sources.extend(
+                        forwarded_ingress_networks
+                            .iter()
+                            .map(|network| json!({"ipBlock": {"cidr": network.to_string()}})),
+                    );
+                }
+                if sources.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![json!({"from": sources, "ports": ports})]
+                }
+            }
+        }
     };
-    Ok(Some(from_value(json!({
+
+    let mut egress = Vec::new();
+    let mut dns_destinations = dns_networks
+        .iter()
+        .map(|network| json!({"ipBlock": {"cidr": network.to_string()}}))
+        .collect::<Vec<_>>();
+    dns_destinations.push(json!({
+        "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+        "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+    }));
+    egress.push(json!({
+        "to": dns_destinations,
+        "ports": [
+            {"protocol": "UDP", "port": 53},
+            {"protocol": "TCP", "port": 53}
+        ],
+    }));
+    if flash.spec.workload.egress.allow_same_organization {
+        egress.push(json!({
+            "to": [{
+                "podSelector": {"matchLabels": {
+                    "flash.heterocloud.io/organization": flash.spec.organization_id
+                }}
+            }]
+        }));
+    }
+    let destinations = flash
+        .spec
+        .workload
+        .egress
+        .destination_ip_blocks(additional_protected_networks)?
+        .into_iter()
+        .map(|block| {
+            json!({"ipBlock": {
+                "cidr": block.cidr.to_string(),
+                "except": block.except.into_iter().map(|network| network.to_string()).collect::<Vec<_>>(),
+            }})
+        })
+        .collect::<Vec<_>>();
+    if !destinations.is_empty() {
+        egress.push(json!({"to": destinations}));
+    }
+
+    Ok(from_value(json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
         "metadata": {
@@ -965,10 +1070,73 @@ fn desired_network_policy(
                     "flash.heterocloud.io/instance": flash.spec.service_instance_id
                 }
             },
-            "policyTypes": ["Ingress"],
+            "policyTypes": ["Ingress", "Egress"],
             "ingress": ingress,
+            "egress": egress,
         }
-    }))?))
+    }))?)
+}
+
+#[derive(Deserialize)]
+struct AssignedIngressNode {
+    name: String,
+}
+
+async fn assigned_forwarder_networks(
+    client: &Client,
+    service: Option<&Service>,
+) -> Result<Vec<IpNet>, ReconcileError> {
+    let Some(encoded) = service
+        .and_then(|service| service.metadata.annotations.as_ref())
+        .and_then(|annotations| annotations.get(ASSIGNED_NODES_ANNOTATION))
+    else {
+        return Ok(Vec::new());
+    };
+    let assigned = serde_json::from_str::<Vec<AssignedIngressNode>>(encoded)
+        .context("parse assigned HeteroNetwork ingress nodes")?;
+    let assigned_names = assigned
+        .into_iter()
+        .map(|node| node.name)
+        .collect::<BTreeSet<_>>();
+    let nodes = Api::<Node>::all(client.clone())
+        .list(&ListParams::default())
+        .await?;
+    let mut networks = BTreeSet::new();
+    for node in nodes
+        .items
+        .iter()
+        .filter(|node| assigned_names.contains(&node.name_any()))
+    {
+        for value in node
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.pod_cidrs.as_deref())
+            .unwrap_or_default()
+        {
+            let cidr = value.parse::<IpNet>().with_context(|| {
+                format!("node {} has invalid Pod CIDR {value}", node.name_any())
+            })?;
+            networks.insert(IpNet::from(cidr.network()));
+            if let Some(first_host) = cidr.hosts().next() {
+                networks.insert(IpNet::from(first_host));
+            }
+        }
+        for address in node
+            .status
+            .as_ref()
+            .and_then(|status| status.addresses.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .filter(|address| address.type_ == "InternalIP")
+        {
+            let address = address
+                .address
+                .parse::<std::net::IpAddr>()
+                .with_context(|| format!("node {} has invalid internal IP", node.name_any()))?;
+            networks.insert(IpNet::from(address));
+        }
+    }
+    Ok(networks.into_iter().collect())
 }
 
 fn service_endpoints(flash: &FlashService, service: &Service) -> Vec<FlashEndpoint> {
@@ -1074,18 +1242,20 @@ mod tests {
 
     use k8s_openapi::api::core::v1::{Pod, Service};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         AdminVolumeMount, desired_deployment, desired_network_policy,
-        desired_persistent_volume_claim, desired_service, storage_allocation,
-        validate_admin_volume_mounts, workload_failure_message, workload_restart_message,
+        desired_network_policy_with_networks, desired_persistent_volume_claim, desired_service,
+        storage_allocation, validate_admin_volume_mounts, workload_failure_message,
+        workload_restart_message,
     };
     use crate::{
         LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME,
         crd::{FlashService, FlashServiceSpec},
         domain::{
-            ExposureType, FlashExposure, FlashPort, FlashSpec, TrafficMode, TransportProtocol,
+            ExposureType, FlashEgress, FlashExposure, FlashPort, FlashSpec, TrafficMode,
+            TransportProtocol,
         },
     };
 
@@ -1117,6 +1287,7 @@ mod tests {
                         allowed_source_cidrs: Vec::new(),
                         denied_source_cidrs: Vec::new(),
                     },
+                    egress: FlashEgress::default(),
                     env: BTreeMap::new(),
                     command: Vec::new(),
                     args: Vec::new(),
@@ -1174,11 +1345,11 @@ mod tests {
             value.pointer(
                 "/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation"
             ),
-            None
+            Some(&json!(false))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/capabilities/drop/0"),
-            None
+            Some(&json!("ALL"))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/runAsNonRoot"),
@@ -1528,27 +1699,57 @@ mod tests {
             Some(&json!(["192.0.2.0/25"]))
         );
 
-        let policy = desired_network_policy(&flash, &owner())?
-            .ok_or_else(|| std::io::Error::other("source policy was not created"))?;
+        let policy = desired_network_policy(&flash, &owner())?;
         let policy = serde_json::to_value(policy)?;
         assert_eq!(
             policy.pointer("/spec/policyTypes"),
-            Some(&json!(["Ingress"]))
+            Some(&json!(["Ingress", "Egress"]))
         );
         assert_eq!(
             policy.pointer("/spec/ingress/0/from/0/ipBlock/cidr"),
-            Some(&json!("192.0.2.0/25"))
+            Some(&json!("192.0.2.0/24"))
+        );
+        assert_eq!(
+            policy.pointer("/spec/ingress/0/from/0/ipBlock/except/0"),
+            Some(&json!("192.0.2.128/25"))
+        );
+        assert_eq!(
+            policy.pointer("/spec/ingress/0/ports/0"),
+            Some(&json!({"protocol": "UDP", "port": 7777}))
         );
         Ok(())
     }
 
     #[test]
-    fn service_without_source_policy_does_not_install_a_firewall()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn service_without_source_policy_is_still_isolated() -> Result<(), Box<dyn std::error::Error>> {
         let flash = service(TrafficMode::Forwarded);
         let service = serde_json::to_value(exposed_service(&flash)?)?;
         assert_eq!(service.pointer("/spec/loadBalancerSourceRanges"), None);
-        assert!(desired_network_policy(&flash, &owner())?.is_none());
+        let policy = serde_json::to_value(desired_network_policy(&flash, &owner())?)?;
+        assert_eq!(
+            policy.pointer("/spec/ingress/0/ports/0/port"),
+            Some(&json!(7777))
+        );
+        assert!(
+            policy
+                .pointer("/spec/ingress/0/from/0/ipBlock/except")
+                .and_then(Value::as_array)
+                .is_some_and(|networks| networks.contains(&json!("10.0.0.0/8")))
+        );
+        assert_eq!(
+            policy.pointer("/spec/egress/0/ports/0"),
+            Some(&json!({"protocol": "UDP", "port": 53}))
+        );
+        assert_eq!(
+            policy.pointer("/spec/egress/1/to/0/ipBlock/cidr"),
+            Some(&json!("0.0.0.0/0"))
+        );
+        assert!(
+            policy
+                .pointer("/spec/egress/1/to/0/ipBlock/except")
+                .and_then(Value::as_array)
+                .is_some_and(|networks| networks.contains(&json!("10.0.0.0/8")))
+        );
         Ok(())
     }
 
@@ -1559,18 +1760,40 @@ mod tests {
         flash.spec.workload.exposure.denied_source_cidrs = vec!["198.51.100.0/24".into()];
         let service = serde_json::to_value(exposed_service(&flash)?)?;
         assert!(service.pointer("/spec/loadBalancerSourceRanges").is_some());
-        assert!(desired_network_policy(&flash, &owner())?.is_none());
+        let policy = serde_json::to_value(desired_network_policy_with_networks(
+            &flash,
+            &owner(),
+            &[],
+            &[],
+            &["10.244.2.0/32".parse()?],
+        )?)?;
+        assert_eq!(
+            policy.pointer("/spec/ingress/0/from/2/ipBlock/cidr"),
+            Some(&json!("10.244.2.0/32"))
+        );
+        assert!(
+            policy
+                .pointer("/spec/ingress/0/from/0/ipBlock/except")
+                .and_then(Value::as_array)
+                .is_some_and(|networks| networks.contains(&json!("198.51.100.0/24")))
+        );
+        assert_eq!(
+            policy.pointer("/spec/ingress/0/ports/0/port"),
+            Some(&json!(7777))
+        );
         Ok(())
     }
 
     #[test]
-    fn service_without_endpoints_has_no_network_resources() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn service_without_endpoints_still_has_default_deny_network_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut flash = service(TrafficMode::Forwarded);
         flash.spec.workload.ports.clear();
 
         assert!(desired_service(&flash, &owner())?.is_none());
-        assert!(desired_network_policy(&flash, &owner())?.is_none());
+        let policy = serde_json::to_value(desired_network_policy(&flash, &owner())?)?;
+        assert_eq!(policy.pointer("/spec/ingress"), Some(&json!([])));
+        assert!(policy.pointer("/spec/egress/0").is_some());
         let deployment = serde_json::to_value(desired_deployment(
             &flash,
             &owner(),
@@ -1583,6 +1806,21 @@ mod tests {
         assert_eq!(
             deployment.pointer("/spec/template/spec/containers/0/ports"),
             Some(&json!([]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn optional_same_organization_access_uses_tenant_label()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.egress.allow_same_organization = true;
+        let policy = serde_json::to_value(desired_network_policy(&flash, &owner())?)?;
+        assert_eq!(
+            policy.pointer(
+                "/spec/egress/1/to/0/podSelector/matchLabels/flash.heterocloud.io~1organization"
+            ),
+            Some(&json!("00000000-0000-0000-0000-000000000002"))
         );
         Ok(())
     }

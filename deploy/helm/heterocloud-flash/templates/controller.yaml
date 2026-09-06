@@ -36,6 +36,10 @@ spec:
           env:
             - name: FLASH_WORKLOAD_NAMESPACE
               value: {{ .Values.workloadNamespace | quote }}
+            - name: FLASH_ADDITIONAL_PROTECTED_CIDRS_JSON
+              value: {{ .Values.networkPolicy.additionalProtectedCidrs | toJson | quote }}
+            - name: FLASH_DNS_CIDRS_JSON
+              value: {{ required "networkPolicy.dnsCidrs must contain the cluster DNS service addresses" .Values.networkPolicy.dnsCidrs | toJson | quote }}
             {{- if .Values.persistence.enabled }}
             - name: FLASH_PERSISTENT_STORAGE_CLASS
               value: {{ required "persistence.storageClass is required" .Values.persistence.storageClass | quote }}
