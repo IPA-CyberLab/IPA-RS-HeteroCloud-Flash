@@ -551,7 +551,7 @@ fn desired_deployment(
             "runAsUser": 0,
             "runAsGroup": 0,
             "allowPrivilegeEscalation": false,
-            "capabilities": {"drop": ["ALL"]},
+            "capabilities": {"drop": ["NET_RAW"]},
         }
     });
     if !workload.command.is_empty() {
@@ -1349,7 +1349,7 @@ mod tests {
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/capabilities/drop/0"),
-            Some(&json!("ALL"))
+            Some(&json!("NET_RAW"))
         );
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/securityContext/runAsNonRoot"),
