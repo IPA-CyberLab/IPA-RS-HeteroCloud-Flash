@@ -408,22 +408,50 @@ async fn reconcile(
             flash.spec.service_instance_id, GENERATION_LABEL, flash.spec.desired_generation
         )))
         .await?;
-    let ready_replicas = i32::try_from(pods.items.iter().filter(|pod| pod_is_ready(pod)).count())
-        .unwrap_or(i32::MAX);
-    let ready = ready_replicas == desired_replicas && endpoint_ready;
-    let failure = workload_failure_message(&pods.items);
-    let restart_warning = workload_restart_message(&pods.items);
-    let phase = if failure.is_some() {
+    let mut status = FlashServiceStatus {
+        observed_generation: flash.spec.desired_generation,
+        desired_replicas,
+        runtime_class: RUNTIME_CLASS_NAME.into(),
+        endpoints,
+        resolved_image: Some(inspection.resolved_image),
+        image_size_bytes: Some(inspection.image_size_bytes),
+        writable_storage_bytes: Some(inspection.writable_storage_bytes),
+        ..FlashServiceStatus::default()
+    };
+    let action = update_workload_status(
+        &mut status,
+        &pods.items,
+        endpoint_ready,
+        !flash.spec.workload.ports.is_empty(),
+    );
+    patch_status_if_changed(&services, &name, flash.status.as_ref(), status).await?;
+    Ok(action)
+}
+
+fn update_workload_status(
+    status: &mut FlashServiceStatus,
+    pods: &[Pod],
+    endpoint_ready: bool,
+    needs_endpoint: bool,
+) -> Action {
+    let desired_replicas = status.desired_replicas;
+    status.ready_replicas =
+        i32::try_from(pods.iter().filter(|pod| pod_is_ready(pod)).count()).unwrap_or(i32::MAX);
+    let ready = status.ready_replicas == desired_replicas && endpoint_ready;
+    let failure = workload_failure_message(pods);
+    status.phase = if failure.is_some() {
         FlashServicePhase::Error
     } else if ready {
         FlashServicePhase::Ready
     } else {
         FlashServicePhase::Provisioning
     };
-    let message = failure.or_else(|| {
+    status.message = failure.or_else(|| {
         if ready {
-            restart_warning
-        } else if flash.spec.workload.ports.is_empty() {
+            workload_restart_message(pods)
+        } else if let Some(message) = workload_pending_message(pods) {
+            Some(message)
+        } else if !needs_endpoint {
             Some(format!("waiting for {desired_replicas} gVisor replicas"))
         } else {
             Some(format!(
@@ -431,24 +459,10 @@ async fn reconcile(
             ))
         }
     });
-    let status = FlashServiceStatus {
-        phase,
-        observed_generation: flash.spec.desired_generation,
-        ready_replicas,
-        desired_replicas,
-        runtime_class: RUNTIME_CLASS_NAME.into(),
-        endpoints,
-        message,
-        resolved_image: Some(inspection.resolved_image),
-        image_size_bytes: Some(inspection.image_size_bytes),
-        writable_storage_bytes: Some(inspection.writable_storage_bytes),
-    };
-    let settled = status.phase == FlashServicePhase::Ready;
-    patch_status_if_changed(&services, &name, flash.status.as_ref(), status).await?;
-    if settled {
-        Ok(Action::await_change())
+    if status.phase == FlashServicePhase::Ready {
+        Action::await_change()
     } else {
-        Ok(Action::requeue(Duration::from_secs(5)))
+        Action::requeue(Duration::from_secs(5))
     }
 }
 
@@ -749,6 +763,30 @@ fn pod_is_ready(pod: &Pod) -> bool {
             })
 }
 
+fn workload_pending_message(pods: &[Pod]) -> Option<String> {
+    for pod in pods
+        .iter()
+        .filter(|pod| pod.metadata.deletion_timestamp.is_none())
+    {
+        let Some(status) = pod.status.as_ref() else {
+            continue;
+        };
+        if let Some(condition) = status.conditions.as_ref().and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition.type_ == "PodScheduled" && condition.status == "False")
+        }) {
+            return Some(format!(
+                "waiting for pod {} to be scheduled ({}): {}",
+                pod.name_any(),
+                condition.reason.as_deref().unwrap_or("Pending"),
+                condition.message.as_deref().unwrap_or("no eligible node")
+            ));
+        }
+    }
+    None
+}
+
 fn workload_failure_message(pods: &[Pod]) -> Option<String> {
     const FAILURE_REASONS: &[&str] = &[
         "CreateContainerConfigError",
@@ -763,19 +801,6 @@ fn workload_failure_message(pods: &[Pod]) -> Option<String> {
         let Some(status) = pod.status.as_ref() else {
             continue;
         };
-        if let Some(condition) = status.conditions.as_ref().and_then(|conditions| {
-            conditions.iter().find(|condition| {
-                condition.type_ == "PodScheduled"
-                    && condition.status == "False"
-                    && condition.reason.as_deref() == Some("Unschedulable")
-            })
-        }) {
-            return Some(format!(
-                "pod {} is unschedulable: {}",
-                pod.name_any(),
-                condition.message.as_deref().unwrap_or("no eligible node")
-            ));
-        }
         for container in status.container_statuses.iter().flatten() {
             let current_terminated = container
                 .state
@@ -1238,21 +1263,22 @@ pub enum ReconcileError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, time::Duration};
 
     use k8s_openapi::api::core::v1::{Pod, Service};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+    use kube::runtime::controller::Action;
     use serde_json::{Value, json};
 
     use super::{
         AdminVolumeMount, desired_deployment, desired_network_policy,
         desired_network_policy_with_networks, desired_persistent_volume_claim, desired_service,
-        storage_allocation, validate_admin_volume_mounts, workload_failure_message,
-        workload_restart_message,
+        storage_allocation, update_workload_status, validate_admin_volume_mounts,
+        workload_failure_message, workload_restart_message,
     };
     use crate::{
         LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME,
-        crd::{FlashService, FlashServiceSpec},
+        crd::{FlashService, FlashServicePhase, FlashServiceSpec, FlashServiceStatus},
         domain::{
             ExposureType, FlashEgress, FlashExposure, FlashPort, FlashSpec, TrafficMode,
             TransportProtocol,
@@ -1488,6 +1514,164 @@ mod tests {
                 .pointer("/spec/template/spec/containers/0/resources/limits/ephemeral-storage"),
             Some(&json!(allocation.rootfs_bytes.to_string()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_pvc_recovers_without_a_user_update() -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.replicas = 1;
+        let original_spec = flash.spec.clone();
+        let mut status = FlashServiceStatus {
+            observed_generation: flash.spec.desired_generation,
+            desired_replicas: 1,
+            ..FlashServiceStatus::default()
+        };
+        let mut pod: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "flash-test-abc"},
+            "status": {
+                "phase": "Pending",
+                "conditions": [{
+                    "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                    "message": "0/3 nodes are available: pod has unbound immediate PersistentVolumeClaims."
+                }]
+            }
+        }))?;
+        for _ in 0..2 {
+            assert_eq!(workload_failure_message(std::slice::from_ref(&pod)), None);
+            assert_eq!(
+                update_workload_status(&mut status, std::slice::from_ref(&pod), true, true),
+                Action::requeue(Duration::from_secs(5))
+            );
+            assert_eq!(status.phase, FlashServicePhase::Provisioning);
+            assert_eq!(status.ready_replicas, 0);
+            let message = status.message.as_deref().unwrap_or_default();
+            assert!(message.contains("flash-test-abc"));
+            assert!(message.contains("Unschedulable"));
+            assert!(message.contains("unbound immediate PersistentVolumeClaims"));
+        }
+
+        // PVC binding and scheduling change only pod status, not the desired workload.
+        pod.status = Some(serde_json::from_value(json!({
+            "phase": "Pending",
+            "conditions": [{"type": "PodScheduled", "status": "True"}]
+        }))?);
+        assert_eq!(
+            update_workload_status(&mut status, std::slice::from_ref(&pod), true, true),
+            Action::requeue(Duration::from_secs(5))
+        );
+        assert_eq!(status.phase, FlashServicePhase::Provisioning);
+        assert!(
+            !status
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Unschedulable")
+        );
+
+        pod.status = Some(serde_json::from_value(json!({
+            "phase": "Running",
+            "conditions": [
+                {"type": "PodScheduled", "status": "True"},
+                {"type": "Ready", "status": "True"}
+            ]
+        }))?);
+        assert_eq!(
+            update_workload_status(&mut status, std::slice::from_ref(&pod), false, true),
+            Action::requeue(Duration::from_secs(5))
+        );
+        assert_eq!(status.phase, FlashServicePhase::Provisioning);
+        assert_eq!(
+            update_workload_status(&mut status, &[pod], true, true),
+            Action::await_change()
+        );
+        assert_eq!(status.phase, FlashServicePhase::Ready);
+        assert_eq!(status.ready_replicas, 1);
+        assert_eq!(status.message, None);
+        assert_eq!(status.observed_generation, original_spec.desired_generation);
+        assert_eq!(flash.spec, original_spec);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduling_delays_remain_provisioning() -> Result<(), Box<dyn std::error::Error>> {
+        for conditions in [
+            json!([]),
+            json!([{"type": "PodScheduled", "status": "False"}]),
+            json!([{
+                "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                "message": "0/3 nodes are available: insufficient cpu"
+            }]),
+            json!([{"type": "PodScheduled", "status": "False", "reason": "SchedulingGated"}]),
+        ] {
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "flash-pending"},
+                "status": {"phase": "Pending", "conditions": conditions}
+            }))?;
+            let mut status = FlashServiceStatus {
+                desired_replicas: 1,
+                ..FlashServiceStatus::default()
+            };
+            assert_eq!(
+                update_workload_status(&mut status, &[pod], true, false),
+                Action::requeue(Duration::from_secs(5))
+            );
+            assert_eq!(status.phase, FlashServicePhase::Provisioning);
+            assert!(
+                status
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("waiting for")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn permanent_errors_take_precedence_over_scheduling_delays()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pending: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "flash-pending"},
+            "status": {"conditions": [{
+                "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                "message": "unbound immediate PersistentVolumeClaims"
+            }]}
+        }))?;
+        for state in [
+            json!({"waiting": {"reason": "CreateContainerConfigError"}}),
+            json!({"waiting": {"reason": "CrashLoopBackOff"}}),
+            json!({"waiting": {"reason": "ErrImagePull"}}),
+            json!({"waiting": {"reason": "ImagePullBackOff"}}),
+            json!({"waiting": {"reason": "InvalidImageName"}}),
+            json!({"waiting": {"reason": "RunContainerError"}}),
+            json!({"terminated": {"exitCode": 1, "reason": "Error"}}),
+            json!({"terminated": {"exitCode": 0, "reason": "Completed"}}),
+        ] {
+            let failed: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "flash-failed"},
+                "status": {"containerStatuses": [{
+                    "name": "workload", "image": "example.invalid/test:v1", "imageID": "",
+                    "ready": false, "restartCount": 0, "state": state
+                }]}
+            }))?;
+            let mut status = FlashServiceStatus {
+                desired_replicas: 2,
+                ..FlashServiceStatus::default()
+            };
+            assert_eq!(
+                update_workload_status(&mut status, &[pending.clone(), failed], true, false),
+                Action::requeue(Duration::from_secs(5))
+            );
+            assert_eq!(status.phase, FlashServicePhase::Error);
+            assert!(
+                status
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("flash-failed")
+            );
+        }
         Ok(())
     }
 
