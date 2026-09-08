@@ -223,8 +223,7 @@ async fn reconcile(
     if let Err(error) = flash.spec.workload.validate() {
         patch_status_if_changed(
             &services,
-            &name,
-            flash.status.as_ref(),
+            &flash,
             FlashServiceStatus {
                 phase: FlashServicePhase::Error,
                 observed_generation: flash.spec.desired_generation,
@@ -258,8 +257,7 @@ async fn reconcile(
             Ok(Err(error)) if error.retryable() => {
                 patch_status_if_changed(
                     &services,
-                    &name,
-                    flash.status.as_ref(),
+                    &flash,
                     FlashServiceStatus {
                         phase: FlashServicePhase::Provisioning,
                         observed_generation: flash.spec.desired_generation,
@@ -276,8 +274,7 @@ async fn reconcile(
                 suspend_deployment(&context.client, &context.namespace, &name).await?;
                 patch_status_if_changed(
                     &services,
-                    &name,
-                    flash.status.as_ref(),
+                    &flash,
                     FlashServiceStatus {
                         phase: FlashServicePhase::Error,
                         observed_generation: flash.spec.desired_generation,
@@ -293,8 +290,7 @@ async fn reconcile(
             Err(_) => {
                 patch_status_if_changed(
                     &services,
-                    &name,
-                    flash.status.as_ref(),
+                    &flash,
                     FlashServiceStatus {
                         phase: FlashServicePhase::Provisioning,
                         observed_generation: flash.spec.desired_generation,
@@ -424,7 +420,7 @@ async fn reconcile(
         endpoint_ready,
         !flash.spec.workload.ports.is_empty(),
     );
-    patch_status_if_changed(&services, &name, flash.status.as_ref(), status).await?;
+    patch_status_if_changed(&services, &flash, status).await?;
     Ok(action)
 }
 
@@ -475,29 +471,31 @@ fn error_policy(
     Action::requeue(Duration::from_secs(5))
 }
 
-async fn patch_status(
-    services: &Api<FlashService>,
-    name: &str,
-    status: FlashServiceStatus,
-) -> Result<(), ReconcileError> {
-    services
-        .patch_status(
-            name,
-            &PatchParams::default(),
-            &Patch::Merge(json!({ "status": status })),
-        )
-        .await?;
-    Ok(())
+fn status_patch(flash: &FlashService, status: &FlashServiceStatus) -> Value {
+    let mut patch = json!({"status": status});
+    // Merge patches must explicitly clear fields omitted by status serialization.
+    patch["status"]["resolved_image"] = json!(status.resolved_image);
+    patch["status"]["image_size_bytes"] = json!(status.image_size_bytes);
+    patch["status"]["writable_storage_bytes"] = json!(status.writable_storage_bytes);
+    if let Some(version) = &flash.metadata.resource_version {
+        patch["metadata"] = json!({"resourceVersion": version});
+    }
+    patch
 }
 
 async fn patch_status_if_changed(
     services: &Api<FlashService>,
-    name: &str,
-    current: Option<&FlashServiceStatus>,
+    flash: &FlashService,
     status: FlashServiceStatus,
 ) -> Result<(), ReconcileError> {
-    if current != Some(&status) {
-        patch_status(services, name, status).await?;
+    if flash.status.as_ref() != Some(&status) {
+        services
+            .patch_status(
+                &flash.name_any(),
+                &PatchParams::default(),
+                &Patch::Merge(status_patch(flash, &status)),
+            )
+            .await?;
     }
     Ok(())
 }
@@ -1284,6 +1282,117 @@ mod tests {
             TransportProtocol,
         },
     };
+
+    #[tokio::test]
+    async fn status_clear_converges_and_stale_replica_cannot_restore_image_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use kube::{Api, Client, client::Body};
+        use std::sync::{Arc, Mutex};
+
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.metadata.resource_version = Some("10".into());
+        flash.status = Some(FlashServiceStatus {
+            observed_generation: 1,
+            resolved_image: Some("example.invalid/old@sha256:old".into()),
+            image_size_bytes: Some(1024),
+            writable_storage_bytes: Some(10 * crate::image::GIB_BYTES - 1024),
+            ..FlashServiceStatus::default()
+        });
+        flash.spec.desired_generation = 2;
+        let state = Arc::new(Mutex::new((serde_json::to_value(&flash)?, 0usize)));
+        let server_state = state.clone();
+        let client = Client::new(
+            tower::service_fn(move |request: http::Request<Body>| {
+                let state = server_state.clone();
+                async move {
+                    assert_eq!(request.method(), http::Method::PATCH);
+                    assert!(request.uri().path().ends_with("/status"));
+                    assert_eq!(
+                        request.headers()[http::header::CONTENT_TYPE],
+                        "application/merge-patch+json"
+                    );
+                    let patch: Value =
+                        serde_json::from_slice(&request.into_body().collect_bytes().await?)?;
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| std::io::Error::other("poisoned state"))?;
+                    state.1 += 1;
+                    let response = if patch["metadata"]["resourceVersion"]
+                        != state.0["metadata"]["resourceVersion"]
+                    {
+                        http::Response::builder().status(409).body(Body::from(serde_json::to_vec(&json!({
+                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                        "reason": "Conflict", "message": "stale resourceVersion", "code": 409
+                    }))?))?
+                    } else {
+                        // Status has scalar/array fields only; emulate JSON merge deletion.
+                        for (key, value) in patch["status"]
+                            .as_object()
+                            .ok_or_else(|| std::io::Error::other("missing status"))?
+                        {
+                            if value.is_null() {
+                                state.0["status"]
+                                    .as_object_mut()
+                                    .ok_or_else(|| std::io::Error::other("missing status"))?
+                                    .remove(key);
+                            } else {
+                                state.0["status"][key] = value.clone();
+                            }
+                        }
+                        state.0["metadata"]["resourceVersion"] = json!("11");
+                        http::Response::builder().body(Body::from(serde_json::to_vec(&state.0)?))?
+                    };
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response)
+                }
+            }),
+            "test",
+        );
+        let api = Api::<FlashService>::namespaced(client, "test");
+        let desired = FlashServiceStatus {
+            observed_generation: 2,
+            message: Some("waiting for image inspection".into()),
+            ..FlashServiceStatus::default()
+        };
+        super::patch_status_if_changed(&api, &flash, desired.clone()).await?;
+        let updated: FlashService = serde_json::from_value(
+            state
+                .lock()
+                .map_err(|_| std::io::Error::other("poisoned state"))?
+                .0
+                .clone(),
+        )?;
+        assert_eq!(updated.status.as_ref(), Some(&desired));
+        assert!(super::cached_image_inspection(&updated, 10 * crate::image::GIB_BYTES).is_none());
+        super::patch_status_if_changed(&api, &updated, desired).await?;
+        assert_eq!(
+            state
+                .lock()
+                .map_err(|_| std::io::Error::other("poisoned state"))?
+                .1,
+            1
+        );
+
+        let stale_desired = FlashServiceStatus {
+            phase: FlashServicePhase::Ready,
+            ..flash
+                .status
+                .clone()
+                .ok_or_else(|| std::io::Error::other("missing status"))?
+        };
+        assert!(matches!(
+            super::patch_status_if_changed(&api, &flash, stale_desired).await,
+            Err(super::ReconcileError::Kubernetes(kube::Error::Api(response))) if response.code == 409
+        ));
+        let persisted: FlashService = serde_json::from_value(
+            state
+                .lock()
+                .map_err(|_| std::io::Error::other("poisoned state"))?
+                .0
+                .clone(),
+        )?;
+        assert_eq!(persisted.status, updated.status);
+        Ok(())
+    }
 
     fn service(mode: TrafficMode) -> FlashService {
         FlashService::new(
