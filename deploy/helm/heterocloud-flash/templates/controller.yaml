@@ -34,6 +34,8 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/flash-controller"]
           env:
+            - name: FLASH_PUBLIC_DOMAIN
+              value: {{ .Values.publicDomain | quote }}
             - name: FLASH_WORKLOAD_NAMESPACE
               value: {{ .Values.workloadNamespace | quote }}
             - name: FLASH_ADDITIONAL_PROTECTED_CIDRS_JSON

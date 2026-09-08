@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, env, fs, process::ExitCode};
 use anyhow::{Context, Result};
 use heterocloud_flash::image::ImageInspector;
 use heterocloud_flash::reconcile::{
-    AdminVolumeMounts, run_controller, validate_admin_volume_mounts,
+    AdminVolumeMounts, run_controller, validate_admin_volume_mounts, validate_public_domain,
 };
 use ipnet::IpNet;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +34,10 @@ async fn run() -> Result<()> {
     let registry_password_file = optional("FLASH_REGISTRY_PASSWORD_FILE");
     let registry_pull_secret = optional("FLASH_REGISTRY_PULL_SECRET");
     let persistent_storage_class = optional("FLASH_PERSISTENT_STORAGE_CLASS");
+    let public_domain = optional("FLASH_PUBLIC_DOMAIN");
+    if let Some(domain) = &public_domain {
+        validate_public_domain(domain)?;
+    }
     let admin_volume_mounts = optional("FLASH_ADMIN_VOLUME_MOUNTS_JSON")
         .map(|value| serde_json::from_str::<AdminVolumeMounts>(&value))
         .transpose()
@@ -85,6 +89,7 @@ async fn run() -> Result<()> {
         admin_volume_mounts,
         additional_protected_networks,
         dns_networks,
+        public_domain,
     )
     .await
 }

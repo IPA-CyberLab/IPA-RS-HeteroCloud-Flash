@@ -59,6 +59,9 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
 
 ## Flash spec
 
+Optional autoscaling and domain endpoints are described in
+[Autoscaling and domain endpoints](docs/AUTOSCALING_AND_DOMAINS.md).
+
 ```json
 {
   "region": "heteronet-global",

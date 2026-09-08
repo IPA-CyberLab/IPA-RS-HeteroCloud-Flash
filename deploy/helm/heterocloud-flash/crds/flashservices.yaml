@@ -39,6 +39,40 @@ spec:
                     items:
                       type: string
                     type: array
+                  autoscaling:
+                    nullable: true
+                    properties:
+                      max_replicas:
+                        format: uint32
+                        maximum: 100000.0
+                        minimum: 1.0
+                        type: integer
+                      min_replicas:
+                        format: uint32
+                        maximum: 100000.0
+                        minimum: 1.0
+                        type: integer
+                      target_cpu_utilization_percent:
+                        format: uint32
+                        maximum: 100.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      target_memory_utilization_percent:
+                        format: uint32
+                        maximum: 100.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                    required:
+                    - max_replicas
+                    - min_replicas
+                    type: object
+                    x-kubernetes-validations:
+                    - message: max_replicas must be at least min_replicas
+                      rule: self.max_replicas >= self.min_replicas
+                    - message: at least one CPU or memory target is required
+                      rule: has(self.target_cpu_utilization_percent) || has(self.target_memory_utilization_percent)
                   command:
                     default: []
                     items:
@@ -103,6 +137,12 @@ spec:
                           type: string
                         maxItems: 64
                         type: array
+                      endpoint_mode:
+                        default: ip
+                        enum:
+                        - ip
+                        - load_balancer
+                        type: string
                       traffic_mode:
                         enum:
                         - forwarded
@@ -117,6 +157,9 @@ spec:
                     - traffic_mode
                     - type
                     type: object
+                    x-kubernetes-validations:
+                    - message: load_balancer requires public forwarded exposure
+                      rule: '!has(self.endpoint_mode) || self.endpoint_mode != ''load_balancer'' || (self.type == ''public'' && self.traffic_mode == ''forwarded'')'
                   image:
                     type: string
                   memory_mib:
@@ -169,6 +212,9 @@ spec:
                 - region
                 - replicas
                 type: object
+                x-kubernetes-validations:
+                - message: replicas must be within autoscaling bounds
+                  rule: '!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)'
             required:
             - desired_generation
             - display_name

@@ -6,6 +6,9 @@ metadata:
   labels:
     {{- include "flash.labels" . | nindent 4 }}
 rules:
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["flash.heterocloud.io"]
     resources: ["flashservices"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

@@ -46,6 +46,8 @@ pub struct FlashSpec {
     pub region: String,
     pub image: String,
     pub replicas: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscaling: Option<FlashAutoscaling>,
     pub cpu_millis: u32,
     pub memory_mib: u32,
     #[serde(default = "default_ephemeral_storage_gib")]
@@ -81,6 +83,18 @@ impl FlashSpec {
             return Err(ValidationError::Field(format!(
                 "replicas must be between 1 and {MAX_REPLICAS}"
             )));
+        }
+        if let Some(scaling) = &self.autoscaling {
+            scaling.validate(self.replicas)?;
+        }
+        if self.exposure.endpoint_mode == EndpointMode::LoadBalancer
+            && (self.exposure.kind != ExposureType::Public
+                || self.exposure.traffic_mode != TrafficMode::Forwarded)
+        {
+            return Err(ValidationError::Field(
+                "load_balancer endpoint_mode requires public exposure and forwarded traffic_mode"
+                    .into(),
+            ));
         }
         if !(10..=MAX_CPU_MILLIS).contains(&self.cpu_millis) {
             return Err(ValidationError::Field(format!(
@@ -155,6 +169,57 @@ impl FlashSpec {
         validate_string_list("args", &self.args, 256)?;
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlashAutoscaling {
+    #[schemars(range(min = 1, max = 100_000))]
+    pub min_replicas: u32,
+    #[schemars(range(min = 1, max = 100_000))]
+    pub max_replicas: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub target_cpu_utilization_percent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub target_memory_utilization_percent: Option<u32>,
+}
+
+impl FlashAutoscaling {
+    fn validate(&self, replicas: u32) -> Result<(), ValidationError> {
+        if self.min_replicas == 0
+            || self.max_replicas > MAX_REPLICAS
+            || self.max_replicas < self.min_replicas
+            || !(self.min_replicas..=self.max_replicas).contains(&replicas)
+        {
+            return Err(ValidationError::Field(
+                "autoscaling requires 1 <= min_replicas <= replicas <= max_replicas <= 100000"
+                    .into(),
+            ));
+        }
+        let targets = [
+            self.target_cpu_utilization_percent,
+            self.target_memory_utilization_percent,
+        ];
+        if targets.iter().all(Option::is_none)
+            || targets
+                .into_iter()
+                .flatten()
+                .any(|target| !(1..=100).contains(&target))
+        {
+            return Err(ValidationError::Field("autoscaling requires at least one CPU or memory target, each between 1 and 100 percent".into()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointMode {
+    #[default]
+    Ip,
+    LoadBalancer,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -316,6 +381,8 @@ impl TransportProtocol {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlashExposure {
+    #[serde(default)]
+    pub endpoint_mode: EndpointMode,
     #[serde(rename = "type")]
     pub kind: ExposureType,
     pub traffic_mode: TrafficMode,
@@ -537,6 +604,7 @@ mod tests {
             region: "heteronet-global".into(),
             image: "ghcr.io/example/udp-server:v1".into(),
             replicas: 3,
+            autoscaling: None,
             cpu_millis: 500,
             memory_mib: 256,
             ephemeral_storage_gib: 10,
@@ -547,6 +615,7 @@ mod tests {
                 service_port: 7777,
             }],
             exposure: FlashExposure {
+                endpoint_mode: super::EndpointMode::Ip,
                 kind: ExposureType::Public,
                 traffic_mode: TrafficMode::Forwarded,
                 allowed_source_cidrs: Vec::new(),
@@ -563,6 +632,58 @@ mod tests {
     #[test]
     fn accepts_udp_service() {
         assert!(valid_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn autoscaling_targets_and_bounds() -> Result<(), Box<dyn std::error::Error>> {
+        for targets in [
+            serde_json::json!({"target_cpu_utilization_percent": 1}),
+            serde_json::json!({"target_memory_utilization_percent": 100}),
+            serde_json::json!({"target_cpu_utilization_percent": 60, "target_memory_utilization_percent": 80}),
+        ] {
+            let mut scaling = targets;
+            scaling["min_replicas"] = 2.into();
+            scaling["max_replicas"] = 5.into();
+            let mut spec = valid_spec();
+            spec.autoscaling = Some(serde_json::from_value(scaling)?);
+            assert!(spec.validate().is_ok());
+            spec.replicas = 1;
+            assert!(spec.validate().is_err());
+            spec.replicas = 6;
+            assert!(spec.validate().is_err());
+        }
+        for scaling in [
+            serde_json::json!({"min_replicas": 1, "max_replicas": 4}),
+            serde_json::json!({"min_replicas": 0, "max_replicas": 4, "target_cpu_utilization_percent": 60}),
+            serde_json::json!({"min_replicas": 4, "max_replicas": 3, "target_cpu_utilization_percent": 60}),
+            serde_json::json!({"min_replicas": 1, "max_replicas": 100001, "target_cpu_utilization_percent": 60}),
+            serde_json::json!({"min_replicas": 1, "max_replicas": 4, "target_cpu_utilization_percent": 0}),
+            serde_json::json!({"min_replicas": 1, "max_replicas": 4, "target_memory_utilization_percent": 101}),
+        ] {
+            let mut spec = valid_spec();
+            spec.autoscaling = Some(serde_json::from_value(scaling)?);
+            assert!(spec.validate().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn domain_mode_requires_public_forwarded_and_defaults_to_ip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let exposure: FlashExposure = serde_json::from_value(
+            serde_json::json!({"type": "public", "traffic_mode": "forwarded"}),
+        )?;
+        assert_eq!(exposure.endpoint_mode, super::EndpointMode::Ip);
+        let mut spec = valid_spec();
+        spec.exposure.endpoint_mode = super::EndpointMode::LoadBalancer;
+        assert!(spec.validate().is_ok());
+        spec.exposure.traffic_mode = TrafficMode::Direct;
+        assert!(spec.validate().is_err());
+        spec.exposure.traffic_mode = TrafficMode::Forwarded;
+        spec.exposure.kind = ExposureType::Internal;
+        assert!(spec.validate().is_err());
+        assert!(serde_json::from_value::<FlashExposure>(serde_json::json!({"type": "public", "traffic_mode": "forwarded", "hostname": "tenant.example"})).is_err());
+        Ok(())
     }
 
     #[test]

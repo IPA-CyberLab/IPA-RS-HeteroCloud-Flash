@@ -15,6 +15,9 @@ api:
       cpu: 500m
       memory: 512Mi
 
+# Trusted provider suffix; empty disables domain endpoints.
+publicDomain: ""
+
 controller:
   replicaCount: 2
   resources:

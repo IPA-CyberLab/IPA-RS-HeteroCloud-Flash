@@ -1,10 +1,9 @@
 use std::process::ExitCode;
 
-use heterocloud_flash::crd::FlashService;
-use kube::CustomResourceExt;
+use heterocloud_flash::crd::validated_crd;
 
 fn main() -> ExitCode {
-    match serde_yaml::to_string(&FlashService::crd()) {
+    match validated_crd().and_then(|crd| Ok(serde_yaml::to_string(&crd)?)) {
         Ok(document) => {
             print!("{document}");
             ExitCode::SUCCESS

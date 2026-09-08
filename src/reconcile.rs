@@ -10,6 +10,7 @@ use ipnet::IpNet;
 use k8s_openapi::{
     api::{
         apps::v1::Deployment,
+        autoscaling::v2::HorizontalPodAutoscaler,
         core::v1::{Node, PersistentVolumeClaim, Pod, Service},
         networking::v1::NetworkPolicy,
     },
@@ -33,11 +34,14 @@ use uuid::Uuid;
 use crate::{
     LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME, TRAFFIC_MODE_ANNOTATION,
     crd::{FlashEndpoint, FlashService, FlashServicePhase, FlashServiceStatus},
-    domain::{ExposureType, TrafficMode, ValidationError},
+    domain::{EndpointMode, ExposureType, TrafficMode, ValidationError},
     image::{GIB_BYTES, ImageInspection, ImageInspector},
 };
 
 const FIELD_MANAGER: &str = "heterocloud-flash-controller";
+const REPLICAS_MANAGER: &str = "heterocloud-flash-replicas";
+const DNS_HOSTNAME: &str = "external-dns.alpha.kubernetes.io/hostname";
+const DNS_PUBLISH_LABEL: &str = "dns.heterocloud.io/publish";
 const GENERATION_LABEL: &str = "flash.heterocloud.io/generation";
 const ASSIGNED_NODES_ANNOTATION: &str = "networking.heteronetwork.io/assigned-nodes";
 const PERSISTENT_HOME_VOLUME: &str = "persistent-home";
@@ -136,6 +140,7 @@ pub struct ControllerContext {
     admin_volume_mounts: AdminVolumeMounts,
     additional_protected_networks: Vec<IpNet>,
     dns_networks: Vec<IpNet>,
+    public_domain: Option<String>,
 }
 
 impl ControllerContext {
@@ -149,6 +154,7 @@ impl ControllerContext {
         admin_volume_mounts: AdminVolumeMounts,
         additional_protected_networks: Vec<IpNet>,
         dns_networks: Vec<IpNet>,
+        public_domain: Option<String>,
     ) -> Self {
         Self {
             client,
@@ -159,6 +165,7 @@ impl ControllerContext {
             admin_volume_mounts,
             additional_protected_networks,
             dns_networks,
+            public_domain,
         }
     }
 }
@@ -172,6 +179,7 @@ pub async fn run_controller(
     admin_volume_mounts: AdminVolumeMounts,
     additional_protected_networks: Vec<IpNet>,
     dns_networks: Vec<IpNet>,
+    public_domain: Option<String>,
 ) -> Result<()> {
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
@@ -180,6 +188,7 @@ pub async fn run_controller(
     let persistent_volume_claims =
         Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace);
     let pods = Api::<Pod>::namespaced(client.clone(), &namespace);
+    let autoscalers = Api::<HorizontalPodAutoscaler>::namespaced(client.clone(), &namespace);
     let context = Arc::new(ControllerContext::new(
         client,
         namespace,
@@ -189,11 +198,13 @@ pub async fn run_controller(
         admin_volume_mounts,
         additional_protected_networks,
         dns_networks,
+        public_domain,
     ));
 
     info!("FlashService controller started");
     Controller::new(services, watcher::Config::default())
         .owns(deployments, watcher::Config::default())
+        .owns(autoscalers, watcher::Config::default())
         .owns(network_services, watcher::Config::default())
         .owns(network_policies, watcher::Config::default())
         .owns(persistent_volume_claims, watcher::Config::default())
@@ -220,7 +231,13 @@ async fn reconcile(
     let name = flash.name_any();
     let services = Api::<FlashService>::namespaced(context.client.clone(), &context.namespace);
 
-    if let Err(error) = flash.spec.workload.validate() {
+    if let Err(error) = flash
+        .spec
+        .workload
+        .validate()
+        .map_err(ReconcileError::from)
+        .and_then(|()| public_hostname(&flash, context.public_domain.as_deref()).map(|_| ()))
+    {
         patch_status_if_changed(
             &services,
             &flash,
@@ -337,8 +354,9 @@ async fn reconcile(
             .map(Vec::as_slice)
             .unwrap_or_default(),
     )?;
-    let desired_network_service = desired_service(&flash, &owner)?;
-    let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
+    let hostname = public_hostname(&flash, context.public_domain.as_deref())?;
+    let desired_network_service =
+        desired_service_with_hostname(&flash, &owner, hostname.as_deref())?;
     let network_services = Api::<Service>::namespaced(context.client.clone(), &context.namespace);
     let network_policies =
         Api::<NetworkPolicy>::namespaced(context.client.clone(), &context.namespace);
@@ -373,9 +391,19 @@ async fn reconcile(
     network_policies
         .patch(&name, &params, &Patch::Apply(&network_policy))
         .await?;
-    deployments
-        .patch(&name, &params, &Patch::Apply(&deployment))
-        .await?;
+    let applied_deployment = reconcile_scaling(
+        &context.client,
+        &context.namespace,
+        &flash,
+        &owner,
+        deployment,
+    )
+    .await?;
+    let desired_replicas = applied_deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(desired_replicas);
     let network_service = if let Some(network_service) = &desired_network_service {
         Some(
             network_services
@@ -395,7 +423,7 @@ async fn reconcile(
     };
     let endpoints = network_service
         .as_ref()
-        .map(|service| service_endpoints(&flash, service))
+        .map(|service| service_endpoints(&flash, service, hostname.as_deref()))
         .unwrap_or_default();
     let endpoint_ready = flash.spec.workload.ports.is_empty() || !endpoints.is_empty();
     let pods = Api::<Pod>::namespaced(context.client.clone(), &context.namespace)
@@ -420,6 +448,16 @@ async fn reconcile(
         endpoint_ready,
         !flash.spec.workload.ports.is_empty(),
     );
+    if hostname.is_some()
+        && !status.endpoints.is_empty()
+        && status.phase == FlashServicePhase::Ready
+    {
+        let note = "Load balancer allocated; DNS publication/resolution is not verified";
+        status.message = Some(match status.message.take() {
+            Some(message) => format!("{message}; {note}"),
+            None => note.into(),
+        });
+    }
     patch_status_if_changed(&services, &flash, status).await?;
     Ok(action)
 }
@@ -733,6 +771,10 @@ async fn suspend_deployment(
     namespace: &str,
     name: &str,
 ) -> Result<(), ReconcileError> {
+    let autoscalers = Api::<HorizontalPodAutoscaler>::namespaced(client.clone(), namespace);
+    if !delete_autoscaler(&autoscalers, name).await? {
+        return Err(anyhow::anyhow!("waiting for autoscaler deletion before suspension").into());
+    }
     let deployments = Api::<Deployment>::namespaced(client.clone(), namespace);
     if deployments.get_opt(name).await?.is_some_and(|deployment| {
         deployment.spec.as_ref().and_then(|spec| spec.replicas) != Some(0)
@@ -746,6 +788,155 @@ async fn suspend_deployment(
             .await?;
     }
     Ok(())
+}
+
+pub fn validate_public_domain(domain: &str) -> Result<()> {
+    if !valid_dns_subdomain(domain, 214) || domain.parse::<std::net::IpAddr>().is_ok() {
+        anyhow::bail!(
+            "publicDomain must be a lowercase DNS suffix, without scheme, port, wildcard or trailing dot (maximum 214 characters)"
+        );
+    }
+    Ok(())
+}
+
+fn public_hostname(
+    flash: &FlashService,
+    domain: Option<&str>,
+) -> Result<Option<String>, ReconcileError> {
+    if flash.spec.workload.exposure.endpoint_mode != EndpointMode::LoadBalancer {
+        return Ok(None);
+    }
+    let domain =
+        domain.ok_or_else(|| anyhow::anyhow!("load_balancer requires provider publicDomain"))?;
+    validate_public_domain(domain)?;
+    let id = Uuid::parse_str(&flash.spec.service_instance_id)
+        .context("invalid service instance UUID")?;
+    Ok(Some(format!("f-{id}.{domain}")))
+}
+
+fn desired_autoscaler(
+    flash: &FlashService,
+    owner: &OwnerReference,
+) -> Result<Option<HorizontalPodAutoscaler>, ReconcileError> {
+    let Some(scaling) = &flash.spec.workload.autoscaling else {
+        return Ok(None);
+    };
+    let metrics = [("cpu", scaling.target_cpu_utilization_percent), ("memory", scaling.target_memory_utilization_percent)]
+        .into_iter().filter_map(|(name, target)| target.map(|target| json!({
+            "type": "Resource", "resource": {"name": name, "target": {"type": "Utilization", "averageUtilization": target}}
+        }))).collect::<Vec<_>>();
+    Ok(Some(from_value(json!({
+        "apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
+        "metadata": {"name": flash.name_any(), "labels": base_labels(flash), "ownerReferences": [owner]},
+        "spec": {
+            "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": flash.name_any()},
+            "minReplicas": scaling.min_replicas, "maxReplicas": scaling.max_replicas,
+            "metrics": metrics, "behavior": {"scaleDown": {"stabilizationWindowSeconds": 300}}
+        }
+    }))?))
+}
+
+async fn delete_autoscaler(
+    api: &Api<HorizontalPodAutoscaler>,
+    name: &str,
+) -> Result<bool, ReconcileError> {
+    if let Some(hpa) = api.get_opt(name).await? {
+        if hpa.metadata.deletion_timestamp.is_none() {
+            let params = DeleteParams {
+                preconditions: Some(kube::api::Preconditions {
+                    uid: hpa.metadata.uid,
+                    resource_version: hpa.metadata.resource_version,
+                }),
+                ..DeleteParams::default()
+            };
+            match api.delete(name, &params).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(response)) if response.code == 404 => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        return Ok(api.get_opt(name).await?.is_none());
+    }
+    Ok(true)
+}
+
+fn legacy_owns_replicas(deployment: &Deployment) -> bool {
+    deployment
+        .metadata
+        .managed_fields
+        .iter()
+        .flatten()
+        .any(|entry| {
+            entry.manager.as_deref() == Some(FIELD_MANAGER)
+                && entry
+                    .fields_v1
+                    .as_ref()
+                    .is_some_and(|fields| fields.0.pointer("/f:spec/f:replicas").is_some())
+        })
+}
+
+async fn reconcile_scaling(
+    client: &Client,
+    namespace: &str,
+    flash: &FlashService,
+    owner: &OwnerReference,
+    mut desired: Deployment,
+) -> Result<Deployment, ReconcileError> {
+    let name = flash.name_any();
+    let deployments = Api::<Deployment>::namespaced(client.clone(), namespace);
+    let autoscalers = Api::<HorizontalPodAutoscaler>::namespaced(client.clone(), namespace);
+    let hpa = desired_autoscaler(flash, owner)?;
+    if hpa.is_none() && !delete_autoscaler(&autoscalers, &name).await? {
+        return Err(anyhow::anyhow!("waiting for autoscaler deletion before fixed scaling").into());
+    }
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    let mut current = match deployments.get_opt(&name).await? {
+        Some(current) => current,
+        // Initialize once at the requested count, then relinquish main-manager ownership.
+        None => {
+            deployments
+                .create(
+                    &kube::api::PostParams {
+                        field_manager: Some(FIELD_MANAGER.into()),
+                        ..Default::default()
+                    },
+                    &desired,
+                )
+                .await?
+        }
+    };
+    if hpa.is_none() || legacy_owns_replicas(&current) {
+        let replicas = if hpa.is_none() {
+            i32::try_from(flash.spec.workload.replicas)
+                .map_err(|_| ReconcileError::InvalidReplicaCount)?
+        } else {
+            current
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .unwrap_or(1)
+        };
+        // Share the live count before omission so SSA cannot default it to one.
+        // The resourceVersion fences concurrent HPA writes; this manager stays dormant under HPA.
+        current = deployments.patch(&name, &PatchParams::apply(REPLICAS_MANAGER).force(), &Patch::Apply(json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": name, "resourceVersion": current.metadata.resource_version},
+            "spec": {"replicas": replicas}
+        }))).await?;
+    }
+    if let Some(spec) = desired.spec.as_mut() {
+        spec.replicas = None;
+    }
+    desired.metadata.resource_version = current.metadata.resource_version;
+    let applied = deployments
+        .patch(&name, &params, &Patch::Apply(&desired))
+        .await?;
+    if let Some(hpa) = hpa {
+        autoscalers
+            .patch(&name, &params, &Patch::Apply(&hpa))
+            .await?;
+    }
+    Ok(applied)
 }
 
 fn pod_is_ready(pod: &Pod) -> bool {
@@ -890,9 +1081,18 @@ fn flash_service_for_pod(pod: Pod) -> Option<ObjectRef<FlashService>> {
     Some(ObjectRef::new(&format!("flash-{service_instance_id}")).within(&namespace))
 }
 
+#[cfg(test)]
 fn desired_service(
     flash: &FlashService,
     owner: &OwnerReference,
+) -> Result<Option<Service>, ReconcileError> {
+    desired_service_with_hostname(flash, owner, None)
+}
+
+fn desired_service_with_hostname(
+    flash: &FlashService,
+    owner: &OwnerReference,
+    hostname: Option<&str>,
 ) -> Result<Option<Service>, ReconcileError> {
     let workload = &flash.spec.workload;
     if workload.ports.is_empty() {
@@ -911,6 +1111,18 @@ fn desired_service(
         })
         .collect::<Vec<_>>();
     let mut annotations = BTreeMap::new();
+    let mut labels = base_labels(flash);
+    if workload.exposure.endpoint_mode == EndpointMode::LoadBalancer {
+        let hostname = hostname
+            .ok_or_else(|| anyhow::anyhow!("load_balancer requires provider publicDomain"))?;
+        annotations.insert(DNS_HOSTNAME, hostname);
+        annotations.insert("external-dns.alpha.kubernetes.io/ttl", "60");
+        annotations.insert(
+            "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+            "false",
+        );
+        labels.insert(DNS_PUBLISH_LABEL.into(), "true".into());
+    }
     let (kind, load_balancer_class, external_traffic_policy) =
         if workload.exposure.kind == ExposureType::Public {
             annotations.insert(
@@ -957,7 +1169,7 @@ fn desired_service(
         "kind": "Service",
         "metadata": {
             "name": flash.name_any(),
-            "labels": base_labels(flash),
+            "labels": labels,
             "annotations": annotations,
             "ownerReferences": [owner],
         },
@@ -1162,8 +1374,12 @@ async fn assigned_forwarder_networks(
     Ok(networks.into_iter().collect())
 }
 
-fn service_endpoints(flash: &FlashService, service: &Service) -> Vec<FlashEndpoint> {
-    let hosts = match flash.spec.workload.exposure.kind {
+fn service_endpoints(
+    flash: &FlashService,
+    service: &Service,
+    hostname: Option<&str>,
+) -> Vec<FlashEndpoint> {
+    let mut hosts = match flash.spec.workload.exposure.kind {
         ExposureType::Internal => service
             .spec
             .as_ref()
@@ -1190,6 +1406,13 @@ fn service_endpoints(flash: &FlashService, service: &Service) -> Vec<FlashEndpoi
             })
             .unwrap_or_default(),
     };
+    if flash.spec.workload.exposure.endpoint_mode == EndpointMode::LoadBalancer {
+        hosts = if hosts.is_empty() {
+            Vec::new()
+        } else {
+            hostname.into_iter().map(str::to_owned).collect()
+        };
+    }
     hosts
         .into_iter()
         .flat_map(|host| {
@@ -1407,6 +1630,7 @@ mod tests {
                     region: "heteronet-global".into(),
                     image: "example.invalid/udp:v1".into(),
                     replicas: 3,
+                    autoscaling: None,
                     cpu_millis: 250,
                     memory_mib: 128,
                     ephemeral_storage_gib: 10,
@@ -1417,6 +1641,7 @@ mod tests {
                         service_port: 7777,
                     }],
                     exposure: FlashExposure {
+                        endpoint_mode: crate::domain::EndpointMode::Ip,
                         kind: ExposureType::Public,
                         traffic_mode: mode,
                         allowed_source_cidrs: Vec::new(),
@@ -1975,6 +2200,261 @@ mod tests {
         assert_eq!(
             value.pointer("/metadata/annotations/networking.heteronetwork.io~1traffic-mode"),
             Some(&json!("forwarded"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn domain_service_annotations_status_and_isolation() -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.exposure.allowed_source_cidrs = vec!["192.0.2.0/24".into()];
+        flash.spec.workload.exposure.denied_source_cidrs = vec!["192.0.2.128/25".into()];
+        let ip_service = exposed_service(&flash)?;
+        let policy = desired_network_policy(&flash, &owner())?;
+        flash.spec.workload.exposure.endpoint_mode = crate::domain::EndpointMode::LoadBalancer;
+        assert!(super::public_hostname(&flash, None).is_err());
+        for invalid in [
+            "https://example.com",
+            "*.example.com",
+            "example.com.",
+            "example.com:443",
+            "127.0.0.1",
+            "UPPER.example",
+            "bad..example",
+        ] {
+            assert!(super::public_hostname(&flash, Some(invalid)).is_err());
+        }
+        let hostname = super::public_hostname(&flash, Some("flash.heterocloud.mizuame.app"))?
+            .ok_or("missing hostname")?;
+        assert_eq!(
+            hostname,
+            format!(
+                "f-{}.flash.heterocloud.mizuame.app",
+                flash.spec.service_instance_id
+            )
+        );
+        flash.spec.display_name = "tenant-controlled-name".into();
+        assert_eq!(
+            super::public_hostname(&flash, Some("flash.heterocloud.mizuame.app"))?,
+            Some(hostname.clone())
+        );
+        let mut lb = super::desired_service_with_hostname(&flash, &owner(), Some(&hostname))?
+            .ok_or("missing service")?;
+        assert_eq!(lb.spec, ip_service.spec);
+        assert_eq!(desired_network_policy(&flash, &owner())?, policy);
+        let annotations = lb
+            .metadata
+            .annotations
+            .as_ref()
+            .ok_or("missing annotations")?;
+        assert_eq!(annotations.get(super::DNS_HOSTNAME), Some(&hostname));
+        assert_eq!(
+            annotations
+                .get("external-dns.alpha.kubernetes.io/ttl")
+                .map(String::as_str),
+            Some("60")
+        );
+        assert_eq!(
+            annotations
+                .get("external-dns.alpha.kubernetes.io/cloudflare-proxied")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            lb.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(super::DNS_PUBLISH_LABEL))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(super::service_endpoints(&flash, &lb, Some(&hostname)).is_empty());
+        lb.status = Some(serde_json::from_value(
+            json!({"loadBalancer": {"ingress": [{"ip": "192.0.2.1"}, {"ip": "192.0.2.2"}]}}),
+        )?);
+        let endpoints = super::service_endpoints(&flash, &lb, Some(&hostname));
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].host, hostname);
+        assert_eq!(endpoints[0].port, 7777);
+        assert_eq!(endpoints[0].protocol, TransportProtocol::Udp);
+        assert!(super::service_endpoints(&flash, &lb, None).is_empty());
+        flash.spec.workload.exposure.endpoint_mode = crate::domain::EndpointMode::Ip;
+        let fixed = exposed_service(&flash)?;
+        assert!(
+            !fixed
+                .metadata
+                .labels
+                .ok_or("missing labels")?
+                .contains_key(super::DNS_PUBLISH_LABEL)
+        );
+        assert!(
+            !fixed
+                .metadata
+                .annotations
+                .ok_or("missing annotations")?
+                .keys()
+                .any(|key| key.starts_with("external-dns."))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hpa_independent_resource_metrics() -> Result<(), Box<dyn std::error::Error>> {
+        for (cpu, memory, names) in [
+            (Some(60), None, vec!["cpu"]),
+            (None, Some(80), vec!["memory"]),
+            (Some(60), Some(80), vec!["cpu", "memory"]),
+        ] {
+            let mut flash = service(TrafficMode::Forwarded);
+            flash.spec.workload.autoscaling = Some(crate::domain::FlashAutoscaling {
+                min_replicas: 2,
+                max_replicas: 10,
+                target_cpu_utilization_percent: cpu,
+                target_memory_utilization_percent: memory,
+            });
+            let hpa = serde_json::to_value(
+                super::desired_autoscaler(&flash, &owner())?.ok_or("missing HPA")?,
+            )?;
+            assert_eq!(hpa["apiVersion"], "autoscaling/v2");
+            assert_eq!(hpa["spec"]["minReplicas"], 2);
+            assert_eq!(hpa["spec"]["maxReplicas"], 10);
+            assert_eq!(
+                hpa["spec"]["behavior"]["scaleDown"]["stabilizationWindowSeconds"],
+                300
+            );
+            let metrics = hpa["spec"]["metrics"].as_array().ok_or("missing metrics")?;
+            assert_eq!(metrics.len(), names.len());
+            for (metric, name) in metrics.iter().zip(names) {
+                assert_eq!(metric["resource"]["name"], name);
+                assert_eq!(metric["resource"]["target"]["type"], "Utilization");
+            }
+        }
+        assert!(super::desired_autoscaler(&service(TrafficMode::Forwarded), &owner())?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scaling_handoff_and_fixed_transitions() -> Result<(), Box<dyn std::error::Error>> {
+        use kube::{Client, client::Body};
+        use std::sync::{Arc, Mutex};
+        let mut flash = service(TrafficMode::Forwarded);
+        let deployment = desired_deployment(
+            &flash,
+            &owner(),
+            "example.invalid/test@sha256:verified",
+            1024,
+            None,
+            None,
+            &[],
+        )?;
+        let mut live = serde_json::to_value(&deployment)?;
+        live["metadata"]["resourceVersion"] = json!("1");
+        live["metadata"]["managedFields"] = json!([{
+            "manager": super::FIELD_MANAGER, "fieldsV1": {"f:spec": {"f:replicas": {}}}
+        }]);
+        // A request-level fake verifies ordering/payloads, not Kubernetes' SSA implementation.
+        let state = Arc::new(Mutex::new((live, None::<Value>, Vec::<String>::new())));
+        let server_state = state.clone();
+        let client = Client::new(
+            tower::service_fn(move |request: http::Request<Body>| {
+                let state = server_state.clone();
+                async move {
+                    let method = request.method().clone();
+                    let uri = request.uri().to_string();
+                    let body = request.into_body().collect_bytes().await?;
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| std::io::Error::other("poisoned state"))?;
+                    let hpa = uri.contains("horizontalpodautoscalers");
+                    let mut code = 200;
+                    let result = match method {
+                    http::Method::GET if hpa => state.1.clone().unwrap_or_else(|| {
+                        code = 404;
+                        json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "reason": "NotFound", "message": "absent", "code": 404})
+                    }),
+                    http::Method::GET => state.0.clone(),
+                    http::Method::DELETE => {
+                        assert!(hpa);
+                        state.2.push("delete-hpa".into());
+                        state.1 = None;
+                        json!({"apiVersion": "v1", "kind": "Status", "status": "Success"})
+                    },
+                    http::Method::PATCH => {
+                        let patch: Value = serde_json::from_slice(&body)?;
+                        if hpa {
+                            state.2.push("apply-hpa".into());
+                            state.1 = Some(patch.clone());
+                            patch
+                        } else {
+                            assert_eq!(patch["metadata"]["resourceVersion"], state.0["metadata"]["resourceVersion"]);
+                            if uri.contains(super::REPLICAS_MANAGER) {
+                                state.2.push(format!("replicas:{}", patch["spec"]["replicas"]));
+                                state.0["spec"]["replicas"] = patch["spec"]["replicas"].clone();
+                            } else {
+                                assert!(patch["spec"].get("replicas").is_none());
+                                state.2.push("apply-workload-without-replicas".into());
+                                state.0["metadata"]["managedFields"] = json!([]);
+                            }
+                            let revision = state.0["metadata"]["resourceVersion"].as_str().ok_or("missing revision")?.parse::<u32>()? + 1;
+                            state.0["metadata"]["resourceVersion"] = json!(revision.to_string());
+                            state.0.clone()
+                        }
+                    },
+                    _ => return Err("unexpected request".into()),
+                };
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        http::Response::builder()
+                            .status(code)
+                            .body(Body::from(serde_json::to_vec(&result)?))?,
+                    )
+                }
+            }),
+            "test",
+        );
+        let scaling = crate::domain::FlashAutoscaling {
+            min_replicas: 2,
+            max_replicas: 10,
+            target_cpu_utilization_percent: Some(60),
+            target_memory_utilization_percent: None,
+        };
+        flash.spec.workload.autoscaling = Some(scaling.clone());
+        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone()).await?;
+        {
+            let mut state = state.lock().map_err(|_| "poisoned state")?;
+            assert_eq!(
+                state.2,
+                ["replicas:3", "apply-workload-without-replicas", "apply-hpa"]
+            );
+            state.2.clear();
+            state.0["spec"]["replicas"] = json!(7);
+        }
+        let applied =
+            super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone()).await?;
+        assert_eq!(applied.spec.and_then(|spec| spec.replicas), Some(7));
+        {
+            let mut state = state.lock().map_err(|_| "poisoned state")?;
+            assert_eq!(state.2, ["apply-workload-without-replicas", "apply-hpa"]);
+            state.2.clear();
+        }
+        flash.spec.workload.autoscaling = None;
+        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone()).await?;
+        {
+            let mut state = state.lock().map_err(|_| "poisoned state")?;
+            assert_eq!(
+                state.2,
+                [
+                    "delete-hpa",
+                    "replicas:3",
+                    "apply-workload-without-replicas"
+                ]
+            );
+            state.2.clear();
+        }
+        flash.spec.workload.autoscaling = Some(scaling);
+        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment).await?;
+        assert_eq!(
+            state.lock().map_err(|_| "poisoned state")?.2,
+            ["apply-workload-without-replicas", "apply-hpa"]
         );
         Ok(())
     }

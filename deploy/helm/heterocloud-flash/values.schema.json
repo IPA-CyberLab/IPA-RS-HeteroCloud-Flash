@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "publicDomain": {
+      "type": "string",
+      "maxLength": 214,
+      "pattern": "^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
+      "description": "Trusted DNS suffix for Flash domain endpoints; empty disables domain mode."
+    }
+  }
+}
