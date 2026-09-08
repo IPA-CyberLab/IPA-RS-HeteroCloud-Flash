@@ -1291,7 +1291,7 @@ fn desired_network_policy_with_networks(
         egress.push(json!({"to": destinations}));
     }
 
-    Ok(from_value(json!({
+    let mut policy: NetworkPolicy = from_value(json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
         "metadata": {
@@ -1309,7 +1309,44 @@ fn desired_network_policy_with_networks(
             "ingress": ingress,
             "egress": egress,
         }
-    }))?)
+    }))?;
+    normalize_network_policy(&mut policy);
+    Ok(policy)
+}
+
+fn omit_empty<T>(values: &mut Option<Vec<T>>) {
+    if values.as_ref().is_some_and(Vec::is_empty) {
+        *values = None;
+    }
+}
+
+fn normalize_network_policy(policy: &mut NetworkPolicy) {
+    let Some(spec) = policy.spec.as_mut() else {
+        return;
+    };
+    // Kubernetes omits empty slices but compares NetworkPolicy specs with reflect.DeepEqual.
+    // Sending Some([]) repeatedly therefore increments generation and retriggers our watch.
+    omit_empty(&mut spec.ingress);
+    omit_empty(&mut spec.egress);
+    omit_empty(&mut spec.policy_types);
+    for rule in spec.ingress.iter_mut().flatten() {
+        omit_empty(&mut rule.ports);
+        omit_empty(&mut rule.from);
+        for peer in rule.from.iter_mut().flatten() {
+            if let Some(block) = peer.ip_block.as_mut() {
+                omit_empty(&mut block.except);
+            }
+        }
+    }
+    for rule in spec.egress.iter_mut().flatten() {
+        omit_empty(&mut rule.ports);
+        omit_empty(&mut rule.to);
+        for peer in rule.to.iter_mut().flatten() {
+            if let Some(block) = peer.ip_block.as_mut() {
+                omit_empty(&mut block.except);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2565,7 +2602,8 @@ mod tests {
 
         assert!(desired_service(&flash, &owner())?.is_none());
         let policy = serde_json::to_value(desired_network_policy(&flash, &owner())?)?;
-        assert_eq!(policy.pointer("/spec/ingress"), Some(&json!([])));
+        assert_eq!(policy.pointer("/spec/ingress"), None);
+        assert_eq!(policy["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
         assert!(policy.pointer("/spec/egress/0").is_some());
         let deployment = serde_json::to_value(desired_deployment(
             &flash,
@@ -2580,6 +2618,186 @@ mod tests {
             deployment.pointer("/spec/template/spec/containers/0/ports"),
             Some(&json!([]))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn network_policy_omits_empty_optional_arrays() -> Result<(), Box<dyn std::error::Error>> {
+        fn assert_no_empty_arrays(value: &Value) {
+            match value {
+                Value::Array(items) => {
+                    assert!(!items.is_empty(), "optional empty arrays must be omitted");
+                    for item in items {
+                        assert_no_empty_arrays(item);
+                    }
+                }
+                Value::Object(fields) => {
+                    for value in fields.values() {
+                        assert_no_empty_arrays(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for mode in [TrafficMode::Direct, TrafficMode::Forwarded] {
+            for no_ports in [false, true] {
+                let mut flash = service(mode);
+                if no_ports {
+                    flash.spec.workload.ports.clear();
+                }
+                let policy = desired_network_policy(&flash, &owner())?;
+                let value = serde_json::to_value(&policy)?;
+                assert_no_empty_arrays(&value);
+                assert_eq!(value["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+                if no_ports {
+                    assert!(
+                        policy
+                            .spec
+                            .as_ref()
+                            .ok_or("missing spec")?
+                            .ingress
+                            .is_none()
+                    );
+                } else {
+                    assert!(
+                        value
+                            .pointer("/spec/ingress/0/from/1/ipBlock/except")
+                            .is_none()
+                    );
+                }
+                assert!(
+                    value
+                        .pointer("/spec/egress/1/to/1/ipBlock/except")
+                        .is_none()
+                );
+                // Protected IPv4 exclusions must remain, not be normalized away.
+                assert!(
+                    value
+                        .pointer("/spec/egress/1/to/0/ipBlock/except")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| items.contains(&json!("10.0.0.0/8")))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn network_policy_normalization_preserves_rule_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut policy: k8s_openapi::api::networking::v1::NetworkPolicy = serde_json::from_value(
+            json!({
+                "spec": {
+                    "podSelector": {}, "policyTypes": ["Ingress", "Egress"],
+                    "ingress": [
+                        {"ports": [], "from": []},
+                        {"ports": [{"port": 7777, "protocol": "UDP"}], "from": [
+                            {"ipBlock": {"cidr": "2000::/3", "except": []}},
+                            {"namespaceSelector": {}, "podSelector": {}}
+                        ]}
+                    ],
+                    "egress": [
+                        {"ports": [], "to": []},
+                        {"to": [{"ipBlock": {"cidr": "192.0.2.0/24", "except": ["192.0.2.128/25"]}}]}
+                    ]
+                }
+            }),
+        )?;
+        super::normalize_network_policy(&mut policy);
+        let value = serde_json::to_value(&policy)?;
+        // An existing empty rule allows all; it must not be removed or synthesized.
+        assert_eq!(value["spec"]["ingress"][0], json!({}));
+        assert_eq!(value["spec"]["egress"][0], json!({}));
+        assert_eq!(value["spec"]["podSelector"], json!({}));
+        assert_eq!(
+            value["spec"]["ingress"][1]["from"][1],
+            json!({"namespaceSelector": {}, "podSelector": {}})
+        );
+        assert_eq!(
+            value["spec"]["ingress"][1]["ports"],
+            json!([{"port": 7777, "protocol": "UDP"}])
+        );
+        assert!(
+            value
+                .pointer("/spec/ingress/1/from/0/ipBlock/except")
+                .is_none()
+        );
+        assert_eq!(
+            value["spec"]["egress"][1]["to"][0]["ipBlock"]["except"],
+            json!(["192.0.2.128/25"])
+        );
+        let once = policy.clone();
+        super::normalize_network_policy(&mut policy);
+        assert_eq!(policy, once);
+        let spec = policy.spec.as_mut().ok_or("missing spec")?;
+        spec.ingress = Some(Vec::new());
+        spec.egress = Some(Vec::new());
+        super::normalize_network_policy(&mut policy);
+        let value = serde_json::to_value(policy)?;
+        assert!(value.pointer("/spec/ingress").is_none());
+        assert!(value.pointer("/spec/egress").is_none());
+        assert_eq!(value["spec"]["policyTypes"], json!(["Ingress", "Egress"]));
+        Ok(())
+    }
+
+    #[test]
+    fn network_policy_converges_after_server_omits_empty_slices()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use k8s_openapi::api::networking::v1::NetworkPolicy;
+        // Model Go's omitempty wire representation for these generated specs.
+        // This models wire normalization and generation comparison, not the full SSA engine.
+        fn server_roundtrip(policy: &NetworkPolicy) -> Result<NetworkPolicy, serde_json::Error> {
+            fn omit_arrays(value: &mut Value) {
+                match value {
+                    Value::Object(fields) => {
+                        fields.retain(|_, value| !value.as_array().is_some_and(Vec::is_empty));
+                        for value in fields.values_mut() {
+                            omit_arrays(value);
+                        }
+                    }
+                    Value::Array(items) => {
+                        for item in items {
+                            omit_arrays(item);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut value = serde_json::to_value(policy)?;
+            omit_arrays(&mut value);
+            serde_json::from_value(value)
+        }
+        for no_ports in [false, true] {
+            let mut flash = service(TrafficMode::Forwarded);
+            if no_ports {
+                flash.spec.workload.ports.clear();
+            }
+            let desired = desired_network_policy(&flash, &owner())?;
+            let mut old_wire = serde_json::to_value(&desired)?;
+            old_wire["spec"]["egress"][1]["to"][1]["ipBlock"]["except"] = json!([]);
+            if no_ports {
+                old_wire["spec"]["ingress"] = json!([]);
+            }
+            let old_desired: NetworkPolicy = serde_json::from_value(old_wire)?;
+            let mut persisted = server_roundtrip(&old_desired)?;
+            let mut generation = 1;
+            // The old desired representation differs again after each serialization.
+            for _ in 0..2 {
+                if persisted.spec != old_desired.spec {
+                    generation += 1;
+                }
+                persisted = server_roundtrip(&old_desired)?;
+            }
+            assert_eq!(generation, 3);
+            for _ in 0..10 {
+                if persisted.spec != desired.spec {
+                    generation += 1;
+                }
+                persisted = server_roundtrip(&desired)?;
+            }
+            assert_eq!(generation, 3);
+            assert_eq!(persisted.spec, desired.spec);
+        }
         Ok(())
     }
 
