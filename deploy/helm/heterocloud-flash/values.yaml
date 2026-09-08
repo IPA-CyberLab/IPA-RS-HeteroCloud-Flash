@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash
-  tag: "0.1.28"
+  tag: "0.1.29"
   pullPolicy: IfNotPresent
 
 api:
@@ -15,7 +15,9 @@ api:
       cpu: 500m
       memory: 512Mi
 
-# Trusted provider suffix; empty disables domain endpoints.
+# Trusted provider suffix; empty disables load_balancer and web endpoints.
+# Web uses the existing heterocloud-edge/heterocloud-edge Gateway, listener http.
+# Gateway API v1 CRDs and external wildcard DNS/TLS must be installed by the platform.
 publicDomain: ""
 
 controller:

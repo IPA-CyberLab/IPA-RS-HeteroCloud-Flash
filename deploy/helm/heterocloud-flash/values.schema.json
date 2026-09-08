@@ -6,7 +6,7 @@
       "type": "string",
       "maxLength": 214,
       "pattern": "^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
-      "description": "Trusted DNS suffix for Flash domain endpoints; empty disables domain mode."
+      "description": "Trusted DNS suffix for load_balancer and web endpoints; empty disables both domain modes. Web requires external wildcard DNS/TLS and the shared Gateway."
     }
   }
 }

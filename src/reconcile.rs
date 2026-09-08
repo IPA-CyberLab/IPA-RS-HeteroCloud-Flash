@@ -36,6 +36,10 @@ use crate::{
     crd::{FlashEndpoint, FlashService, FlashServicePhase, FlashServiceStatus},
     domain::{EndpointMode, ExposureType, TrafficMode, ValidationError},
     image::{GIB_BYTES, ImageInspection, ImageInspector},
+    web::{
+        GATEWAY_NAME, GATEWAY_NAMESPACE, GATEWAY_SECTION, HTTPRoute, PROXY_NAMESPACE,
+        route_is_ready,
+    },
 };
 
 const FIELD_MANAGER: &str = "heterocloud-flash-controller";
@@ -43,6 +47,7 @@ const REPLICAS_MANAGER: &str = "heterocloud-flash-replicas";
 const DNS_HOSTNAME: &str = "external-dns.alpha.kubernetes.io/hostname";
 const DNS_PUBLISH_LABEL: &str = "dns.heterocloud.io/publish";
 const GENERATION_LABEL: &str = "flash.heterocloud.io/generation";
+const TEMPLATE_OBSERVED_GENERATION: &str = "flash.heterocloud.io/template-observed-generation";
 const ASSIGNED_NODES_ANNOTATION: &str = "networking.heteronetwork.io/assigned-nodes";
 const PERSISTENT_HOME_VOLUME: &str = "persistent-home";
 const PERSISTENT_HOME_MOUNT_PATH: &str = "/root";
@@ -189,6 +194,7 @@ pub async fn run_controller(
         Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace);
     let pods = Api::<Pod>::namespaced(client.clone(), &namespace);
     let autoscalers = Api::<HorizontalPodAutoscaler>::namespaced(client.clone(), &namespace);
+    let http_routes = Api::<HTTPRoute>::namespaced(client.clone(), &namespace);
     let context = Arc::new(ControllerContext::new(
         client,
         namespace,
@@ -205,6 +211,7 @@ pub async fn run_controller(
     Controller::new(services, watcher::Config::default())
         .owns(deployments, watcher::Config::default())
         .owns(autoscalers, watcher::Config::default())
+        .owns(http_routes, watcher::Config::default())
         .owns(network_services, watcher::Config::default())
         .owns(network_policies, watcher::Config::default())
         .owns(persistent_volume_claims, watcher::Config::default())
@@ -357,6 +364,11 @@ async fn reconcile(
     let hostname = public_hostname(&flash, context.public_domain.as_deref())?;
     let desired_network_service =
         desired_service_with_hostname(&flash, &owner, hostname.as_deref())?;
+    let http_routes = Api::<HTTPRoute>::namespaced(context.client.clone(), &context.namespace);
+    let desired_route = desired_http_route(&flash, &owner, hostname.as_deref())?;
+    if desired_route.is_none() && !delete_http_route(&http_routes, &name).await? {
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
     let network_services = Api::<Service>::namespaced(context.client.clone(), &context.namespace);
     let network_policies =
         Api::<NetworkPolicy>::namespaced(context.client.clone(), &context.namespace);
@@ -366,6 +378,7 @@ async fn reconcile(
     let current_network_service = network_services.get_opt(&name).await?;
     let forwarded_ingress_networks = if flash.spec.workload.exposure.kind == ExposureType::Public
         && flash.spec.workload.exposure.traffic_mode == TrafficMode::Forwarded
+        && flash.spec.workload.exposure.endpoint_mode != EndpointMode::Web
     {
         assigned_forwarder_networks(&context.client, current_network_service.as_ref()).await?
     } else {
@@ -421,15 +434,32 @@ async fn reconcile(
         }
         None
     };
+    let http_route = if let Some(route) = desired_route {
+        Some(
+            http_routes
+                .patch(&name, &params, &Patch::Apply(&route))
+                .await?,
+        )
+    } else {
+        None
+    };
     let endpoints = network_service
         .as_ref()
-        .map(|service| service_endpoints(&flash, service, hostname.as_deref()))
+        .map(|service| {
+            if flash.spec.workload.exposure.endpoint_mode == EndpointMode::Web {
+                web_endpoints(&flash, service, http_route.as_ref(), hostname.as_deref())
+            } else {
+                service_endpoints(&flash, service, hostname.as_deref())
+            }
+        })
         .unwrap_or_default();
     let endpoint_ready = flash.spec.workload.ports.is_empty() || !endpoints.is_empty();
+    let pod_generation = deployment_pod_generation(&applied_deployment)
+        .unwrap_or_else(|| flash.spec.desired_generation.to_string());
     let pods = Api::<Pod>::namespaced(context.client.clone(), &context.namespace)
         .list(&ListParams::default().labels(&format!(
             "flash.heterocloud.io/instance={},{}={}",
-            flash.spec.service_instance_id, GENERATION_LABEL, flash.spec.desired_generation
+            flash.spec.service_instance_id, GENERATION_LABEL, pod_generation
         )))
         .await?;
     let mut status = FlashServiceStatus {
@@ -452,7 +482,11 @@ async fn reconcile(
         && !status.endpoints.is_empty()
         && status.phase == FlashServicePhase::Ready
     {
-        let note = "Load balancer allocated; DNS publication/resolution is not verified";
+        let note = if flash.spec.workload.exposure.endpoint_mode == EndpointMode::Web {
+            "HTTPRoute accepted; external DNS, TLS and HTTPS reachability are not verified"
+        } else {
+            "Load balancer allocated; DNS publication/resolution is not verified"
+        };
         status.message = Some(match status.message.take() {
             Some(message) => format!("{message}; {note}"),
             None => note.into(),
@@ -803,11 +837,11 @@ fn public_hostname(
     flash: &FlashService,
     domain: Option<&str>,
 ) -> Result<Option<String>, ReconcileError> {
-    if flash.spec.workload.exposure.endpoint_mode != EndpointMode::LoadBalancer {
+    if flash.spec.workload.exposure.endpoint_mode == EndpointMode::Ip {
         return Ok(None);
     }
     let domain =
-        domain.ok_or_else(|| anyhow::anyhow!("load_balancer requires provider publicDomain"))?;
+        domain.ok_or_else(|| anyhow::anyhow!("domain endpoints require provider publicDomain"))?;
     validate_public_domain(domain)?;
     let id = Uuid::parse_str(&flash.spec.service_instance_id)
         .context("invalid service instance UUID")?;
@@ -927,7 +961,8 @@ async fn reconcile_scaling(
     if let Some(spec) = desired.spec.as_mut() {
         spec.replicas = None;
     }
-    desired.metadata.resource_version = current.metadata.resource_version;
+    desired.metadata.resource_version = current.metadata.resource_version.clone();
+    preserve_unchanged_pod_generation(&deployments, &current, &mut desired).await?;
     let applied = deployments
         .patch(&name, &params, &Patch::Apply(&desired))
         .await?;
@@ -937,6 +972,161 @@ async fn reconcile_scaling(
             .await?;
     }
     Ok(applied)
+}
+
+fn deployment_pod_generation(deployment: &Deployment) -> Option<String> {
+    deployment
+        .spec
+        .as_ref()?
+        .template
+        .metadata
+        .as_ref()?
+        .labels
+        .as_ref()?
+        .get(GENERATION_LABEL)
+        .cloned()
+}
+
+async fn preserve_unchanged_pod_generation(
+    deployments: &Api<Deployment>,
+    current: &Deployment,
+    desired: &mut Deployment,
+) -> Result<(), ReconcileError> {
+    let Some(requested_generation) = deployment_pod_generation(desired) else {
+        return Ok(());
+    };
+    if let Some(current_generation) = deployment_pod_generation(current)
+        && current_generation != requested_generation
+    {
+        let mut candidate = desired.clone();
+        if let Some(metadata) = candidate
+            .spec
+            .as_mut()
+            .and_then(|spec| spec.template.metadata.as_mut())
+        {
+            metadata
+                .labels
+                .get_or_insert_default()
+                .insert(GENERATION_LABEL.into(), current_generation);
+        }
+        let already_checked = current
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(TEMPLATE_OBSERVED_GENERATION))
+            == Some(&requested_generation);
+        let unchanged = if already_checked {
+            true
+        } else {
+            // Let API defaulting/admission normalize the candidate without creating Pods or writes.
+            // Comparing raw templates locally mistakes absent API defaults for workload changes.
+            let preview = deployments
+                .patch(
+                    &desired.name_any(),
+                    &PatchParams {
+                        dry_run: true,
+                        ..PatchParams::apply(FIELD_MANAGER).force()
+                    },
+                    &Patch::Apply(&candidate),
+                )
+                .await?;
+            preview.spec.as_ref().map(|spec| &spec.template)
+                == current.spec.as_ref().map(|spec| &spec.template)
+        };
+        if unchanged {
+            *desired = candidate;
+        }
+    }
+    desired
+        .metadata
+        .annotations
+        .get_or_insert_default()
+        .insert(TEMPLATE_OBSERVED_GENERATION.into(), requested_generation);
+    Ok(())
+}
+
+fn desired_http_route(
+    flash: &FlashService,
+    owner: &OwnerReference,
+    hostname: Option<&str>,
+) -> Result<Option<HTTPRoute>, ReconcileError> {
+    if flash.spec.workload.exposure.endpoint_mode != EndpointMode::Web {
+        return Ok(None);
+    }
+    flash.spec.workload.validate()?;
+    let hostname = hostname.ok_or_else(|| anyhow::anyhow!("web requires provider publicDomain"))?;
+    let port = &flash.spec.workload.ports[0];
+    Ok(Some(from_value(json!({
+        "apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
+        "metadata": {"name": flash.name_any(), "labels": base_labels(flash), "ownerReferences": [owner]},
+        "spec": {
+            "parentRefs": [{"group": "gateway.networking.k8s.io", "kind": "Gateway", "name": GATEWAY_NAME, "namespace": GATEWAY_NAMESPACE, "sectionName": GATEWAY_SECTION}],
+            "hostnames": [hostname],
+            "rules": [{
+                "backendRefs": [{"group": "", "kind": "Service", "name": flash.name_any(), "port": port.service_port}],
+                "filters": [{
+                    "type": "RequestHeaderModifier",
+                    "requestHeaderModifier": {"set": [
+                        {"name": "X-Forwarded-Proto", "value": "https"},
+                        {"name": "X-Forwarded-Port", "value": "443"}
+                    ]}
+                }]
+            }]
+        }
+    }))?))
+}
+
+async fn delete_http_route(routes: &Api<HTTPRoute>, name: &str) -> Result<bool, ReconcileError> {
+    if let Some(route) = routes.get_opt(name).await? {
+        if route.metadata.deletion_timestamp.is_none() {
+            let params = DeleteParams {
+                preconditions: Some(kube::api::Preconditions {
+                    uid: route.metadata.uid,
+                    resource_version: route.metadata.resource_version,
+                }),
+                ..DeleteParams::default()
+            };
+            match routes.delete(name, &params).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(response)) if response.code == 404 => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        return Ok(routes.get_opt(name).await?.is_none());
+    }
+    Ok(true)
+}
+
+fn web_endpoints(
+    flash: &FlashService,
+    service: &Service,
+    route: Option<&HTTPRoute>,
+    hostname: Option<&str>,
+) -> Vec<FlashEndpoint> {
+    if !route.is_some_and(route_is_ready)
+        || !service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.cluster_ip.as_deref())
+            .is_some_and(|ip| !ip.is_empty() && ip != "None")
+    {
+        return Vec::new();
+    }
+    let Some(hostname) = hostname else {
+        return Vec::new();
+    };
+    flash
+        .spec
+        .workload
+        .ports
+        .iter()
+        .map(|port| FlashEndpoint {
+            name: port.name.clone(),
+            protocol: crate::domain::TransportProtocol::Tcp,
+            host: hostname.into(),
+            port: 443,
+        })
+        .collect()
 }
 
 fn pod_is_ready(pod: &Pod) -> bool {
@@ -1123,23 +1313,25 @@ fn desired_service_with_hostname(
         );
         labels.insert(DNS_PUBLISH_LABEL.into(), "true".into());
     }
-    let (kind, load_balancer_class, external_traffic_policy) =
-        if workload.exposure.kind == ExposureType::Public {
-            annotations.insert(
-                TRAFFIC_MODE_ANNOTATION,
-                workload.exposure.traffic_mode.as_annotation(),
-            );
-            (
-                "LoadBalancer",
-                Some(LOAD_BALANCER_CLASS),
-                Some(match workload.exposure.traffic_mode {
-                    TrafficMode::Forwarded => "Cluster",
-                    TrafficMode::Direct => "Local",
-                }),
-            )
-        } else {
-            ("ClusterIP", None, None)
-        };
+    let (kind, load_balancer_class, external_traffic_policy) = if workload.exposure.kind
+        == ExposureType::Public
+        && workload.exposure.endpoint_mode != EndpointMode::Web
+    {
+        annotations.insert(
+            TRAFFIC_MODE_ANNOTATION,
+            workload.exposure.traffic_mode.as_annotation(),
+        );
+        (
+            "LoadBalancer",
+            Some(LOAD_BALANCER_CLASS),
+            Some(match workload.exposure.traffic_mode {
+                TrafficMode::Forwarded => "Cluster",
+                TrafficMode::Direct => "Local",
+            }),
+        )
+    } else {
+        ("ClusterIP", None, None)
+    };
     let mut spec = json!({
         "type": kind,
         "selector": {"flash.heterocloud.io/instance": flash.spec.service_instance_id},
@@ -1152,7 +1344,10 @@ fn desired_service_with_hostname(
     if let Some(value) = external_traffic_policy {
         spec["externalTrafficPolicy"] = json!(value);
     }
-    if workload.exposure.kind == ExposureType::Public && workload.exposure.has_source_policy() {
+    if workload.exposure.kind == ExposureType::Public
+        && workload.exposure.endpoint_mode != EndpointMode::Web
+        && workload.exposure.has_source_policy()
+    {
         let mut source_ranges = workload
             .exposure
             .effective_source_networks()?
@@ -1209,6 +1404,20 @@ fn desired_network_policy_with_networks(
         .collect::<Vec<_>>();
     let ingress = if ports.is_empty() {
         Vec::new()
+    } else if exposure.endpoint_mode == EndpointMode::Web {
+        vec![json!({
+            "from": [{
+                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": PROXY_NAMESPACE}},
+                "podSelector": {"matchLabels": {
+                    "app.kubernetes.io/name": "envoy",
+                    "app.kubernetes.io/component": "proxy",
+                    "app.kubernetes.io/managed-by": "envoy-gateway",
+                    "gateway.envoyproxy.io/owning-gateway-name": GATEWAY_NAME,
+                    "gateway.envoyproxy.io/owning-gateway-namespace": GATEWAY_NAMESPACE
+                }}
+            }],
+            "ports": ports
+        })]
     } else {
         match (exposure.kind, exposure.traffic_mode) {
             (ExposureType::Internal, _) => vec![json!({
@@ -1416,6 +1625,9 @@ fn service_endpoints(
     service: &Service,
     hostname: Option<&str>,
 ) -> Vec<FlashEndpoint> {
+    if flash.spec.workload.exposure.endpoint_mode == EndpointMode::Web {
+        return Vec::new();
+    }
     let mut hosts = match flash.spec.workload.exposure.kind {
         ExposureType::Internal => service
             .spec
@@ -2492,6 +2704,194 @@ mod tests {
         assert_eq!(
             state.lock().map_err(|_| "poisoned state")?.2,
             ["apply-workload-without-replicas", "apply-hpa"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_service_route_status_and_proxy_isolation() -> Result<(), Box<dyn std::error::Error>> {
+        use super::*;
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.exposure.endpoint_mode = EndpointMode::Web;
+        flash.spec.workload.ports[0].protocol = TransportProtocol::Tcp;
+        flash.spec.workload.ports[0].service_port = 8080;
+        let host =
+            public_hostname(&flash, Some("flash.heterocloud.mizuame.app"))?.ok_or("hostname")?;
+        assert_eq!(
+            host,
+            "f-00000000-0000-0000-0000-000000000001.flash.heterocloud.mizuame.app"
+        );
+        assert!(public_hostname(&flash, None).is_err());
+        let mut svc =
+            desired_service_with_hostname(&flash, &owner(), Some(&host))?.ok_or("service")?;
+        let value = serde_json::to_value(&svc)?;
+        assert_eq!(value["spec"]["type"], "ClusterIP");
+        assert!(
+            value["metadata"]["labels"]
+                .get("dns.heterocloud.io/publish")
+                .is_none()
+        );
+        assert!(!value.to_string().contains("external-dns"));
+        for field in [
+            "loadBalancerClass",
+            "allocateLoadBalancerNodePorts",
+            "externalTrafficPolicy",
+            "loadBalancerSourceRanges",
+        ] {
+            assert!(value["spec"].get(field).is_none(), "{field}");
+        }
+        let mut route = desired_http_route(&flash, &owner(), Some(&host))?.ok_or("route")?;
+        let value = serde_json::to_value(&route)?;
+        assert_eq!(value["spec"]["hostnames"], json!([host]));
+        assert_eq!(
+            value["spec"]["parentRefs"],
+            json!([{
+                "group":"gateway.networking.k8s.io", "kind":"Gateway", "name":"heterocloud-edge",
+                "namespace":"heterocloud-edge", "sectionName":"http"
+            }])
+        );
+        assert_eq!(value["spec"]["rules"][0]["backendRefs"][0]["port"], 8080);
+        assert_eq!(
+            value["spec"]["rules"][0]["filters"],
+            json!([{
+                "type": "RequestHeaderModifier",
+                "requestHeaderModifier": {"set": [
+                    {"name": "X-Forwarded-Proto", "value": "https"},
+                    {"name": "X-Forwarded-Port", "value": "443"}
+                ]}
+            }])
+        );
+        assert_eq!(
+            value["spec"]["rules"][0]["backendRefs"][0]["name"],
+            flash.name_any()
+        );
+        assert_eq!(route.metadata.owner_references, Some(vec![owner()]));
+        svc.spec.as_mut().ok_or("spec")?.cluster_ip = Some("10.96.0.1".into());
+        assert!(web_endpoints(&flash, &svc, Some(&route), Some(&host)).is_empty());
+        route.metadata.generation = Some(2);
+        route.status = Some(serde_json::from_value(json!({"parents": [{
+            "parentRef": value["spec"]["parentRefs"][0],
+            "controllerName": "gateway.envoyproxy.io/gatewayclass-controller",
+            "conditions": (["Accepted", "ResolvedRefs"].map(|kind| json!({
+                "type":kind, "status":"True", "reason":"Accepted", "message":"ok",
+                "observedGeneration":2, "lastTransitionTime":"2026-01-01T00:00:00Z"
+            })))
+        }]}))?);
+        let endpoints = web_endpoints(&flash, &svc, Some(&route), Some(&host));
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].host, host);
+        assert_eq!(endpoints[0].port, 443);
+        assert_eq!(endpoints[0].protocol, TransportProtocol::Tcp);
+        for change in 0..5 {
+            let mut stale = route.clone();
+            let parent = &mut stale.status.as_mut().ok_or("status")?.parents[0];
+            match change {
+                0 => parent.conditions[0].observed_generation = Some(1),
+                1 => parent.conditions[1].status = "False".into(),
+                2 => parent.parent_ref.section_name = Some("other".into()),
+                3 => parent.controller_name = "other".into(),
+                _ => {
+                    stale.metadata.deletion_timestamp =
+                        Some(serde_json::from_value(json!("2026-01-01T00:00:00Z"))?)
+                }
+            }
+            assert!(web_endpoints(&flash, &svc, Some(&stale), Some(&host)).is_empty());
+        }
+        assert!(service_endpoints(&flash, &svc, Some(&host)).is_empty());
+        let policy = serde_json::to_value(desired_network_policy(&flash, &owner())?)?;
+        let ingress = &policy["spec"]["ingress"];
+        assert_eq!(ingress.as_array().ok_or("ingress")?.len(), 1);
+        assert_eq!(ingress[0]["ports"], json!([{"port":7777,"protocol":"TCP"}]));
+        assert_eq!(
+            ingress[0]["from"],
+            json!([{
+                "namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"envoy-gateway-system"}},
+                "podSelector":{"matchLabels":{
+                    "app.kubernetes.io/component":"proxy", "app.kubernetes.io/managed-by":"envoy-gateway",
+                    "app.kubernetes.io/name":"envoy", "gateway.envoyproxy.io/owning-gateway-name":"heterocloud-edge",
+                    "gateway.envoyproxy.io/owning-gateway-namespace":"heterocloud-edge"
+                }}
+            }])
+        );
+        flash.spec.workload.exposure.endpoint_mode = EndpointMode::Ip;
+        assert!(desired_http_route(&flash, &owner(), None)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn endpoint_mode_change_preserves_normalized_pod_template()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::*;
+        use kube::{Client, client::Body};
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.ports[0].protocol = TransportProtocol::Tcp;
+        let build = |flash: &FlashService| {
+            desired_deployment(
+                flash,
+                &owner(),
+                "example.invalid/test@sha256:verified",
+                1024,
+                None,
+                None,
+                &[],
+            )
+        };
+        let mut current = build(&flash)?;
+        current.metadata.resource_version = Some("10".into());
+        let template = &mut current.spec.as_mut().ok_or("spec")?.template;
+        template.spec.as_mut().ok_or("pod spec")?.dns_policy = Some("ClusterFirst".into());
+        let client = Client::new(
+            tower::service_fn(move |request: http::Request<Body>| async move {
+                assert_eq!(request.method(), http::Method::PATCH);
+                assert!(
+                    request
+                        .uri()
+                        .query()
+                        .is_some_and(|q| q.contains("dryRun=All"))
+                );
+                let mut preview: Deployment =
+                    serde_json::from_slice(&request.into_body().collect_bytes().await?)?;
+                assert_eq!(deployment_pod_generation(&preview).as_deref(), Some("1"));
+                preview
+                    .spec
+                    .as_mut()
+                    .ok_or("spec")?
+                    .template
+                    .spec
+                    .as_mut()
+                    .ok_or("pod spec")?
+                    .dns_policy = Some("ClusterFirst".into());
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                    http::Response::builder().body(Body::from(serde_json::to_vec(&preview)?))?,
+                )
+            }),
+            "test",
+        );
+        let deployments = Api::namespaced(client, "test");
+        for mode in [
+            EndpointMode::LoadBalancer,
+            EndpointMode::Web,
+            EndpointMode::Ip,
+        ] {
+            flash.spec.desired_generation += 1;
+            flash.spec.workload.exposure.endpoint_mode = mode;
+            let mut desired = build(&flash)?;
+            preserve_unchanged_pod_generation(&deployments, &current, &mut desired).await?;
+            assert_eq!(deployment_pod_generation(&desired).as_deref(), Some("1"));
+            let mut normalized = desired.spec.as_ref().ok_or("spec")?.template.clone();
+            normalized.spec.as_mut().ok_or("pod spec")?.dns_policy = Some("ClusterFirst".into());
+            assert_eq!(normalized, current.spec.as_ref().ok_or("spec")?.template);
+        }
+        flash
+            .spec
+            .workload
+            .env
+            .insert("CHANGED".into(), "true".into());
+        let mut desired = build(&flash)?;
+        preserve_unchanged_pod_generation(&deployments, &current, &mut desired).await?;
+        assert_eq!(
+            deployment_pod_generation(&desired),
+            Some(flash.spec.desired_generation.to_string())
         );
         Ok(())
     }

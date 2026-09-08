@@ -11,14 +11,16 @@ pub fn validated_crd() -> anyhow::Result<serde_json::Value> {
     let workload = &mut crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
         ["properties"]["workload"];
     workload["x-kubernetes-validations"] = json!([
-        {"rule": "!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)", "message": "replicas must be within autoscaling bounds"}
+        {"rule": "!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)", "message": "replicas must be within autoscaling bounds"},
+        {"rule": "!has(self.exposure.endpoint_mode) || self.exposure.endpoint_mode != 'web' || (size(self.ports) == 1 && self.ports.all(p, p.protocol == 'tcp'))", "message": "web requires exactly one TCP port"}
     ]);
     workload["properties"]["autoscaling"]["x-kubernetes-validations"] = json!([
         {"rule": "self.max_replicas >= self.min_replicas", "message": "max_replicas must be at least min_replicas"},
         {"rule": "has(self.target_cpu_utilization_percent) || has(self.target_memory_utilization_percent)", "message": "at least one CPU or memory target is required"}
     ]);
     workload["properties"]["exposure"]["x-kubernetes-validations"] = json!([
-        {"rule": "!has(self.endpoint_mode) || self.endpoint_mode != 'load_balancer' || (self.type == 'public' && self.traffic_mode == 'forwarded')", "message": "load_balancer requires public forwarded exposure"}
+        {"rule": "!has(self.endpoint_mode) || !(self.endpoint_mode in ['load_balancer', 'web']) || (self.type == 'public' && self.traffic_mode == 'forwarded')", "message": "load_balancer and web require public forwarded exposure"},
+        {"rule": "!has(self.endpoint_mode) || self.endpoint_mode != 'web' || ((!has(self.allowed_source_cidrs) || size(self.allowed_source_cidrs) == 0) && (!has(self.denied_source_cidrs) || size(self.denied_source_cidrs) == 0))", "message": "web does not yet support source CIDR filters"}
     ]);
     Ok(crd)
 }

@@ -3,6 +3,7 @@ pub mod crd;
 pub mod domain;
 pub mod image;
 pub mod reconcile;
+mod web;
 
 pub const PROVIDER_RECONCILE_ACTION: &str = "service-instance.reconcile";
 pub const PROVIDER_DELETE_ACTION: &str = "service-instance.delete";

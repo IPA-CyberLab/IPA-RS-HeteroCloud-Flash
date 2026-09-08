@@ -74,7 +74,7 @@ the Service for pre-SNAT enforcement; Pod policies continue to allow only declar
 ports, public source blocks, and assigned forwarder addresses. No extra tenant or
 infrastructure access is granted by enabling domains or autoscaling.
 
-Domain-mode Services alone receive:
+Only `load_balancer` Services receive:
 
 - Label `dns.heterocloud.io/publish: "true"`.
 - Annotation `external-dns.alpha.kubernetes.io/hostname` with the derived hostname.
@@ -99,6 +99,52 @@ ready, not DNS verification; the status message explicitly states that DNS publi
 and resolution are unverified. ExternalDNS propagation is asynchronous.
 
 ## Verification
+
+### Web endpoints
+
+Set `exposure.endpoint_mode: "web"` with public, forwarded exposure and exactly
+one TCP port. The application must speak HTTP on the declared container port.
+Nonempty `allowed_source_cidrs` or `denied_source_cidrs` are rejected by both the
+provider and CRD admission: the current Caddy/proxy chain does not safely preserve
+original client IP for tenant filtering. No proxy headers are trusted for this purpose.
+
+Web creates an owned ClusterIP Service and `gateway.networking.k8s.io/v1` HTTPRoute,
+both named `flash-<service_instance_id>`. The exact hostname is still
+`f-<service_instance_id>.<publicDomain>`. The route references Gateway
+`heterocloud-edge/heterocloud-edge`, section `http`, and sends all HTTP paths to
+the Service's declared service port in the workload namespace. Gateway API CRDs
+must be installed before starting this controller (including its HTTPRoute watch),
+and the listener must permit routes from the workload namespace.
+
+The Pod ingress policy allows only the declared port from Envoy proxy Pods in
+`envoy-gateway-system`, selected by the shared Gateway's owning-gateway labels and
+the Envoy proxy application labels. Other tenant and infrastructure ingress remains
+denied; existing egress restrictions remain intact. If the platform moves the proxy
+namespace or changes these labels, update the policy integration before rollout.
+
+Web Services have **no ExternalDNS publication label or annotations**. The operator
+must supply wildcard DNS for `*.<publicDomain>` pointing to public HTTPS-capable
+Caddy addresses, a DNS01 wildcard certificate, and Caddy forwarding to the shared
+Envoy listener. Flash does not provision or verify those external components.
+Each exact web route sets `X-Forwarded-Proto: https` and `X-Forwarded-Port: 443`
+using RequestHeaderModifier, replacing values from the internal HTTP proxy hops.
+Host is preserved. This relies on public HTTP being redirected to HTTPS by Caddy;
+it does not establish trusted client IP or enable source CIDR filtering.
+Status reports only hostname, port `443`, protocol `TCP`; consumers use web mode
+to construct an `https://` URL. Endpoints require current-generation HTTPRoute
+`Accepted=True` and `ResolvedRefs=True`, plus a Service ClusterIP. Workload Ready
+does not certify external DNS, TLS, or HTTPS reachability.
+
+Mode-only changes retain the existing Deployment PodTemplate generation when an
+API-server dry-run confirms the normalized template is unchanged. The acknowledgement
+is stored on Deployment metadata, not its PodTemplate. Status selects the applied
+Pod generation; list/exec continue selecting by service identity. Real workload
+template changes still roll out. Switching away from web deletes the HTTPRoute
+before changing the Service; Flash deletion garbage-collects the owned route.
+Switching from L4 LB to web omits previously owned LB/DNS fields using the same SSA
+manager. Verify this conversion with server-side dry-run on the target Kubernetes
+version, and coordinate removal of any old per-host ExternalDNS records with the
+external wildcard DNS. IP and load_balancer modes retain their L4 semantics.
 
 ### Read-only status refresh
 

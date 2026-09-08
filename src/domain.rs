@@ -87,14 +87,26 @@ impl FlashSpec {
         if let Some(scaling) = &self.autoscaling {
             scaling.validate(self.replicas)?;
         }
-        if self.exposure.endpoint_mode == EndpointMode::LoadBalancer
-            && (self.exposure.kind != ExposureType::Public
-                || self.exposure.traffic_mode != TrafficMode::Forwarded)
+        if matches!(
+            self.exposure.endpoint_mode,
+            EndpointMode::LoadBalancer | EndpointMode::Web
+        ) && (self.exposure.kind != ExposureType::Public
+            || self.exposure.traffic_mode != TrafficMode::Forwarded)
         {
             return Err(ValidationError::Field(
-                "load_balancer endpoint_mode requires public exposure and forwarded traffic_mode"
+                "load_balancer and web endpoint modes require public exposure and forwarded traffic_mode"
                     .into(),
             ));
+        }
+        if self.exposure.endpoint_mode == EndpointMode::Web {
+            if self.ports.len() != 1 || self.ports[0].protocol != TransportProtocol::Tcp {
+                return Err(ValidationError::Field(
+                    "web endpoint_mode requires exactly one TCP port".into(),
+                ));
+            }
+            if self.exposure.has_source_policy() {
+                return Err(ValidationError::Field("web endpoint_mode does not yet support allowed_source_cidrs or denied_source_cidrs".into()));
+            }
         }
         if !(10..=MAX_CPU_MILLIS).contains(&self.cpu_millis) {
             return Err(ValidationError::Field(format!(
@@ -220,6 +232,7 @@ pub enum EndpointMode {
     #[default]
     Ip,
     LoadBalancer,
+    Web,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -683,6 +696,42 @@ mod tests {
         spec.exposure.kind = ExposureType::Internal;
         assert!(spec.validate().is_err());
         assert!(serde_json::from_value::<FlashExposure>(serde_json::json!({"type": "public", "traffic_mode": "forwarded", "hostname": "tenant.example"})).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn web_requires_one_tcp_port_and_rejects_source_filters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = valid_spec();
+        spec.exposure.endpoint_mode = super::EndpointMode::Web;
+        assert!(spec.validate().is_err());
+        spec.ports[0].protocol = TransportProtocol::Tcp;
+        assert!(spec.validate().is_ok());
+        assert_eq!(serde_json::to_value(spec.exposure.endpoint_mode)?, "web");
+        for field in ["allowed_source_cidrs", "denied_source_cidrs"] {
+            let mut value = serde_json::to_value(&spec)?;
+            value["exposure"][field] = serde_json::json!(["203.0.113.0/24"]);
+            assert!(
+                serde_json::from_value::<FlashSpec>(value)?
+                    .validate()
+                    .is_err()
+            );
+        }
+        let mut invalid = spec.clone();
+        invalid.exposure.kind = ExposureType::Internal;
+        assert!(invalid.validate().is_err());
+        invalid = spec.clone();
+        invalid.exposure.traffic_mode = TrafficMode::Direct;
+        assert!(invalid.validate().is_err());
+        invalid = spec.clone();
+        invalid.ports.clear();
+        assert!(invalid.validate().is_err());
+        spec.ports.push(FlashPort {
+            name: "second".into(),
+            service_port: 8888,
+            ..spec.ports[0].clone()
+        });
+        assert!(spec.validate().is_err());
         Ok(())
     }
 

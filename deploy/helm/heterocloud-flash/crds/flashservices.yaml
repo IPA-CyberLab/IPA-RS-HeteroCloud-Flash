@@ -142,6 +142,7 @@ spec:
                         enum:
                         - ip
                         - load_balancer
+                        - web
                         type: string
                       traffic_mode:
                         enum:
@@ -158,8 +159,10 @@ spec:
                     - type
                     type: object
                     x-kubernetes-validations:
-                    - message: load_balancer requires public forwarded exposure
-                      rule: '!has(self.endpoint_mode) || self.endpoint_mode != ''load_balancer'' || (self.type == ''public'' && self.traffic_mode == ''forwarded'')'
+                    - message: load_balancer and web require public forwarded exposure
+                      rule: '!has(self.endpoint_mode) || !(self.endpoint_mode in [''load_balancer'', ''web'']) || (self.type == ''public'' && self.traffic_mode == ''forwarded'')'
+                    - message: web does not yet support source CIDR filters
+                      rule: '!has(self.endpoint_mode) || self.endpoint_mode != ''web'' || ((!has(self.allowed_source_cidrs) || size(self.allowed_source_cidrs) == 0) && (!has(self.denied_source_cidrs) || size(self.denied_source_cidrs) == 0))'
                   image:
                     type: string
                   memory_mib:
@@ -215,6 +218,8 @@ spec:
                 x-kubernetes-validations:
                 - message: replicas must be within autoscaling bounds
                   rule: '!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)'
+                - message: web requires exactly one TCP port
+                  rule: '!has(self.exposure.endpoint_mode) || self.exposure.endpoint_mode != ''web'' || (size(self.ports) == 1 && self.ports.all(p, p.protocol == ''tcp''))'
             required:
             - desired_generation
             - display_name

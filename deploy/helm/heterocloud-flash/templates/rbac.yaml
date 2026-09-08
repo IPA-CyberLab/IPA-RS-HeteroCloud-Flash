@@ -6,6 +6,9 @@ metadata:
   labels:
     {{- include "flash.labels" . | nindent 4 }}
 rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

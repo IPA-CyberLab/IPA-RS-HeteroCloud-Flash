@@ -1052,6 +1052,27 @@ mod tests {
     }
 
     #[test]
+    fn retained_pod_generation_remains_listable_and_executable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let instance_id = Uuid::from_u128(7);
+        let mut retained = pod(instance_id, "Running", true)?;
+        retained
+            .metadata
+            .labels
+            .as_mut()
+            .ok_or("labels")?
+            .insert("flash.heterocloud.io/generation".into(), "1".into());
+        assert_eq!(
+            super::service_pod_selector(instance_id).label_selector,
+            Some(format!("flash.heterocloud.io/instance={instance_id}"))
+        );
+        assert!(pod_belongs_to_service(&retained, instance_id));
+        assert!(pod_can_exec(&retained));
+        assert!(container_summary(retained).ok_or("summary")?.ready);
+        Ok(())
+    }
+
+    #[test]
     fn exec_allows_owned_running_workload_without_readiness()
     -> Result<(), Box<dyn std::error::Error>> {
         let instance_id = Uuid::from_u128(7);
