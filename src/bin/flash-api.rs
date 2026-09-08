@@ -313,7 +313,7 @@ async fn exec(
     validate_command(&claims, service_instance_id, query.generation)?;
     validate_resource_scope(&state, &claims, service_instance_id, query.generation).await?;
     let pod = state.pods.get(&query.pod).await?;
-    if !pod_belongs_to_service(&pod, service_instance_id) || !pod_is_exec_ready(&pod) {
+    if !pod_belongs_to_service(&pod, service_instance_id) || !pod_can_exec(&pod) {
         return Err(ApiError::Forbidden);
     }
     let permit = Arc::clone(&state.exec_sessions)
@@ -336,14 +336,26 @@ async fn validate_resource_scope(
         .services
         .get(&resource_name(service_instance_id))
         .await?;
-    let status = resource.status.as_ref().ok_or(ApiError::NotReady)?;
+    validate_resource_access(&resource, claims, service_instance_id, generation)
+}
+
+fn validate_resource_access(
+    resource: &FlashService,
+    claims: &ProviderClaims,
+    service_instance_id: Uuid,
+    generation: i64,
+) -> Result<(), ApiError> {
     if resource.spec.service_instance_id != service_instance_id.to_string()
         || resource.spec.organization_id != claims.organization_id.to_string()
         || resource.spec.project_id != claims.project_id.to_string()
         || resource.spec.desired_generation != generation
-        || status.phase != FlashServicePhase::Ready
-        || status.observed_generation != generation
+        || resource.metadata.deletion_timestamp.is_some()
     {
+        return Err(ApiError::Forbidden);
+    }
+    // Readiness is operational state, not authorization for listing or diagnostics.
+    let status = resource.status.as_ref().ok_or(ApiError::NotReady)?;
+    if status.observed_generation != generation {
         return Err(ApiError::Forbidden);
     }
     Ok(())
@@ -363,7 +375,7 @@ fn pod_belongs_to_service(pod: &Pod, service_instance_id: Uuid) -> bool {
         .is_some_and(|value| value == &service_instance_id.to_string())
 }
 
-fn pod_is_exec_ready(pod: &Pod) -> bool {
+fn pod_can_exec(pod: &Pod) -> bool {
     pod.metadata.deletion_timestamp.is_none()
         && pod
             .status
@@ -375,22 +387,21 @@ fn pod_is_exec_ready(pod: &Pod) -> bool {
             .as_ref()
             .and_then(|status| status.container_statuses.as_ref())
             .is_some_and(|statuses| {
-                statuses
-                    .iter()
-                    .any(|container| container.name == "workload" && container.ready)
+                statuses.iter().any(|container| {
+                    container.name == "workload"
+                        && container
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.running.is_some())
+                })
             })
 }
 
 fn container_summary(pod: Pod) -> Option<ContainerSummary> {
+    let ready = pod_can_exec(&pod);
     let name = pod.metadata.name?;
     let status = pod.status?;
     let phase = status.phase.unwrap_or_else(|| "Unknown".into());
-    let ready = phase == "Running"
-        && status
-            .container_statuses
-            .unwrap_or_default()
-            .iter()
-            .any(|container| container.name == "workload" && container.ready);
     Some(ContainerSummary { name, phase, ready })
 }
 
@@ -625,13 +636,122 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use k8s_openapi::api::core::v1::Pod;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use uuid::Uuid;
 
     use super::{
-        EXEC_SHELL_SCRIPT, TerminalControl, container_summary, pod_belongs_to_service,
-        pod_is_exec_ready,
+        ApiError, EXEC_SHELL_SCRIPT, FlashService, ProviderClaims, TerminalControl,
+        container_summary, pod_belongs_to_service, pod_can_exec, validate_command,
+        validate_resource_access,
     };
+
+    fn access_fixture() -> Result<(ProviderClaims, FlashService), serde_json::Error> {
+        let claims: ProviderClaims = serde_json::from_value(json!({
+            "iss": "test", "aud": "flash", "sub": Uuid::from_u128(1),
+            "organization_id": Uuid::from_u128(2), "project_id": Uuid::from_u128(3),
+            "service_instance_id": Uuid::from_u128(7),
+            "action": super::PROVIDER_LIST_CONTAINERS_ACTION,
+            "generation": 4, "jti": Uuid::from_u128(5),
+            "iat": 100, "nbf": 95, "exp": 160
+        }))?;
+        let resource = serde_json::from_value(json!({
+            "metadata": {"name": super::resource_name(claims.service_instance_id)},
+            "spec": {
+                "desired_generation": claims.generation, "display_name": "test",
+                "organization_id": claims.organization_id,
+                "project_id": claims.project_id,
+                "service_instance_id": claims.service_instance_id,
+                "workload": {
+                    "region": "heteronet-global", "image": "example.invalid/workload:test",
+                    "replicas": 1, "cpu_millis": 500, "memory_mib": 256, "ports": [],
+                    "exposure": {"type": "public", "traffic_mode": "forwarded",
+                        "allowed_source_cidrs": [], "denied_source_cidrs": []}
+                }
+            },
+            "status": {
+                "phase": "provisioning", "observed_generation": claims.generation,
+                "ready_replicas": 0, "desired_replicas": 1,
+                "runtime_class": super::RUNTIME_CLASS_NAME
+            }
+        }))?;
+        Ok((claims, resource))
+    }
+
+    #[test]
+    fn diagnostics_scope_accepts_current_non_ready_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (claims, resource) = access_fixture()?;
+        for phase in ["provisioning", "error", "ready"] {
+            let mut value = serde_json::to_value(&resource)?;
+            value["status"]["phase"] = json!(phase);
+            let resource = serde_json::from_value(value)?;
+            validate_resource_access(
+                &resource,
+                &claims,
+                claims.service_instance_id,
+                claims.generation,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_scope_rejects_tenant_generation_and_deletion_mismatches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (claims, resource) = access_fixture()?;
+        for (section, field, replacement) in [
+            ("spec", "service_instance_id", json!(Uuid::from_u128(8))),
+            ("spec", "organization_id", json!(Uuid::from_u128(8))),
+            ("spec", "project_id", json!(Uuid::from_u128(8))),
+            ("spec", "desired_generation", json!(3)),
+            ("spec", "desired_generation", json!(5)),
+            ("status", "observed_generation", json!(3)),
+            ("status", "observed_generation", json!(5)),
+            (
+                "metadata",
+                "deletionTimestamp",
+                json!("2026-08-21T00:00:00Z"),
+            ),
+        ] {
+            let mut value = serde_json::to_value(&resource)?;
+            value[section][field] = replacement;
+            let resource = serde_json::from_value(value)?;
+            assert!(
+                matches!(
+                    validate_resource_access(
+                        &resource,
+                        &claims,
+                        claims.service_instance_id,
+                        claims.generation,
+                    ),
+                    Err(ApiError::Forbidden)
+                ),
+                "{section}.{field}"
+            );
+        }
+        let mut resource = resource;
+        resource.status = None;
+        assert!(matches!(
+            validate_resource_access(
+                &resource,
+                &claims,
+                claims.service_instance_id,
+                claims.generation,
+            ),
+            Err(ApiError::NotReady)
+        ));
+        assert!(matches!(
+            validate_command(&claims, Uuid::from_u128(8), claims.generation),
+            Err(ApiError::Forbidden)
+        ));
+        for generation in [claims.generation - 1, claims.generation + 1] {
+            assert!(matches!(
+                validate_command(&claims, claims.service_instance_id, generation),
+                Err(ApiError::Forbidden)
+            ));
+        }
+        Ok(())
+    }
 
     fn pod(instance_id: Uuid, phase: &str, ready: bool) -> Result<Pod, serde_json::Error> {
         serde_json::from_value(json!({
@@ -641,6 +761,10 @@ mod tests {
             },
             "status": {
                 "phase": phase,
+                "conditions": [
+                    {"type": "Ready", "status": "False"},
+                    {"type": "ContainersReady", "status": if ready { "True" } else { "False" }}
+                ],
                 "containerStatuses": [{
                     "name": "workload",
                     "image": "example.invalid/workload:test",
@@ -655,26 +779,91 @@ mod tests {
     }
 
     #[test]
-    fn exec_requires_owned_running_ready_workload() -> Result<(), Box<dyn std::error::Error>> {
+    fn exec_allows_owned_running_workload_without_readiness()
+    -> Result<(), Box<dyn std::error::Error>> {
         let instance_id = Uuid::from_u128(7);
         let ready = pod(instance_id, "Running", true)?;
         assert!(pod_belongs_to_service(&ready, instance_id));
-        assert!(pod_is_exec_ready(&ready));
+        assert!(pod_can_exec(&ready));
         assert!(!pod_belongs_to_service(&ready, Uuid::from_u128(8)));
-        assert!(!pod_is_exec_ready(&pod(instance_id, "Pending", true)?));
-        assert!(!pod_is_exec_ready(&pod(instance_id, "Running", false)?));
+        assert!(pod_can_exec(&pod(instance_id, "Running", false)?));
+        let mut unowned = ready;
+        unowned.metadata.labels = None;
+        assert!(!pod_belongs_to_service(&unowned, instance_id));
         Ok(())
     }
 
     #[test]
-    fn container_list_reports_workload_readiness() -> Result<(), Box<dyn std::error::Error>> {
+    fn exec_rejects_non_running_missing_and_terminating_workloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let instance_id = Uuid::from_u128(7);
+        for phase in ["Pending", "Succeeded", "Failed", "Unknown"] {
+            assert!(!pod_can_exec(&pod(instance_id, phase, true)?));
+        }
+        let base = serde_json::to_value(pod(instance_id, "Running", true)?)?;
+        for state in [
+            json!({"waiting": {"reason": "CrashLoopBackOff"}}),
+            json!({"terminated": {"exitCode": 0}}),
+            json!({}),
+            Value::Null,
+        ] {
+            let mut value = base.clone();
+            value["status"]["containerStatuses"][0]["state"] = state;
+            assert!(!pod_can_exec(&serde_json::from_value(value)?));
+        }
+        for (section, field, replacement) in [
+            (
+                "metadata",
+                "deletionTimestamp",
+                json!("2026-08-21T00:00:00Z"),
+            ),
+            ("status", "containerStatuses", json!([])),
+            ("status", "containerStatuses", Value::Null),
+            ("status", "phase", Value::Null),
+        ] {
+            let mut value = base.clone();
+            value[section][field] = replacement;
+            assert!(!pod_can_exec(&serde_json::from_value(value)?));
+        }
+        let mut value = base;
+        value["status"]["containerStatuses"][0]["name"] = json!("sidecar");
+        assert!(!pod_can_exec(&serde_json::from_value(value.clone())?));
+        value["status"] = Value::Null;
+        assert!(!pod_can_exec(&serde_json::from_value(value)?));
+        Ok(())
+    }
+
+    #[test]
+    fn container_list_reports_exec_capability() -> Result<(), Box<dyn std::error::Error>> {
         let instance_id = Uuid::from_u128(9);
-        let Some(summary) = container_summary(pod(instance_id, "Running", true)?) else {
-            return Err("named pod must have a summary".into());
-        };
-        assert_eq!(summary.name, "flash-workload-abc123");
-        assert_eq!(summary.phase, "Running");
-        assert!(summary.ready);
+        for ready in [true, false] {
+            let summary = container_summary(pod(instance_id, "Running", ready)?)
+                .ok_or("named pod must have a summary")?;
+            assert_eq!(summary.name, "flash-workload-abc123");
+            assert_eq!(summary.phase, "Running");
+            assert!(summary.ready);
+        }
+        let base = serde_json::to_value(pod(instance_id, "Running", true)?)?;
+        for pointer in [
+            "/metadata/deletionTimestamp",
+            "/status/phase",
+            "/status/containerStatuses/0/state",
+        ] {
+            let mut value = base.clone();
+            match pointer {
+                "/metadata/deletionTimestamp" => {
+                    value["metadata"]["deletionTimestamp"] = json!("2026-08-21T00:00:00Z");
+                }
+                "/status/phase" => value["status"]["phase"] = json!("Pending"),
+                _ => {
+                    value["status"]["containerStatuses"][0]["state"] =
+                        json!({"terminated": {"exitCode": 0}})
+                }
+            }
+            let summary = container_summary(serde_json::from_value(value)?)
+                .ok_or("named pod must have a summary")?;
+            assert!(!summary.ready, "{pointer}");
+        }
         Ok(())
     }
 
