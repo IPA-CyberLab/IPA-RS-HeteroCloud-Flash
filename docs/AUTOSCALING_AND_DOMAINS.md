@@ -100,6 +100,27 @@ and resolution are unverified. ExternalDNS propagation is asynchronous.
 
 ## Verification
 
+### Read-only status refresh
+
+HeteroCloud can continue refreshing replica counts and endpoints after initial Ready
+using `GET /internal/v1/service-instances/{service_instance_id}?generation=N`.
+Sign the normal short-lived provider JWT with action `flash.status.get`; exec,
+container-list, reconcile, and delete actions do not authorize this endpoint.
+The token must match the path service UUID and query generation exactly. The
+resource must match the token's organization/project/service scope and must not
+be deleting. This endpoint only reads the FlashService; it never applies a CR,
+changes desired state, lists Pods, or opens an exec session.
+
+HTTP 200 returns the raw `FlashServiceStatus` JSON, without an operation envelope,
+for current-generation Ready, Provisioning, or Error states. It reads persisted
+controller status, not live metrics directly. Missing or mismatched observed status
+returns 503 with `Retry-After: 2`; a mismatched desired generation returns 409.
+Scope mismatches/deleting resources return 403, missing resources 404, and wrong
+JWT actions or credentials 401. Missing/malformed query parameters return 400.
+Only status whose `observed_generation` equals the requested generation is returned.
+
+### Local checks
+
 Run `cargo test --all-targets`, `cargo check --all-targets`, and `cargo fmt --all --check`.
 Unit and request-level tests cover target validation, independent metrics, handoff
 ordering, fixed/HPA transitions, hostname derivation, DNS-field omission, status,

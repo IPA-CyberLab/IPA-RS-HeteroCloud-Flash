@@ -14,9 +14,9 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use heterocloud_flash::{
     PROVIDER_DELETE_ACTION, PROVIDER_EXEC_ACTION, PROVIDER_LIST_CONTAINERS_ACTION,
-    PROVIDER_RECONCILE_ACTION, RUNTIME_CLASS_NAME,
+    PROVIDER_RECONCILE_ACTION, PROVIDER_STATUS_GET_ACTION, RUNTIME_CLASS_NAME,
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
-    crd::{FlashService, FlashServicePhase, FlashServiceSpec},
+    crd::{FlashService, FlashServicePhase, FlashServiceSpec, FlashServiceStatus},
     domain::FlashSpec,
 };
 use k8s_openapi::api::core::v1::Pod;
@@ -91,12 +91,24 @@ async fn run() -> Result<()> {
         authenticator,
         exec_sessions: Arc::new(Semaphore::new(max_exec_sessions)),
     });
-    let app = Router::new()
+    let app = app_router(state);
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .with_context(|| format!("bind Flash provider API to {bind_addr}"))?;
+    info!(%bind_addr, %namespace, "HeteroCloud Flash provider API ready");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("serve Flash provider API")
+}
+
+fn app_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route(
             "/internal/v1/service-instances/{service_instance_id}",
-            put(reconcile).delete(remove),
+            put(reconcile).delete(remove).get(get_status),
         )
         .route(
             "/internal/v1/service-instances/{service_instance_id}/containers",
@@ -106,15 +118,7 @@ async fn run() -> Result<()> {
             "/internal/v1/service-instances/{service_instance_id}/exec",
             get(exec),
         )
-        .with_state(state);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("bind Flash provider API to {bind_addr}"))?;
-    info!(%bind_addr, %namespace, "HeteroCloud Flash provider API ready");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serve Flash provider API")
+        .with_state(state)
 }
 
 async fn live() -> impl IntoResponse {
@@ -263,6 +267,45 @@ struct GenerationQuery {
     generation: i64,
 }
 
+async fn get_status(
+    State(state): State<Arc<AppState>>,
+    Path(service_instance_id): Path<Uuid>,
+    Query(query): Query<GenerationQuery>,
+    headers: HeaderMap,
+) -> Result<Json<FlashServiceStatus>, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_STATUS_GET_ACTION)?;
+    validate_command(&claims, service_instance_id, query.generation)?;
+    let resource = state
+        .services
+        .get_opt(&resource_name(service_instance_id))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(
+        status_for_access(&resource, &claims, service_instance_id, query.generation)?.clone(),
+    ))
+}
+
+fn status_for_access<'a>(
+    resource: &'a FlashService,
+    claims: &ProviderClaims,
+    service_instance_id: Uuid,
+    generation: i64,
+) -> Result<&'a FlashServiceStatus, ApiError> {
+    validate_resource_identity(resource, claims, service_instance_id)?;
+    if resource.spec.desired_generation != generation {
+        return Err(ApiError::Conflict(
+            "generation does not match current desired state".into(),
+        ));
+    }
+    resource
+        .status
+        .as_ref()
+        .filter(|status| status.observed_generation == generation)
+        .ok_or(ApiError::NotReady)
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ContainerSummary {
     name: String,
@@ -345,17 +388,28 @@ fn validate_resource_access(
     service_instance_id: Uuid,
     generation: i64,
 ) -> Result<(), ApiError> {
-    if resource.spec.service_instance_id != service_instance_id.to_string()
-        || resource.spec.organization_id != claims.organization_id.to_string()
-        || resource.spec.project_id != claims.project_id.to_string()
-        || resource.spec.desired_generation != generation
-        || resource.metadata.deletion_timestamp.is_some()
-    {
+    validate_resource_identity(resource, claims, service_instance_id)?;
+    if resource.spec.desired_generation != generation {
         return Err(ApiError::Forbidden);
     }
     // Readiness is operational state, not authorization for listing or diagnostics.
     let status = resource.status.as_ref().ok_or(ApiError::NotReady)?;
     if status.observed_generation != generation {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+fn validate_resource_identity(
+    resource: &FlashService,
+    claims: &ProviderClaims,
+    service_instance_id: Uuid,
+) -> Result<(), ApiError> {
+    if resource.spec.service_instance_id != service_instance_id.to_string()
+        || resource.spec.organization_id != claims.organization_id.to_string()
+        || resource.spec.project_id != claims.project_id.to_string()
+        || resource.metadata.deletion_timestamp.is_some()
+    {
         return Err(ApiError::Forbidden);
     }
     Ok(())
@@ -554,6 +608,8 @@ impl AcceptedOperation {
 
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
+    #[error("service instance was not found")]
+    NotFound,
     #[error("{0}")]
     BadRequest(String),
     #[error("provider is still reconciling the resource")]
@@ -575,6 +631,7 @@ enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
+            Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::NotReady => (StatusCode::SERVICE_UNAVAILABLE, "operation_in_progress"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "generation_conflict"),
@@ -675,6 +732,222 @@ mod tests {
             }
         }))?;
         Ok((claims, resource))
+    }
+
+    async fn signed_status_request(
+        mut claims: ProviderClaims,
+        resource: Option<FlashService>,
+        uri: String,
+    ) -> Result<(axum::response::Response, usize), Box<dyn std::error::Error>> {
+        use kube::{Api, Client, client::Body};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tower::ServiceExt;
+        // Test-only keypair, generated for this fixture and never used by a provider.
+        let private_key = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEICKoEEWPLg2OazcyTWzBEw/mMPPXatNOUcEUWDHo2y0Y\n-----END PRIVATE KEY-----\n";
+        let public_key = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAcBpAFx4KtN1FYwvSN0XJMWSGiAJPjzetPXEiuMX2azg=\n-----END PUBLIC KEY-----\n";
+        claims.issued_at = chrono::Utc::now().timestamp();
+        claims.not_before = claims.issued_at - 5;
+        claims.expires_at = claims.issued_at + 60;
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some("status-test".into());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_ed_pem(private_key)?,
+        )?;
+        let authenticator = super::ProviderAuthenticator::from_public_keys_json(
+            "test",
+            "flash",
+            &json!({"status-test": public_key}).to_string(),
+        )?;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let server_reads = reads.clone();
+        let client = Client::new(
+            tower::service_fn(move |request: http::Request<Body>| {
+                let reads = server_reads.clone();
+                let resource = resource.clone();
+                async move {
+                    assert_eq!(
+                        request.method(),
+                        http::Method::GET,
+                        "status refresh must never write"
+                    );
+                    assert_eq!(
+                        request.uri().path(),
+                        format!(
+                            "/apis/flash.heterocloud.io/v1alpha1/namespaces/test/flashservices/flash-{}",
+                            Uuid::from_u128(7)
+                        )
+                    );
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = match resource {
+                        Some(resource) => (200, serde_json::to_value(resource)?),
+                        None => (
+                            404,
+                            json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "reason": "NotFound", "message": "absent", "code": 404}),
+                        ),
+                    };
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        http::Response::builder()
+                            .status(status)
+                            .body(Body::from(serde_json::to_vec(&body)?))?,
+                    )
+                }
+            }),
+            "test",
+        );
+        let app = super::app_router(Arc::new(super::AppState {
+            services: Api::namespaced(client.clone(), "test"),
+            pods: Api::namespaced(client, "test"),
+            authenticator,
+            exec_sessions: Arc::new(tokio::sync::Semaphore::new(0)),
+        }));
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri(uri)
+                    .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        Ok((response, reads.load(Ordering::SeqCst)))
+    }
+
+    #[tokio::test]
+    async fn signed_status_returns_raw_current_status_in_all_phases_without_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut claims, resource) = access_fixture()?;
+        claims.action = super::PROVIDER_STATUS_GET_ACTION.into();
+        let uri = format!(
+            "/internal/v1/service-instances/{}?generation=4",
+            claims.service_instance_id
+        );
+        for phase in ["provisioning", "error", "ready"] {
+            for count in [1, 7] {
+                let mut value = serde_json::to_value(&resource)?;
+                value["status"]["phase"] = json!(phase);
+                value["status"]["ready_replicas"] = json!(count);
+                value["status"]["desired_replicas"] = json!(count);
+                let resource: FlashService = serde_json::from_value(value)?;
+                let expected = serde_json::to_value(&resource.status)?;
+                let (response, reads) =
+                    signed_status_request(claims.clone(), Some(resource), uri.clone()).await?;
+                assert_eq!(response.status(), http::StatusCode::OK);
+                assert_eq!(reads, 1);
+                let body = axum::body::to_bytes(response.into_body(), 65536).await?;
+                assert_eq!(serde_json::from_slice::<Value>(&body)?, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_status_requires_its_own_action_and_exact_command_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut claims, resource) = access_fixture()?;
+        let uri = format!(
+            "/internal/v1/service-instances/{}?generation=4",
+            claims.service_instance_id
+        );
+        for action in [
+            super::PROVIDER_EXEC_ACTION,
+            super::PROVIDER_LIST_CONTAINERS_ACTION,
+            super::PROVIDER_RECONCILE_ACTION,
+            super::PROVIDER_DELETE_ACTION,
+        ] {
+            claims.action = action.into();
+            let (response, reads) =
+                signed_status_request(claims.clone(), Some(resource.clone()), uri.clone()).await?;
+            assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+            assert_eq!(reads, 0);
+        }
+        claims.action = super::PROVIDER_STATUS_GET_ACTION.into();
+        for bad_uri in [
+            format!(
+                "/internal/v1/service-instances/{}?generation=4",
+                Uuid::from_u128(8)
+            ),
+            format!(
+                "/internal/v1/service-instances/{}?generation=5",
+                claims.service_instance_id
+            ),
+        ] {
+            let (response, reads) =
+                signed_status_request(claims.clone(), Some(resource.clone()), bad_uri).await?;
+            assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+            assert_eq!(reads, 0);
+        }
+        for bad_uri in [
+            format!(
+                "/internal/v1/service-instances/{}",
+                claims.service_instance_id
+            ),
+            format!("{uri}&unexpected=true"),
+        ] {
+            let (response, reads) =
+                signed_status_request(claims.clone(), Some(resource.clone()), bad_uri).await?;
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            assert_eq!(reads, 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_status_rejects_tenant_deletion_and_stale_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut claims, resource) = access_fixture()?;
+        claims.action = super::PROVIDER_STATUS_GET_ACTION.into();
+        let uri = format!(
+            "/internal/v1/service-instances/{}?generation=4",
+            claims.service_instance_id
+        );
+        for (section, field, replacement, expected) in [
+            (
+                "spec",
+                "service_instance_id",
+                json!(Uuid::from_u128(8)),
+                403,
+            ),
+            ("spec", "organization_id", json!(Uuid::from_u128(8)), 403),
+            ("spec", "project_id", json!(Uuid::from_u128(8)), 403),
+            (
+                "metadata",
+                "deletionTimestamp",
+                json!("2026-08-21T00:00:00Z"),
+                403,
+            ),
+            ("spec", "desired_generation", json!(3), 409),
+            ("spec", "desired_generation", json!(5), 409),
+            ("status", "observed_generation", json!(3), 503),
+            ("status", "observed_generation", json!(5), 503),
+        ] {
+            let mut value = serde_json::to_value(&resource)?;
+            value[section][field] = replacement;
+            let (response, reads) = signed_status_request(
+                claims.clone(),
+                Some(serde_json::from_value(value)?),
+                uri.clone(),
+            )
+            .await?;
+            assert_eq!(response.status().as_u16(), expected, "{section}.{field}");
+            assert_eq!(reads, 1);
+            if expected == 503 {
+                assert_eq!(response.headers()[http::header::RETRY_AFTER], "2");
+            }
+        }
+        let mut missing_status = resource;
+        missing_status.status = None;
+        let (response, reads) =
+            signed_status_request(claims.clone(), Some(missing_status), uri.clone()).await?;
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reads, 1);
+        let (response, reads) = signed_status_request(claims, None, uri).await?;
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(reads, 1);
+        Ok(())
     }
 
     #[test]
