@@ -6,10 +6,38 @@ on:
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
+  GH_TOKEN: ${{ github.token }}
+  IMAGE: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash
 
 jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify release identity and artifact contract
+        run: |
+          node --test scripts/release-artifact-manifest.test.mjs
+          node scripts/release-artifact-manifest.mjs validate
+          node scripts/release-artifact-manifest.mjs guard flash-release-artifact.json
+
   image:
+    needs: verify
+    permissions:
+      contents: read
+      packages: write
     name: image-${{ matrix.arch }}
     strategy:
       fail-fast: false
@@ -24,59 +52,90 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate before publishing
+        id: release
+        run: |
+          echo "version=$(node scripts/release-artifact-manifest.mjs validate)" >> "$GITHUB_OUTPUT"
+          node scripts/release-artifact-manifest.mjs guard flash-release-artifact.json
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}},suffix=-${{ matrix.arch }}
-            type=ref,event=tag,suffix=-${{ matrix.arch }}
-            type=sha,format=short,suffix=-${{ matrix.arch }}
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.release.outputs.version }}-${{ matrix.arch }}
+            ${{ env.IMAGE }}:${{ github.sha }}-${{ matrix.arch }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+      - name: Record pushed architecture digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir digests
+          printf '%s\n' "$DIGEST" > "digests/$ARCH"
+          node scripts/release-artifact-manifest.mjs digest-input "digests/$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flash-digest-${{ matrix.arch }}-${{ github.run_attempt }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
 
   manifest:
     needs: image
+    permissions:
+      contents: write
+      packages: write
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate before publishing
+        run: |
+          node scripts/release-artifact-manifest.mjs validate
+          node scripts/release-artifact-manifest.mjs guard flash-release-artifact.json
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
+      - uses: actions/download-artifact@v4
         with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=ref,event=tag
-            type=sha,format=short
-      - name: Publish multi-architecture manifest
-        env:
-          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
-          VERSION: ${{ steps.meta.outputs.version }}
+          name: flash-digest-amd64-${{ github.run_attempt }}
+          path: digests
+      - uses: actions/download-artifact@v4
+        with:
+          name: flash-digest-arm64-${{ github.run_attempt }}
+          path: digests
+      - name: Publish index from immutable architecture digests
         run: |
           set -Eeuo pipefail
-          image="$(printf 'ghcr.io/%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          manifest_tags=()
-          while IFS= read -r tag; do
-            [[ -n "$tag" ]] && manifest_tags+=(--tag "$tag")
-          done <<< "$IMAGE_TAGS"
-          docker buildx imagetools create "${manifest_tags[@]}" \
-            "$image:$VERSION-amd64" \
-            "$image:$VERSION-arm64"
+          version="$(node scripts/release-artifact-manifest.mjs validate)"
+          amd64="$(node scripts/release-artifact-manifest.mjs digest-input digests/amd64)"
+          arm64="$(node scripts/release-artifact-manifest.mjs digest-input digests/arm64)"
+          docker buildx imagetools create --metadata-file index-metadata.json \
+            --tag "$IMAGE:$version" --tag "$IMAGE:$GITHUB_SHA" "$amd64" "$arm64"
+          node scripts/release-artifact-manifest.mjs generate-index flash-release-artifact.json index-metadata.json
+      - name: Attach release artifact without replacement
+        run: |
+          node scripts/release-artifact-manifest.mjs guard flash-release-artifact.json
+          gh release upload "$RELEASE_TAG" flash-release-artifact.json --repo "$GITHUB_REPOSITORY"
