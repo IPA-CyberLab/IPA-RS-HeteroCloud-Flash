@@ -72,6 +72,13 @@ on_error() {
 trap on_error ERR
 trap cleanup EXIT
 
+runsc_package="runsc"
+if [[ ${GVISOR_VERSION+x} ]]; then
+  [[ "${GVISOR_VERSION}" =~ ^([0-9]+:)?[0-9][A-Za-z0-9.+~]*(-[A-Za-z0-9.+~]+)*$ ]] \
+    || fail "GVISOR_VERSION must be a nonempty, safe Debian package version."
+  runsc_package="runsc=${GVISOR_VERSION}"
+fi
+
 [[ ${EUID} -eq 0 ]] || fail "run this installer as root (for example: sudo $0)."
 [[ -r /etc/os-release ]] || fail "/etc/os-release is unavailable; Ubuntu is required."
 
@@ -157,10 +164,16 @@ if [[ ! -f "${SOURCE_FILE}" ]] || ! cmp -s "${WORK_DIR}/gvisor.list" "${SOURCE_F
 fi
 
 run_apt "refreshing package indexes with the gVisor repository" update
-run_apt "installing runsc from the official gVisor repository" install -y --no-install-recommends runsc
+run_apt "installing runsc from the official gVisor repository" install -y --no-install-recommends "${runsc_package}"
 
 dpkg-query -W -f='${Status}' runsc 2>/dev/null | grep -qx 'install ok installed' \
   || fail "the runsc package is not installed."
+if [[ ${GVISOR_VERSION+x} ]]; then
+  installed_version="$(dpkg-query -W -f='${Version}' runsc)" \
+    || fail "could not query the installed runsc package version."
+  [[ "${installed_version}" == "${GVISOR_VERSION}" ]] \
+    || fail "installed runsc version '${installed_version}' does not match GVISOR_VERSION '${GVISOR_VERSION}'."
+fi
 command -v runsc >/dev/null 2>&1 || fail "the runsc executable is unavailable after package installation."
 command -v containerd-shim-runsc-v1 >/dev/null 2>&1 \
   || fail "the containerd-shim-runsc-v1 executable is unavailable after package installation."
