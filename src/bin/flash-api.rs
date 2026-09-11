@@ -394,6 +394,9 @@ fn validate_resource_access(
     }
     // Readiness is operational state, not authorization for listing or diagnostics.
     let status = resource.status.as_ref().ok_or(ApiError::NotReady)?;
+    if status.observed_generation < generation {
+        return Err(ApiError::NotReady);
+    }
     if status.observed_generation != generation {
         return Err(ApiError::Forbidden);
     }
@@ -978,7 +981,6 @@ mod tests {
             ("spec", "project_id", json!(Uuid::from_u128(8))),
             ("spec", "desired_generation", json!(3)),
             ("spec", "desired_generation", json!(5)),
-            ("status", "observed_generation", json!(3)),
             ("status", "observed_generation", json!(5)),
             (
                 "metadata",
@@ -1002,6 +1004,17 @@ mod tests {
                 "{section}.{field}"
             );
         }
+        let mut pending = resource.clone();
+        pending.status.as_mut().expect("fixture status").observed_generation = claims.generation - 1;
+        assert!(matches!(
+            validate_resource_access(
+                &pending,
+                &claims,
+                claims.service_instance_id,
+                claims.generation,
+            ),
+            Err(ApiError::NotReady)
+        ));
         let mut resource = resource;
         resource.status = None;
         assert!(matches!(
