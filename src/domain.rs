@@ -19,6 +19,7 @@ pub const MAX_MEMORY_MIB: u32 = 1_048_576;
 pub const MIN_EPHEMERAL_STORAGE_GIB: u32 = 1;
 pub const MAX_EPHEMERAL_STORAGE_GIB: u32 = 1_000_000;
 pub const DEFAULT_EPHEMERAL_STORAGE_GIB: u32 = 10;
+pub const MAX_GPUS_PER_VM: u32 = 1;
 
 const PUBLIC_EGRESS_ROOTS: [&str; 2] = ["0.0.0.0/0", "2000::/3"];
 const PROTECTED_EGRESS_CIDRS: [&str; 16] = [
@@ -50,6 +51,9 @@ pub struct FlashSpec {
     pub autoscaling: Option<FlashAutoscaling>,
     pub cpu_millis: u32,
     pub memory_mib: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[schemars(range(min = 0, max = 1))]
+    pub gpu_count: u32,
     #[serde(default = "default_ephemeral_storage_gib")]
     #[schemars(range(min = 1, max = 1_000_000))]
     pub ephemeral_storage_gib: u32,
@@ -118,6 +122,11 @@ impl FlashSpec {
                 "memory_mib must be between 16 and {MAX_MEMORY_MIB}"
             )));
         }
+        if self.gpu_count > MAX_GPUS_PER_VM {
+            return Err(ValidationError::Field(format!(
+                "gpu_count must be between 0 and {MAX_GPUS_PER_VM}"
+            )));
+        }
         if !(MIN_EPHEMERAL_STORAGE_GIB..=MAX_EPHEMERAL_STORAGE_GIB)
             .contains(&self.ephemeral_storage_gib)
         {
@@ -181,6 +190,10 @@ impl FlashSpec {
         validate_string_list("args", &self.args, 256)?;
         Ok(())
     }
+}
+
+const fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -620,6 +633,7 @@ mod tests {
             autoscaling: None,
             cpu_millis: 500,
             memory_mib: 256,
+            gpu_count: 0,
             ephemeral_storage_gib: 10,
             ports: vec![FlashPort {
                 name: "game-udp".into(),
@@ -645,6 +659,22 @@ mod tests {
     #[test]
     fn accepts_udp_service() {
         assert!(valid_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn gpu_defaults_to_zero_and_rejects_more_than_one() -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(valid_spec())?;
+        value
+            .as_object_mut()
+            .ok_or("Flash spec must be an object")?
+            .remove("gpu_count");
+        let defaulted = serde_json::from_value::<FlashSpec>(value)?;
+        assert_eq!(defaulted.gpu_count, 0);
+
+        let mut oversized = valid_spec();
+        oversized.gpu_count = 2;
+        assert!(oversized.validate().is_err());
+        Ok(())
     }
 
     #[test]

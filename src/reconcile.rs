@@ -32,7 +32,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME, TRAFFIC_MODE_ANNOTATION,
+    GPU_READY_LABEL, GPU_RESOURCE_NAME, LOAD_BALANCER_CLASS, TRAFFIC_MODE_ANNOTATION,
     crd::{FlashEndpoint, FlashService, FlashServicePhase, FlashServiceStatus},
     domain::{EndpointMode, ExposureType, TrafficMode, ValidationError},
     image::{GIB_BYTES, ImageInspection, ImageInspector},
@@ -40,6 +40,7 @@ use crate::{
         GATEWAY_NAME, GATEWAY_NAMESPACE, GATEWAY_SECTION, HTTPRoute, PROXY_NAMESPACE,
         route_is_ready,
     },
+    workload_runtime_class,
 };
 
 const FIELD_MANAGER: &str = "heterocloud-flash-controller";
@@ -236,6 +237,7 @@ async fn reconcile(
     context: Arc<ControllerContext>,
 ) -> Result<Action, ReconcileError> {
     let name = flash.name_any();
+    let runtime_class = workload_runtime_class(flash.spec.workload.gpu_count);
     let services = Api::<FlashService>::namespaced(context.client.clone(), &context.namespace);
 
     if let Err(error) = flash
@@ -252,7 +254,7 @@ async fn reconcile(
                 phase: FlashServicePhase::Error,
                 observed_generation: flash.spec.desired_generation,
                 desired_replicas: i32::try_from(flash.spec.workload.replicas).unwrap_or(i32::MAX),
-                runtime_class: RUNTIME_CLASS_NAME.into(),
+                runtime_class: runtime_class.into(),
                 message: Some(error.to_string()),
                 ..FlashServiceStatus::default()
             },
@@ -286,7 +288,7 @@ async fn reconcile(
                         phase: FlashServicePhase::Provisioning,
                         observed_generation: flash.spec.desired_generation,
                         desired_replicas,
-                        runtime_class: RUNTIME_CLASS_NAME.into(),
+                        runtime_class: runtime_class.into(),
                         message: Some(format!("waiting for image inspection: {error}")),
                         ..FlashServiceStatus::default()
                     },
@@ -303,7 +305,7 @@ async fn reconcile(
                         phase: FlashServicePhase::Error,
                         observed_generation: flash.spec.desired_generation,
                         desired_replicas,
-                        runtime_class: RUNTIME_CLASS_NAME.into(),
+                        runtime_class: runtime_class.into(),
                         message: Some(error.to_string()),
                         ..FlashServiceStatus::default()
                     },
@@ -319,7 +321,7 @@ async fn reconcile(
                         phase: FlashServicePhase::Provisioning,
                         observed_generation: flash.spec.desired_generation,
                         desired_replicas,
-                        runtime_class: RUNTIME_CLASS_NAME.into(),
+                        runtime_class: runtime_class.into(),
                         message: Some(
                             "waiting for image inspection: OCI registry request timed out".into(),
                         ),
@@ -465,7 +467,7 @@ async fn reconcile(
     let mut status = FlashServiceStatus {
         observed_generation: flash.spec.desired_generation,
         desired_replicas,
-        runtime_class: RUNTIME_CLASS_NAME.into(),
+        runtime_class: runtime_class.into(),
         endpoints,
         resolved_image: Some(inspection.resolved_image),
         image_size_bytes: Some(inspection.image_size_bytes),
@@ -520,10 +522,14 @@ fn update_workload_status(
         } else if let Some(message) = workload_pending_message(pods) {
             Some(message)
         } else if !needs_endpoint {
-            Some(format!("waiting for {desired_replicas} gVisor replicas"))
+            Some(format!(
+                "waiting for {desired_replicas} {} replicas",
+                status.runtime_class
+            ))
         } else {
             Some(format!(
-                "waiting for {desired_replicas} gVisor replicas and a routable service endpoint"
+                "waiting for {desired_replicas} {} replicas and a routable service endpoint",
+                status.runtime_class
             ))
         }
     });
@@ -638,6 +644,11 @@ fn desired_deployment(
             "capabilities": {"drop": ["NET_RAW"]},
         }
     });
+    if workload.gpu_count > 0 {
+        let count = workload.gpu_count.to_string();
+        container["resources"]["requests"][GPU_RESOURCE_NAME] = json!(count);
+        container["resources"]["limits"][GPU_RESOURCE_NAME] = json!(count);
+    }
     if !workload.command.is_empty() {
         container["command"] = json!(workload.command);
     }
@@ -662,7 +673,7 @@ fn desired_deployment(
         container["volumeMounts"] = Value::Array(volume_mounts);
     }
     let mut pod_spec = json!({
-        "runtimeClassName": RUNTIME_CLASS_NAME,
+        "runtimeClassName": workload_runtime_class(workload.gpu_count),
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
         "terminationGracePeriodSeconds": 30,
@@ -680,6 +691,9 @@ fn desired_deployment(
         }],
         "containers": [container]
     });
+    if workload.gpu_count > 0 {
+        pod_spec["nodeSelector"] = json!({(GPU_READY_LABEL): "true"});
+    }
     if let Some(secret) = registry_pull_secret {
         pod_spec["imagePullSecrets"] = json!([{"name": secret}]);
     }
@@ -699,6 +713,17 @@ fn desired_deployment(
     if !volumes.is_empty() {
         pod_spec["volumes"] = Value::Array(volumes);
     }
+    let strategy = if workload.gpu_count > 0 {
+        json!({
+            "type": "RollingUpdate",
+            "rollingUpdate": {"maxUnavailable": 1, "maxSurge": 0}
+        })
+    } else {
+        json!({
+            "type": "RollingUpdate",
+            "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}
+        })
+    };
     from_value(json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -709,10 +734,7 @@ fn desired_deployment(
         },
         "spec": {
             "replicas": workload.replicas,
-            "strategy": {
-                "type": "RollingUpdate",
-                "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}
-            },
+            "strategy": strategy,
             "selector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}},
             "template": {
                 "metadata": {"labels": labels},
@@ -1747,7 +1769,8 @@ mod tests {
         workload_failure_message, workload_restart_message,
     };
     use crate::{
-        LOAD_BALANCER_CLASS, RUNTIME_CLASS_NAME,
+        GPU_READY_LABEL, GPU_RESOURCE_NAME, GPU_RUNTIME_CLASS_NAME, LOAD_BALANCER_CLASS,
+        RUNTIME_CLASS_NAME,
         crd::{FlashService, FlashServicePhase, FlashServiceSpec, FlashServiceStatus},
         domain::{
             ExposureType, FlashEgress, FlashExposure, FlashPort, FlashSpec, TrafficMode,
@@ -1882,6 +1905,7 @@ mod tests {
                     autoscaling: None,
                     cpu_millis: 250,
                     memory_mib: 128,
+                    gpu_count: 0,
                     ephemeral_storage_gib: 10,
                     ports: vec![FlashPort {
                         name: "game-udp".into(),
@@ -1936,6 +1960,11 @@ mod tests {
         assert_eq!(
             value.pointer("/spec/template/spec/runtimeClassName"),
             Some(&json!(RUNTIME_CLASS_NAME))
+        );
+        assert_eq!(value.pointer("/spec/template/spec/nodeSelector"), None);
+        assert_eq!(
+            value.pointer("/spec/strategy/rollingUpdate/maxSurge"),
+            Some(&json!(1))
         );
         assert_eq!(
             value.pointer("/spec/template/metadata/labels/flash.heterocloud.io~1generation"),
@@ -2003,6 +2032,52 @@ mod tests {
         assert_eq!(
             value.pointer("/spec/template/spec/containers/0/image"),
             Some(&json!("example.invalid/udp@sha256:verified"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_workload_requests_one_exclusive_gpu_on_a_ready_node()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.gpu_count = 1;
+        let value = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "example.invalid/cuda@sha256:verified",
+            1024,
+            None,
+            None,
+            &[],
+        )?)?;
+
+        assert_eq!(
+            value.pointer("/spec/template/spec/runtimeClassName"),
+            Some(&json!(GPU_RUNTIME_CLASS_NAME))
+        );
+        assert_eq!(
+            value.pointer(&format!(
+                "/spec/template/spec/nodeSelector/{}",
+                GPU_READY_LABEL.replace('/', "~1")
+            )),
+            Some(&json!("true"))
+        );
+        for kind in ["requests", "limits"] {
+            assert_eq!(
+                value.pointer(&format!(
+                    "/spec/template/spec/containers/0/resources/{kind}/{}",
+                    GPU_RESOURCE_NAME.replace('/', "~1")
+                )),
+                Some(&json!("1"))
+            );
+        }
+        assert_eq!(
+            value.pointer("/spec/strategy/rollingUpdate/maxSurge"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            value.pointer("/spec/strategy/rollingUpdate/maxUnavailable"),
+            Some(&json!(1))
         );
         Ok(())
     }

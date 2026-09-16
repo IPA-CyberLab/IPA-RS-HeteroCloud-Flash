@@ -18,6 +18,7 @@ use heterocloud_flash::{
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
     crd::{FlashService, FlashServicePhase, FlashServiceSpec, FlashServiceStatus},
     domain::FlashSpec,
+    workload_runtime_class,
 };
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
@@ -153,6 +154,7 @@ async fn reconcile(
         .map_err(|_| ApiError::BadRequest("Flash spec is invalid".into()))?;
     spec.validate()
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let expected_runtime_class = workload_runtime_class(spec.gpu_count);
     let resource_name = resource_name(service_instance_id);
 
     if let Some(existing) = state.services.get_opt(&resource_name).await? {
@@ -192,7 +194,7 @@ async fn reconcile(
         .as_ref()
         .filter(|status| status.observed_generation == request.generation);
     let ready = current_status.is_some_and(|status| {
-        status.phase == FlashServicePhase::Ready && status.runtime_class == RUNTIME_CLASS_NAME
+        status.phase == FlashServicePhase::Ready && status.runtime_class == expected_runtime_class
     });
     if current_status.is_some_and(|status| status.phase == FlashServicePhase::Error) {
         return Ok((
@@ -1005,7 +1007,11 @@ mod tests {
             );
         }
         let mut pending = resource.clone();
-        pending.status.as_mut().expect("fixture status").observed_generation = claims.generation - 1;
+        pending
+            .status
+            .as_mut()
+            .expect("fixture status")
+            .observed_generation = claims.generation - 1;
         assert!(matches!(
             validate_resource_access(
                 &pending,

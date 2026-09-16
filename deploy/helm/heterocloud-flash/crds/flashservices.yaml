@@ -163,6 +163,11 @@ spec:
                       rule: '!has(self.endpoint_mode) || !(self.endpoint_mode in [''load_balancer'', ''web'']) || (self.type == ''public'' && self.traffic_mode == ''forwarded'')'
                     - message: web does not yet support source CIDR filters
                       rule: '!has(self.endpoint_mode) || self.endpoint_mode != ''web'' || ((!has(self.allowed_source_cidrs) || size(self.allowed_source_cidrs) == 0) && (!has(self.denied_source_cidrs) || size(self.denied_source_cidrs) == 0))'
+                  gpu_count:
+                    format: uint32
+                    maximum: 1.0
+                    minimum: 0.0
+                    type: integer
                   image:
                     type: string
                   memory_mib:

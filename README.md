@@ -1,6 +1,6 @@
 # HeteroCloud Flash
 
-HeteroCloud Flash is the gVisor-backed container service for HeteroCloud. It is
+HeteroCloud Flash is the isolated container service for HeteroCloud. It is
 managed from the same HeteroCloud organization and project model as Flow, but
 runs arbitrary non-privileged TCP and UDP workloads instead of RTC rooms.
 
@@ -14,14 +14,19 @@ HeteroCloud console / API / flashctl
 HeteroCloud Flash provider API
              |
              v
-FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
+FlashService CRD -> Deployment(runtimeClassName=gvisor|nvidia) -> Service
                                                         -> HeteroNetwork LB
 ```
 
 ## Properties
 
-- Every tenant container runs with the `gvisor` Kubernetes RuntimeClass. The
-  runtime is not a customer-controlled field.
+- CPU workloads run with the `gvisor` Kubernetes RuntimeClass. A spec with
+  `gpu_count: 1` runs with the `nvidia` RuntimeClass on a node that passed the
+  cluster GPU smoke test. The provider chooses the runtime from the requested
+  hardware and customers cannot set an arbitrary runtime.
+- A VM may request zero or one physical GPU. GPU requests and limits are both
+  set to `nvidia.com/gpu: 1`, so Kubernetes and the NVIDIA device plugin grant
+  one exclusive device to each replica.
 - TCP and UDP ports use one typed model and support internal ClusterIP or the
   HeteroNetwork `heteronetwork.io/public` LoadBalancer class.
 - Public `forwarded` mode distributes traffic to Pods throughout the cluster;
@@ -34,17 +39,17 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor) -> Service
   HeteroNetwork, link-local, metadata, and operator-configured infrastructure
   ranges are denied by default. Tenant-to-tenant traffic requires an explicit
   same-organization grant.
-- Workloads run as container root inside the gVisor sandbox so Web Shell users
-  can use `sudo` when the image provides it. The runsc sandbox, RuntimeDefault
-  seccomp profile, and absence of host mounts or Kubernetes credentials keep
-  container root separate from host root.
+- Workloads run as container root inside their selected runtime so Web Shell
+  users can use `sudo` when the image provides it. RuntimeDefault seccomp and
+  the absence of host mounts or Kubernetes credentials keep container root
+  separate from host root; CPU workloads additionally use the runsc sandbox.
 - Provider commands use 60-second Ed25519 JWTs, exact issuer/audience/action
   checks, opaque tenant identifiers, monotonic generations, and deterministic
   operation IDs.
 - The Web console can open `/bin/sh` in an owned, ready workload Pod. Exec uses
   a separate IAM action, never exposes Kubernetes credentials, limits each
   session to 30 minutes, and caps concurrent sessions per provider replica.
-- HeteroCloud marks an instance ready only after the requested gVisor replicas
+- HeteroCloud marks an instance ready only after the requested replicas
   and its routable endpoint are ready. Terminal Pod startup failures are
   reported as service errors instead of remaining in provisioning indefinitely.
   Transient provisioning returns `503 Retry-After` to the transactional Outbox
@@ -69,6 +74,7 @@ Optional autoscaling and domain endpoints are described in
   "replicas": 3,
   "cpu_millis": 250,
   "memory_mib": 128,
+  "gpu_count": 1,
   "ephemeral_storage_gib": 10,
   "ports": [
     {
