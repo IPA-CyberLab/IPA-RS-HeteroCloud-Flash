@@ -16,7 +16,10 @@ use heterocloud_flash::{
     PROVIDER_DELETE_ACTION, PROVIDER_EXEC_ACTION, PROVIDER_LIST_CONTAINERS_ACTION,
     PROVIDER_RECONCILE_ACTION, PROVIDER_STATUS_GET_ACTION, RUNTIME_CLASS_NAME,
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
-    crd::{FlashService, FlashServicePhase, FlashServiceSpec, FlashServiceStatus},
+    crd::{
+        FlashService, FlashServicePhase, FlashServicePolicy, FlashServiceSpec, FlashServiceStatus,
+        MAX_WEEKLY_GPU_SECONDS,
+    },
     domain::FlashSpec,
     workload_runtime_class,
 };
@@ -137,6 +140,8 @@ struct ReconcileRequest {
     generation: i64,
     name: String,
     spec: Value,
+    #[serde(default)]
+    policy: FlashServicePolicy,
 }
 
 async fn reconcile(
@@ -155,6 +160,11 @@ async fn reconcile(
     spec.validate()
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let expected_runtime_class = workload_runtime_class(spec.gpu_count);
+    if request.policy.max_weekly_gpu_seconds > MAX_WEEKLY_GPU_SECONDS {
+        return Err(ApiError::BadRequest(
+            "weekly GPU limit exceeds the provider safety maximum".into(),
+        ));
+    }
     let resource_name = resource_name(service_instance_id);
 
     if let Some(existing) = state.services.get_opt(&resource_name).await? {
@@ -178,6 +188,7 @@ async fn reconcile(
             organization_id: claims.organization_id.to_string(),
             project_id: claims.project_id.to_string(),
             service_instance_id: service_instance_id.to_string(),
+            policy: request.policy,
             workload: spec,
         },
     );
@@ -1010,7 +1021,7 @@ mod tests {
         pending
             .status
             .as_mut()
-            .expect("fixture status")
+            .ok_or("fixture status")?
             .observed_generation = claims.generation - 1;
         assert!(matches!(
             validate_resource_access(

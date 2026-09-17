@@ -3,7 +3,8 @@ use std::{collections::BTreeSet, env, fs, process::ExitCode};
 use anyhow::{Context, Result};
 use heterocloud_flash::image::ImageInspector;
 use heterocloud_flash::reconcile::{
-    AdminVolumeMounts, run_controller, validate_admin_volume_mounts, validate_public_domain,
+    AdminVolumeMounts, ControllerConfig, run_controller, validate_admin_volume_mounts,
+    validate_public_domain,
 };
 use ipnet::IpNet;
 use tracing_subscriber::EnvFilter;
@@ -80,16 +81,29 @@ async fn run() -> Result<()> {
     let client = kube::Client::try_default()
         .await
         .context("create Kubernetes client")?;
+    let activator_namespace =
+        env::var("FLASH_ACTIVATOR_NAMESPACE").context("FLASH_ACTIVATOR_NAMESPACE is required")?;
+    let activator_service =
+        env::var("FLASH_ACTIVATOR_SERVICE").context("FLASH_ACTIVATOR_SERVICE is required")?;
+    let activator_port = env::var("FLASH_ACTIVATOR_PORT")
+        .context("FLASH_ACTIVATOR_PORT is required")?
+        .parse::<u16>()
+        .context("FLASH_ACTIVATOR_PORT must be a TCP port")?;
     run_controller(
         client,
-        namespace,
         image_inspector,
-        registry_pull_secret,
-        persistent_storage_class,
-        admin_volume_mounts,
-        additional_protected_networks,
-        dns_networks,
-        public_domain,
+        ControllerConfig {
+            namespace,
+            registry_pull_secret,
+            persistent_storage_class,
+            admin_volume_mounts,
+            additional_protected_networks,
+            dns_networks,
+            public_domain,
+            activator_namespace,
+            activator_service,
+            activator_port,
+        },
     )
     .await
 }

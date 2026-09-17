@@ -28,6 +28,18 @@ spec:
                 type: string
               organization_id:
                 type: string
+              policy:
+                default:
+                  max_weekly_gpu_seconds: 31536000
+                properties:
+                  max_weekly_gpu_seconds:
+                    format: uint64
+                    maximum: 31536000.0
+                    minimum: 0.0
+                    type: integer
+                required:
+                - max_weekly_gpu_seconds
+                type: object
               project_id:
                 type: string
               service_instance_id:
@@ -42,6 +54,12 @@ spec:
                   autoscaling:
                     nullable: true
                     properties:
+                      idle_timeout_seconds:
+                        default: 900
+                        format: uint32
+                        maximum: 86400.0
+                        minimum: 60.0
+                        type: integer
                       max_replicas:
                         format: uint32
                         maximum: 100000.0
@@ -50,7 +68,7 @@ spec:
                       min_replicas:
                         format: uint32
                         maximum: 100000.0
-                        minimum: 1.0
+                        minimum: 0.0
                         type: integer
                       target_cpu_utilization_percent:
                         format: uint32
@@ -223,6 +241,8 @@ spec:
                 x-kubernetes-validations:
                 - message: replicas must be within autoscaling bounds
                   rule: '!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)'
+                - message: min_replicas=0 requires web endpoint mode
+                  rule: '!has(self.autoscaling) || self.autoscaling.min_replicas != 0 || (has(self.exposure.endpoint_mode) && self.exposure.endpoint_mode == ''web'')'
                 - message: web requires exactly one TCP port
                   rule: '!has(self.exposure.endpoint_mode) || self.exposure.endpoint_mode != ''web'' || (size(self.ports) == 1 && self.ports.all(p, p.protocol == ''tcp''))'
             required:
@@ -236,6 +256,9 @@ spec:
           status:
             nullable: true
             properties:
+              cold:
+                default: false
+                type: boolean
               desired_replicas:
                 format: int32
                 type: integer
@@ -264,6 +287,32 @@ spec:
                   - protocol
                   type: object
                 type: array
+              gpu_quota_exhausted:
+                default: false
+                type: boolean
+              gpu_weekly_usage:
+                nullable: true
+                properties:
+                  last_metered_at:
+                    format: int64
+                    type: integer
+                  limit_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  used_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  week_started_at:
+                    format: int64
+                    type: integer
+                required:
+                - last_metered_at
+                - limit_seconds
+                - used_seconds
+                - week_started_at
+                type: object
               image_size_bytes:
                 format: uint64
                 minimum: 0.0

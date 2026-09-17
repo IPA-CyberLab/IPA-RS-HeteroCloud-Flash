@@ -15,6 +15,18 @@ api:
       cpu: 500m
       memory: 512Mi
 
+activator:
+  replicaCount: 2
+  port: 8081
+  coldStartTimeoutSeconds: 120
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
 # Trusted provider suffix; empty disables load_balancer and web endpoints.
 # Web uses the existing heterocloud-edge/heterocloud-edge Gateway, listener http.
 # Gateway API v1 CRDs and external wildcard DNS/TLS must be installed by the platform.

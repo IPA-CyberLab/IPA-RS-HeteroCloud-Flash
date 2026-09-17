@@ -20,6 +20,9 @@ pub const MIN_EPHEMERAL_STORAGE_GIB: u32 = 1;
 pub const MAX_EPHEMERAL_STORAGE_GIB: u32 = 1_000_000;
 pub const DEFAULT_EPHEMERAL_STORAGE_GIB: u32 = 10;
 pub const MAX_GPUS_PER_VM: u32 = 1;
+pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u32 = 900;
+pub const MIN_IDLE_TIMEOUT_SECONDS: u32 = 60;
+pub const MAX_IDLE_TIMEOUT_SECONDS: u32 = 86_400;
 
 const PUBLIC_EGRESS_ROOTS: [&str; 2] = ["0.0.0.0/0", "2000::/3"];
 const PROTECTED_EGRESS_CIDRS: [&str; 16] = [
@@ -90,6 +93,11 @@ impl FlashSpec {
         }
         if let Some(scaling) = &self.autoscaling {
             scaling.validate(self.replicas)?;
+            if scaling.min_replicas == 0 && self.exposure.endpoint_mode != EndpointMode::Web {
+                return Err(ValidationError::Field(
+                    "min_replicas=0 requires the HTTP/HTTPS web endpoint mode".into(),
+                ));
+            }
         }
         if matches!(
             self.exposure.endpoint_mode,
@@ -199,7 +207,7 @@ const fn is_zero(value: &u32) -> bool {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlashAutoscaling {
-    #[schemars(range(min = 1, max = 100_000))]
+    #[schemars(range(min = 0, max = 100_000))]
     pub min_replicas: u32,
     #[schemars(range(min = 1, max = 100_000))]
     pub max_replicas: u32,
@@ -209,19 +217,28 @@ pub struct FlashAutoscaling {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 100))]
     pub target_memory_utilization_percent: Option<u32>,
+    #[serde(default = "default_idle_timeout_seconds")]
+    #[schemars(range(min = 60, max = 86_400))]
+    pub idle_timeout_seconds: u32,
 }
 
 impl FlashAutoscaling {
     fn validate(&self, replicas: u32) -> Result<(), ValidationError> {
-        if self.min_replicas == 0
-            || self.max_replicas > MAX_REPLICAS
+        if self.max_replicas > MAX_REPLICAS
             || self.max_replicas < self.min_replicas
-            || !(self.min_replicas..=self.max_replicas).contains(&replicas)
+            || !(self.min_replicas.max(1)..=self.max_replicas).contains(&replicas)
         {
             return Err(ValidationError::Field(
-                "autoscaling requires 1 <= min_replicas <= replicas <= max_replicas <= 100000"
+                "autoscaling requires 0 <= min_replicas <= replicas <= max_replicas <= 100000"
                     .into(),
             ));
+        }
+        if !(MIN_IDLE_TIMEOUT_SECONDS..=MAX_IDLE_TIMEOUT_SECONDS)
+            .contains(&self.idle_timeout_seconds)
+        {
+            return Err(ValidationError::Field(format!(
+                "idle_timeout_seconds must be between {MIN_IDLE_TIMEOUT_SECONDS} and {MAX_IDLE_TIMEOUT_SECONDS}"
+            )));
         }
         let targets = [
             self.target_cpu_utilization_percent,
@@ -237,6 +254,10 @@ impl FlashAutoscaling {
         }
         Ok(())
     }
+}
+
+const fn default_idle_timeout_seconds() -> u32 {
+    DEFAULT_IDLE_TIMEOUT_SECONDS
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -707,6 +728,30 @@ mod tests {
             spec.autoscaling = Some(serde_json::from_value(scaling)?);
             assert!(spec.validate().is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn scale_to_zero_is_web_only_and_defaults_idle_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scaling = serde_json::json!({
+            "min_replicas": 0,
+            "max_replicas": 5,
+            "target_cpu_utilization_percent": 70
+        });
+        let mut spec = valid_spec();
+        spec.autoscaling = Some(serde_json::from_value(scaling)?);
+        assert!(spec.validate().is_err());
+
+        spec.exposure.endpoint_mode = super::EndpointMode::Web;
+        spec.ports[0].protocol = TransportProtocol::Tcp;
+        spec.exposure.allowed_source_cidrs.clear();
+        spec.exposure.denied_source_cidrs.clear();
+        spec.validate()?;
+        assert_eq!(
+            spec.autoscaling.ok_or("autoscaling")?.idle_timeout_seconds,
+            super::DEFAULT_IDLE_TIMEOUT_SECONDS
+        );
         Ok(())
     }
 

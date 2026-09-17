@@ -12,8 +12,8 @@ RUN apt-get update \
     && useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin flash
 COPY --from=builder /src/target/release/flash-api /usr/local/bin/flash-api
 COPY --from=builder /src/target/release/flash-controller /usr/local/bin/flash-controller
+COPY --from=builder /src/target/release/flash-activator /usr/local/bin/flash-activator
 COPY --from=builder /src/target/release/flashctl /usr/local/bin/flashctl
 COPY --from=builder /src/target/release/flash-udp-echo /usr/local/bin/flash-udp-echo
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/flash-api"]
-

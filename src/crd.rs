@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{FlashSpec, TransportProtocol};
 
+pub const MAX_WEEKLY_GPU_SECONDS: u64 = 31_536_000;
+
 pub fn validated_crd() -> anyhow::Result<serde_json::Value> {
     use kube::CustomResourceExt;
     use serde_json::json;
@@ -12,6 +14,7 @@ pub fn validated_crd() -> anyhow::Result<serde_json::Value> {
         ["properties"]["workload"];
     workload["x-kubernetes-validations"] = json!([
         {"rule": "!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)", "message": "replicas must be within autoscaling bounds"},
+        {"rule": "!has(self.autoscaling) || self.autoscaling.min_replicas != 0 || (has(self.exposure.endpoint_mode) && self.exposure.endpoint_mode == 'web')", "message": "min_replicas=0 requires web endpoint mode"},
         {"rule": "!has(self.exposure.endpoint_mode) || self.exposure.endpoint_mode != 'web' || (size(self.ports) == 1 && self.ports.all(p, p.protocol == 'tcp'))", "message": "web requires exactly one TCP port"}
     ]);
     workload["properties"]["autoscaling"]["x-kubernetes-validations"] = json!([
@@ -42,7 +45,24 @@ pub struct FlashServiceSpec {
     pub organization_id: String,
     pub project_id: String,
     pub service_instance_id: String,
+    #[serde(default)]
+    pub policy: FlashServicePolicy,
     pub workload: FlashSpec,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlashServicePolicy {
+    #[schemars(range(min = 0, max = 31_536_000))]
+    pub max_weekly_gpu_seconds: u64,
+}
+
+impl Default for FlashServicePolicy {
+    fn default() -> Self {
+        Self {
+            max_weekly_gpu_seconds: MAX_WEEKLY_GPU_SECONDS,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -62,6 +82,21 @@ pub struct FlashServiceStatus {
     pub image_size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writable_storage_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_weekly_usage: Option<FlashGpuWeeklyUsage>,
+    #[serde(default)]
+    pub gpu_quota_exhausted: bool,
+    #[serde(default)]
+    pub cold: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlashGpuWeeklyUsage {
+    pub week_started_at: i64,
+    pub used_seconds: u64,
+    pub last_metered_at: i64,
+    pub limit_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]

@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use futures_util::StreamExt;
 use ipnet::IpNet;
 use k8s_openapi::{
@@ -33,7 +34,9 @@ use uuid::Uuid;
 
 use crate::{
     GPU_READY_LABEL, GPU_RESOURCE_NAME, LOAD_BALANCER_CLASS, TRAFFIC_MODE_ANNOTATION,
-    crd::{FlashEndpoint, FlashService, FlashServicePhase, FlashServiceStatus},
+    crd::{
+        FlashEndpoint, FlashGpuWeeklyUsage, FlashService, FlashServicePhase, FlashServiceStatus,
+    },
     domain::{EndpointMode, ExposureType, TrafficMode, ValidationError},
     image::{GIB_BYTES, ImageInspection, ImageInspector},
     web::{
@@ -49,6 +52,7 @@ const DNS_HOSTNAME: &str = "external-dns.alpha.kubernetes.io/hostname";
 const DNS_PUBLISH_LABEL: &str = "dns.heterocloud.io/publish";
 const GENERATION_LABEL: &str = "flash.heterocloud.io/generation";
 const TEMPLATE_OBSERVED_GENERATION: &str = "flash.heterocloud.io/template-observed-generation";
+pub const LAST_ACTIVITY_ANNOTATION: &str = "flash.heterocloud.io/last-activity-at";
 const ASSIGNED_NODES_ANNOTATION: &str = "networking.heteronetwork.io/assigned-nodes";
 const PERSISTENT_HOME_VOLUME: &str = "persistent-home";
 const PERSISTENT_HOME_MOUNT_PATH: &str = "/root";
@@ -147,46 +151,50 @@ pub struct ControllerContext {
     additional_protected_networks: Vec<IpNet>,
     dns_networks: Vec<IpNet>,
     public_domain: Option<String>,
+    activator_namespace: String,
+    activator_service: String,
+    activator_port: u16,
+}
+
+pub struct ControllerConfig {
+    pub namespace: String,
+    pub registry_pull_secret: Option<String>,
+    pub persistent_storage_class: Option<String>,
+    pub admin_volume_mounts: AdminVolumeMounts,
+    pub additional_protected_networks: Vec<IpNet>,
+    pub dns_networks: Vec<IpNet>,
+    pub public_domain: Option<String>,
+    pub activator_namespace: String,
+    pub activator_service: String,
+    pub activator_port: u16,
 }
 
 impl ControllerContext {
     #[must_use]
-    pub fn new(
-        client: Client,
-        namespace: String,
-        image_inspector: ImageInspector,
-        registry_pull_secret: Option<String>,
-        persistent_storage_class: Option<String>,
-        admin_volume_mounts: AdminVolumeMounts,
-        additional_protected_networks: Vec<IpNet>,
-        dns_networks: Vec<IpNet>,
-        public_domain: Option<String>,
-    ) -> Self {
+    pub fn new(client: Client, image_inspector: ImageInspector, config: ControllerConfig) -> Self {
         Self {
             client,
-            namespace,
             image_inspector,
-            registry_pull_secret,
-            persistent_storage_class,
-            admin_volume_mounts,
-            additional_protected_networks,
-            dns_networks,
-            public_domain,
+            namespace: config.namespace,
+            registry_pull_secret: config.registry_pull_secret,
+            persistent_storage_class: config.persistent_storage_class,
+            admin_volume_mounts: config.admin_volume_mounts,
+            additional_protected_networks: config.additional_protected_networks,
+            dns_networks: config.dns_networks,
+            public_domain: config.public_domain,
+            activator_namespace: config.activator_namespace,
+            activator_service: config.activator_service,
+            activator_port: config.activator_port,
         }
     }
 }
 
 pub async fn run_controller(
     client: Client,
-    namespace: String,
     image_inspector: ImageInspector,
-    registry_pull_secret: Option<String>,
-    persistent_storage_class: Option<String>,
-    admin_volume_mounts: AdminVolumeMounts,
-    additional_protected_networks: Vec<IpNet>,
-    dns_networks: Vec<IpNet>,
-    public_domain: Option<String>,
+    config: ControllerConfig,
 ) -> Result<()> {
+    let namespace = config.namespace.clone();
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
     let network_services = Api::<Service>::namespaced(client.clone(), &namespace);
@@ -196,17 +204,7 @@ pub async fn run_controller(
     let pods = Api::<Pod>::namespaced(client.clone(), &namespace);
     let autoscalers = Api::<HorizontalPodAutoscaler>::namespaced(client.clone(), &namespace);
     let http_routes = Api::<HTTPRoute>::namespaced(client.clone(), &namespace);
-    let context = Arc::new(ControllerContext::new(
-        client,
-        namespace,
-        image_inspector,
-        registry_pull_secret,
-        persistent_storage_class,
-        admin_volume_mounts,
-        additional_protected_networks,
-        dns_networks,
-        public_domain,
-    ));
+    let context = Arc::new(ControllerContext::new(client, image_inspector, config));
 
     info!("FlashService controller started");
     Controller::new(services, watcher::Config::default())
@@ -229,6 +227,132 @@ pub async fn run_controller(
             }
         })
         .await;
+    Ok(())
+}
+
+#[derive(Default)]
+struct GpuMeter {
+    usage: Option<FlashGpuWeeklyUsage>,
+    exhausted: bool,
+}
+
+fn utc_week_start(timestamp: i64) -> i64 {
+    const WEEK_SECONDS: i64 = 7 * 24 * 60 * 60;
+    const FIRST_MONDAY_AFTER_UNIX_EPOCH: i64 = 4 * 24 * 60 * 60;
+    (timestamp - FIRST_MONDAY_AFTER_UNIX_EPOCH).div_euclid(WEEK_SECONDS) * WEEK_SECONDS
+        + FIRST_MONDAY_AFTER_UNIX_EPOCH
+}
+
+async fn meter_gpu_usage(
+    services: &Api<FlashService>,
+    flash: &FlashService,
+    now: i64,
+) -> Result<GpuMeter, ReconcileError> {
+    if flash.spec.workload.gpu_count == 0 {
+        return Ok(GpuMeter::default());
+    }
+    let week_started_at = utc_week_start(now);
+    let previous = flash.status.as_ref().and_then(|status| {
+        status
+            .gpu_weekly_usage
+            .as_ref()
+            .filter(|usage| usage.week_started_at == week_started_at)
+    });
+    let mut used_seconds = previous.map_or(0, |usage| usage.used_seconds);
+    let last_metered_at = previous
+        .map_or(now, |usage| usage.last_metered_at.max(week_started_at))
+        .min(now);
+    let ready_replicas = flash.status.as_ref().map_or(0, |status| {
+        u64::try_from(status.ready_replicas.max(0)).unwrap_or_default()
+    });
+    let elapsed = u64::try_from(now.saturating_sub(last_metered_at)).unwrap_or_default();
+    used_seconds = used_seconds.saturating_add(
+        elapsed
+            .saturating_mul(ready_replicas)
+            .saturating_mul(u64::from(flash.spec.workload.gpu_count)),
+    );
+
+    let mut organization_total = used_seconds;
+    for peer in services.list(&ListParams::default()).await?.items {
+        if peer.name_any() == flash.name_any()
+            || peer.spec.organization_id != flash.spec.organization_id
+            || peer.spec.workload.gpu_count == 0
+        {
+            continue;
+        }
+        if let Some(usage) = peer
+            .status
+            .as_ref()
+            .and_then(|status| status.gpu_weekly_usage.as_ref())
+            .filter(|usage| usage.week_started_at == week_started_at)
+        {
+            organization_total = organization_total.saturating_add(usage.used_seconds);
+        }
+    }
+    let limit_seconds = flash.spec.policy.max_weekly_gpu_seconds;
+    Ok(GpuMeter {
+        usage: Some(FlashGpuWeeklyUsage {
+            week_started_at,
+            used_seconds,
+            last_metered_at: now,
+            limit_seconds,
+        }),
+        exhausted: organization_total >= limit_seconds,
+    })
+}
+
+fn is_scale_to_zero(flash: &FlashService) -> bool {
+    flash
+        .spec
+        .workload
+        .autoscaling
+        .as_ref()
+        .is_some_and(|scaling| scaling.min_replicas == 0)
+}
+
+fn activity_timestamp(flash: &FlashService) -> Option<i64> {
+    flash
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(LAST_ACTIVITY_ANNOTATION)?
+        .parse()
+        .ok()
+}
+
+fn should_scale_to_zero(flash: &FlashService, now: i64) -> bool {
+    let Some(scaling) = flash
+        .spec
+        .workload
+        .autoscaling
+        .as_ref()
+        .filter(|scaling| scaling.min_replicas == 0)
+    else {
+        return false;
+    };
+    let was_ready = flash.status.as_ref().is_some_and(|status| {
+        status.observed_generation == flash.spec.desired_generation
+            && status.phase == FlashServicePhase::Ready
+    });
+    was_ready
+        && activity_timestamp(flash)
+            .is_some_and(|last| now.saturating_sub(last) >= i64::from(scaling.idle_timeout_seconds))
+}
+
+async fn mark_activity(
+    services: &Api<FlashService>,
+    flash: &FlashService,
+    timestamp: i64,
+) -> Result<(), ReconcileError> {
+    services
+        .patch(
+            &flash.name_any(),
+            &PatchParams::apply(FIELD_MANAGER),
+            &Patch::Merge(json!({
+                "metadata": {"annotations": {(LAST_ACTIVITY_ANNOTATION): timestamp.to_string()}}
+            })),
+        )
+        .await?;
     Ok(())
 }
 
@@ -262,6 +386,11 @@ async fn reconcile(
         .await?;
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
+
+    let now = Utc::now().timestamp();
+    let gpu_meter = meter_gpu_usage(&services, &flash, now).await?;
+    let cold = should_scale_to_zero(&flash, now);
+    let suspended = cold || gpu_meter.exhausted;
 
     let desired_replicas = i32::try_from(flash.spec.workload.replicas)
         .map_err(|_| ReconcileError::InvalidReplicaCount)?;
@@ -367,7 +496,14 @@ async fn reconcile(
     let desired_network_service =
         desired_service_with_hostname(&flash, &owner, hostname.as_deref())?;
     let http_routes = Api::<HTTPRoute>::namespaced(context.client.clone(), &context.namespace);
-    let desired_route = desired_http_route(&flash, &owner, hostname.as_deref())?;
+    let desired_route = desired_http_route(
+        &flash,
+        &owner,
+        hostname.as_deref(),
+        &context.activator_namespace,
+        &context.activator_service,
+        context.activator_port,
+    )?;
     if desired_route.is_none() && !delete_http_route(&http_routes, &name).await? {
         return Ok(Action::requeue(Duration::from_secs(2)));
     }
@@ -392,6 +528,8 @@ async fn reconcile(
         &context.additional_protected_networks,
         &context.dns_networks,
         &forwarded_ingress_networks,
+        &context.activator_namespace,
+        is_scale_to_zero(&flash),
     )?;
 
     if let Some(persistent_volume_claim) = &persistent_volume_claim {
@@ -412,6 +550,7 @@ async fn reconcile(
         &flash,
         &owner,
         deployment,
+        suspended,
     )
     .await?;
     let desired_replicas = applied_deployment
@@ -472,6 +611,9 @@ async fn reconcile(
         resolved_image: Some(inspection.resolved_image),
         image_size_bytes: Some(inspection.image_size_bytes),
         writable_storage_bytes: Some(inspection.writable_storage_bytes),
+        gpu_weekly_usage: gpu_meter.usage,
+        gpu_quota_exhausted: gpu_meter.exhausted,
+        cold,
         ..FlashServiceStatus::default()
     };
     let action = update_workload_status(
@@ -480,6 +622,16 @@ async fn reconcile(
         endpoint_ready,
         !flash.spec.workload.ports.is_empty(),
     );
+    if suspended {
+        status.desired_replicas = 0;
+        status.ready_replicas = 0;
+        status.phase = FlashServicePhase::Ready;
+        status.message = Some(if gpu_meter.exhausted {
+            "weekly GPU runtime limit reached; service resumes at the next UTC week or after the owner raises the limit".into()
+        } else {
+            "scaled to zero; the next HTTP request will cold-start one replica".into()
+        });
+    }
     if hostname.is_some()
         && !status.endpoints.is_empty()
         && status.phase == FlashServicePhase::Ready
@@ -494,7 +646,15 @@ async fn reconcile(
             None => note.into(),
         });
     }
+    let phase_ready = status.phase == FlashServicePhase::Ready;
     patch_status_if_changed(&services, &flash, status).await?;
+    if is_scale_to_zero(&flash) && phase_ready && activity_timestamp(&flash).is_none() {
+        mark_activity(&services, &flash, now).await?;
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+    if flash.spec.workload.gpu_count > 0 || is_scale_to_zero(&flash) {
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
     Ok(action)
 }
 
@@ -555,6 +715,7 @@ fn status_patch(flash: &FlashService, status: &FlashServiceStatus) -> Value {
     patch["status"]["resolved_image"] = json!(status.resolved_image);
     patch["status"]["image_size_bytes"] = json!(status.image_size_bytes);
     patch["status"]["writable_storage_bytes"] = json!(status.writable_storage_bytes);
+    patch["status"]["gpu_weekly_usage"] = json!(status.gpu_weekly_usage);
     if let Some(version) = &flash.metadata.resource_version {
         patch["metadata"] = json!({"resourceVersion": version});
     }
@@ -873,7 +1034,11 @@ fn public_hostname(
 fn desired_autoscaler(
     flash: &FlashService,
     owner: &OwnerReference,
+    suspended: bool,
 ) -> Result<Option<HorizontalPodAutoscaler>, ReconcileError> {
+    if suspended {
+        return Ok(None);
+    }
     let Some(scaling) = &flash.spec.workload.autoscaling else {
         return Ok(None);
     };
@@ -886,7 +1051,7 @@ fn desired_autoscaler(
         "metadata": {"name": flash.name_any(), "labels": base_labels(flash), "ownerReferences": [owner]},
         "spec": {
             "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": flash.name_any()},
-            "minReplicas": scaling.min_replicas, "maxReplicas": scaling.max_replicas,
+            "minReplicas": scaling.min_replicas.max(1), "maxReplicas": scaling.max_replicas,
             "metrics": metrics, "behavior": {"scaleDown": {"stabilizationWindowSeconds": 300}}
         }
     }))?))
@@ -937,11 +1102,12 @@ async fn reconcile_scaling(
     flash: &FlashService,
     owner: &OwnerReference,
     mut desired: Deployment,
+    suspended: bool,
 ) -> Result<Deployment, ReconcileError> {
     let name = flash.name_any();
     let deployments = Api::<Deployment>::namespaced(client.clone(), namespace);
     let autoscalers = Api::<HorizontalPodAutoscaler>::namespaced(client.clone(), namespace);
-    let hpa = desired_autoscaler(flash, owner)?;
+    let hpa = desired_autoscaler(flash, owner, suspended)?;
     if hpa.is_none() && !delete_autoscaler(&autoscalers, &name).await? {
         return Err(anyhow::anyhow!("waiting for autoscaler deletion before fixed scaling").into());
     }
@@ -962,7 +1128,9 @@ async fn reconcile_scaling(
         }
     };
     if hpa.is_none() || legacy_owns_replicas(&current) {
-        let replicas = if hpa.is_none() {
+        let replicas = if suspended {
+            0
+        } else if hpa.is_none() {
             i32::try_from(flash.spec.workload.replicas)
                 .map_err(|_| ReconcileError::InvalidReplicaCount)?
         } else {
@@ -1071,6 +1239,9 @@ fn desired_http_route(
     flash: &FlashService,
     owner: &OwnerReference,
     hostname: Option<&str>,
+    activator_namespace: &str,
+    activator_service: &str,
+    activator_port: u16,
 ) -> Result<Option<HTTPRoute>, ReconcileError> {
     if flash.spec.workload.exposure.endpoint_mode != EndpointMode::Web {
         return Ok(None);
@@ -1078,6 +1249,14 @@ fn desired_http_route(
     flash.spec.workload.validate()?;
     let hostname = hostname.ok_or_else(|| anyhow::anyhow!("web requires provider publicDomain"))?;
     let port = &flash.spec.workload.ports[0];
+    let backend = if is_scale_to_zero(flash) {
+        json!({
+            "group": "", "kind": "Service", "name": activator_service,
+            "namespace": activator_namespace, "port": activator_port
+        })
+    } else {
+        json!({"group": "", "kind": "Service", "name": flash.name_any(), "port": port.service_port})
+    };
     Ok(Some(from_value(json!({
         "apiVersion": "gateway.networking.k8s.io/v1", "kind": "HTTPRoute",
         "metadata": {"name": flash.name_any(), "labels": base_labels(flash), "ownerReferences": [owner]},
@@ -1085,7 +1264,7 @@ fn desired_http_route(
             "parentRefs": [{"group": "gateway.networking.k8s.io", "kind": "Gateway", "name": GATEWAY_NAME, "namespace": GATEWAY_NAMESPACE, "sectionName": GATEWAY_SECTION}],
             "hostnames": [hostname],
             "rules": [{
-                "backendRefs": [{"group": "", "kind": "Service", "name": flash.name_any(), "port": port.service_port}],
+                "backendRefs": [backend],
                 "filters": [{
                     "type": "RequestHeaderModifier",
                     "requestHeaderModifier": {"set": [
@@ -1212,7 +1391,7 @@ fn workload_failure_message(pods: &[Pod]) -> Option<String> {
                 .as_ref()
                 .and_then(|state| state.waiting.as_ref())
                 .filter(|waiting| waiting.reason.as_deref() == Some("CrashLoopBackOff"))
-                .and_then(|_| container.last_state.as_ref())
+                .and(container.last_state.as_ref())
                 .and_then(|state| state.terminated.as_ref());
             if let Some(terminated) = current_terminated.or(crash_loop_terminated) {
                 let detail = terminated
@@ -1399,7 +1578,7 @@ fn desired_network_policy(
     flash: &FlashService,
     owner: &OwnerReference,
 ) -> Result<NetworkPolicy, ReconcileError> {
-    desired_network_policy_with_networks(flash, owner, &[], &[], &[])
+    desired_network_policy_with_networks(flash, owner, &[], &[], &[], "heterocloud-flash", false)
 }
 
 fn desired_network_policy_with_networks(
@@ -1408,6 +1587,8 @@ fn desired_network_policy_with_networks(
     additional_protected_networks: &[IpNet],
     dns_networks: &[IpNet],
     forwarded_ingress_networks: &[IpNet],
+    activator_namespace: &str,
+    allow_activator: bool,
 ) -> Result<NetworkPolicy, ReconcileError> {
     let exposure = &flash.spec.workload.exposure;
     let mut seen_ports = BTreeSet::new();
@@ -1427,17 +1608,27 @@ fn desired_network_policy_with_networks(
     let ingress = if ports.is_empty() {
         Vec::new()
     } else if exposure.endpoint_mode == EndpointMode::Web {
-        vec![json!({
-            "from": [{
-                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": PROXY_NAMESPACE}},
+        let mut sources = vec![json!({
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": PROXY_NAMESPACE}},
+            "podSelector": {"matchLabels": {
+                "app.kubernetes.io/name": "envoy",
+                "app.kubernetes.io/component": "proxy",
+                "app.kubernetes.io/managed-by": "envoy-gateway",
+                "gateway.envoyproxy.io/owning-gateway-name": GATEWAY_NAME,
+                "gateway.envoyproxy.io/owning-gateway-namespace": GATEWAY_NAMESPACE
+            }}
+        })];
+        if allow_activator {
+            sources.push(json!({
+                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": activator_namespace}},
                 "podSelector": {"matchLabels": {
-                    "app.kubernetes.io/name": "envoy",
-                    "app.kubernetes.io/component": "proxy",
-                    "app.kubernetes.io/managed-by": "envoy-gateway",
-                    "gateway.envoyproxy.io/owning-gateway-name": GATEWAY_NAME,
-                    "gateway.envoyproxy.io/owning-gateway-namespace": GATEWAY_NAMESPACE
+                    "app.kubernetes.io/component": "activator",
+                    "app.kubernetes.io/part-of": "heterocloud"
                 }}
-            }],
+            }));
+        }
+        vec![json!({
+            "from": sources,
             "ports": ports
         })]
     } else {
@@ -1898,6 +2089,7 @@ mod tests {
                 organization_id: "00000000-0000-0000-0000-000000000002".into(),
                 project_id: "00000000-0000-0000-0000-000000000003".into(),
                 service_instance_id: "00000000-0000-0000-0000-000000000001".into(),
+                policy: crate::crd::FlashServicePolicy::default(),
                 workload: FlashSpec {
                     region: "heteronet-global".into(),
                     image: "example.invalid/udp:v1".into(),
@@ -2635,9 +2827,10 @@ mod tests {
                 max_replicas: 10,
                 target_cpu_utilization_percent: cpu,
                 target_memory_utilization_percent: memory,
+                idle_timeout_seconds: crate::domain::DEFAULT_IDLE_TIMEOUT_SECONDS,
             });
             let hpa = serde_json::to_value(
-                super::desired_autoscaler(&flash, &owner())?.ok_or("missing HPA")?,
+                super::desired_autoscaler(&flash, &owner(), false)?.ok_or("missing HPA")?,
             )?;
             assert_eq!(hpa["apiVersion"], "autoscaling/v2");
             assert_eq!(hpa["spec"]["minReplicas"], 2);
@@ -2653,7 +2846,9 @@ mod tests {
                 assert_eq!(metric["resource"]["target"]["type"], "Utilization");
             }
         }
-        assert!(super::desired_autoscaler(&service(TrafficMode::Forwarded), &owner())?.is_none());
+        assert!(
+            super::desired_autoscaler(&service(TrafficMode::Forwarded), &owner(), false)?.is_none()
+        );
         Ok(())
     }
 
@@ -2740,9 +2935,11 @@ mod tests {
             max_replicas: 10,
             target_cpu_utilization_percent: Some(60),
             target_memory_utilization_percent: None,
+            idle_timeout_seconds: crate::domain::DEFAULT_IDLE_TIMEOUT_SECONDS,
         };
         flash.spec.workload.autoscaling = Some(scaling.clone());
-        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone()).await?;
+        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone(), false)
+            .await?;
         {
             let mut state = state.lock().map_err(|_| "poisoned state")?;
             assert_eq!(
@@ -2753,7 +2950,8 @@ mod tests {
             state.0["spec"]["replicas"] = json!(7);
         }
         let applied =
-            super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone()).await?;
+            super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone(), false)
+                .await?;
         assert_eq!(applied.spec.and_then(|spec| spec.replicas), Some(7));
         {
             let mut state = state.lock().map_err(|_| "poisoned state")?;
@@ -2761,7 +2959,8 @@ mod tests {
             state.2.clear();
         }
         flash.spec.workload.autoscaling = None;
-        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone()).await?;
+        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment.clone(), false)
+            .await?;
         {
             let mut state = state.lock().map_err(|_| "poisoned state")?;
             assert_eq!(
@@ -2775,7 +2974,7 @@ mod tests {
             state.2.clear();
         }
         flash.spec.workload.autoscaling = Some(scaling);
-        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment).await?;
+        super::reconcile_scaling(&client, "test", &flash, &owner(), deployment, false).await?;
         assert_eq!(
             state.lock().map_err(|_| "poisoned state")?.2,
             ["apply-workload-without-replicas", "apply-hpa"]
@@ -2815,7 +3014,15 @@ mod tests {
         ] {
             assert!(value["spec"].get(field).is_none(), "{field}");
         }
-        let mut route = desired_http_route(&flash, &owner(), Some(&host))?.ok_or("route")?;
+        let mut route = desired_http_route(
+            &flash,
+            &owner(),
+            Some(&host),
+            "heterocloud-flash",
+            "flash-activator",
+            8081,
+        )?
+        .ok_or("route")?;
         let value = serde_json::to_value(&route)?;
         assert_eq!(value["spec"]["hostnames"], json!([host]));
         assert_eq!(
@@ -2840,6 +3047,33 @@ mod tests {
             value["spec"]["rules"][0]["backendRefs"][0]["name"],
             flash.name_any()
         );
+        flash.spec.workload.autoscaling = Some(crate::domain::FlashAutoscaling {
+            min_replicas: 0,
+            max_replicas: 5,
+            target_cpu_utilization_percent: Some(70),
+            target_memory_utilization_percent: None,
+            idle_timeout_seconds: crate::domain::DEFAULT_IDLE_TIMEOUT_SECONDS,
+        });
+        let cold_route = serde_json::to_value(
+            desired_http_route(
+                &flash,
+                &owner(),
+                Some(&host),
+                "heterocloud-flash",
+                "flash-activator",
+                8081,
+            )?
+            .ok_or("cold route")?,
+        )?;
+        let cold_backend = &cold_route["spec"]["rules"][0]["backendRefs"][0];
+        assert_eq!(cold_backend["name"], "flash-activator");
+        assert_eq!(cold_backend["namespace"], "heterocloud-flash");
+        assert_eq!(cold_backend["port"], 8081);
+        let hpa = serde_json::to_value(
+            desired_autoscaler(&flash, &owner(), false)?.ok_or("scale-to-zero HPA")?,
+        )?;
+        assert_eq!(hpa["spec"]["minReplicas"], 1);
+        flash.spec.workload.autoscaling = None;
         assert_eq!(route.metadata.owner_references, Some(vec![owner()]));
         svc.spec.as_mut().ok_or("spec")?.cluster_ip = Some("10.96.0.1".into());
         assert!(web_endpoints(&flash, &svc, Some(&route), Some(&host)).is_empty());
@@ -2889,7 +3123,17 @@ mod tests {
             }])
         );
         flash.spec.workload.exposure.endpoint_mode = EndpointMode::Ip;
-        assert!(desired_http_route(&flash, &owner(), None)?.is_none());
+        assert!(
+            desired_http_route(
+                &flash,
+                &owner(),
+                None,
+                "heterocloud-flash",
+                "flash-activator",
+                8081,
+            )?
+            .is_none()
+        );
         Ok(())
     }
 
@@ -3051,6 +3295,8 @@ mod tests {
             &[],
             &[],
             &["10.244.2.0/32".parse()?],
+            "heterocloud-flash",
+            false,
         )?)?;
         assert_eq!(
             policy.pointer("/spec/ingress/0/from/2/ipBlock/cidr"),

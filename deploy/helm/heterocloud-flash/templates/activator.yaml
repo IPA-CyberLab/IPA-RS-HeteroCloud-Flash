@@ -1,0 +1,100 @@
+{{- if .Values.publicDomain }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flash.fullname" . }}-activator
+  labels:
+    {{- include "flash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: activator
+spec:
+  replicas: {{ .Values.activator.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "flash.name" . }}
+      app.kubernetes.io/component: activator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "flash.name" . }}
+        app.kubernetes.io/component: activator
+        app.kubernetes.io/part-of: heterocloud
+    spec:
+      serviceAccountName: {{ include "flash.serviceAccountName" . }}
+      securityContext:
+        {{- include "flash.podSecurityContext" . | nindent 8 }}
+      affinity:
+        {{- include "flash.affinity" (dict "root" . "component" "activator") | nindent 8 }}
+      containers:
+        - name: activator
+          image: {{ include "flash.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/flash-activator"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.activator.port }}
+          env:
+            - name: FLASH_ACTIVATOR_BIND_ADDR
+              value: "0.0.0.0:{{ .Values.activator.port }}"
+            - name: FLASH_WORKLOAD_NAMESPACE
+              value: {{ .Values.workloadNamespace | quote }}
+            - name: FLASH_PUBLIC_DOMAIN
+              value: {{ required "publicDomain is required for the scale-to-zero activator" .Values.publicDomain | quote }}
+            - name: FLASH_COLD_START_TIMEOUT_SECONDS
+              value: {{ .Values.activator.coldStartTimeoutSeconds | quote }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+          securityContext:
+            {{- include "flash.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.activator.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flash.fullname" . }}-activator
+  labels:
+    {{- include "flash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: activator
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "flash.name" . }}
+    app.kubernetes.io/component: activator
+  ports:
+    - name: http
+      port: {{ .Values.activator.port }}
+      targetPort: http
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ReferenceGrant
+metadata:
+  name: {{ include "flash.fullname" . }}-activator
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ .Values.workloadNamespace }}
+  to:
+    - group: ""
+      kind: Service
+      name: {{ include "flash.fullname" . }}-activator
+{{- end }}

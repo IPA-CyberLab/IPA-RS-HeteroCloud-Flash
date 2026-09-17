@@ -38,6 +38,12 @@ spec:
               value: {{ .Values.publicDomain | quote }}
             - name: FLASH_WORKLOAD_NAMESPACE
               value: {{ .Values.workloadNamespace | quote }}
+            - name: FLASH_ACTIVATOR_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: FLASH_ACTIVATOR_SERVICE
+              value: {{ printf "%s-activator" (include "flash.fullname" .) | quote }}
+            - name: FLASH_ACTIVATOR_PORT
+              value: {{ .Values.activator.port | quote }}
             - name: FLASH_ADDITIONAL_PROTECTED_CIDRS_JSON
               value: {{ .Values.networkPolicy.additionalProtectedCidrs | toJson | quote }}
             - name: FLASH_DNS_CIDRS_JSON
