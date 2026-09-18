@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{FlashSpec, TransportProtocol};
 
 pub const MAX_WEEKLY_GPU_SECONDS: u64 = 31_536_000;
+pub const MAX_PRIVATE_GPU_ASSIGNMENTS: u64 = 256;
 
 pub fn validated_crd() -> anyhow::Result<serde_json::Value> {
     use kube::CustomResourceExt;
@@ -35,8 +36,13 @@ pub fn validated_gpu_device_crd() -> anyhow::Result<serde_json::Value> {
     use serde_json::json;
     let mut crd = serde_json::to_value(FlashGpuDevice::crd())?;
     let spec = &mut crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+    let assignments = &mut spec["properties"]["private_assignments"];
+    assignments["maxItems"] = json!(MAX_PRIVATE_GPU_ASSIGNMENTS);
+    assignments["items"]["minLength"] = json!(36);
+    assignments["items"]["maxLength"] = json!(36);
+    assignments["items"]["pattern"] =
+        json!("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
     spec["x-kubernetes-validations"] = json!([
-        {"rule": "self.private_assignments.all(subject, subject.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))", "message": "private assignments must be lowercase UUIDs"},
         {"rule": "self.gpu_type.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')", "message": "gpu_type must be a canonical lowercase DNS label"},
         {"rule": "self.node_name.matches('^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$')", "message": "node_name must be a lowercase Kubernetes node name"},
         {"rule": "self.physical_id.matches('^[A-Za-z0-9._:-]+$')", "message": "physical_id contains unsupported characters"}
@@ -349,20 +355,22 @@ mod tests {
             spec["properties"]["private_assignments"]["default"],
             serde_json::json!([])
         );
+        assert_eq!(
+            spec["properties"]["private_assignments"]["maxItems"],
+            super::MAX_PRIVATE_GPU_ASSIGNMENTS
+        );
+        assert_eq!(
+            spec["properties"]["private_assignments"]["items"]["maxLength"],
+            36
+        );
+        assert_eq!(
+            spec["properties"]["private_assignments"]["items"]["pattern"],
+            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        );
         let rules = spec["x-kubernetes-validations"]
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("device validations missing"))?;
-        assert_eq!(rules.len(), 4);
-        let uuid_rule = rules
-            .iter()
-            .find(|rule| rule["message"] == "private assignments must be lowercase UUIDs")
-            .ok_or_else(|| anyhow::anyhow!("UUID validation missing"))?["rule"]
-            .as_str()
-            .unwrap_or_default();
-        assert_eq!(
-            uuid_rule,
-            "self.private_assignments.all(subject, subject.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))"
-        );
+        assert_eq!(rules.len(), 3);
         uuid::Uuid::parse_str("01a05ad9-b529-7573-8d7b-0123456789ab")?;
 
         let job = super::validated_gpu_job_crd()?;

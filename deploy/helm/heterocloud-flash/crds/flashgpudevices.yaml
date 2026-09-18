@@ -49,7 +49,11 @@ spec:
                 default: []
                 description: HeteroCloud UserId UUIDs allowed to see and consume a private GPU.
                 items:
+                  maxLength: 36
+                  minLength: 36
+                  pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
                   type: string
+                maxItems: 256
                 type: array
               visibility:
                 default: open
@@ -65,8 +69,6 @@ spec:
             - physical_id
             type: object
             x-kubernetes-validations:
-            - message: private assignments must be lowercase UUIDs
-              rule: self.private_assignments.all(subject, subject.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
             - message: gpu_type must be a canonical lowercase DNS label
               rule: self.gpu_type.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')
             - message: node_name must be a lowercase Kubernetes node name
