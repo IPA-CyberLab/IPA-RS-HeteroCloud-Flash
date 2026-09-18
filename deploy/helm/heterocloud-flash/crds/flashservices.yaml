@@ -44,6 +44,12 @@ spec:
                 type: string
               service_instance_id:
                 type: string
+              subject_id:
+                description: |-
+                  Authenticated user that owns this service. Older resources do not have
+                  this field and may only consume open GPU inventory.
+                nullable: true
+                type: string
               workload:
                 properties:
                   args:
@@ -182,10 +188,19 @@ spec:
                     - message: web does not yet support source CIDR filters
                       rule: '!has(self.endpoint_mode) || self.endpoint_mode != ''web'' || ((!has(self.allowed_source_cidrs) || size(self.allowed_source_cidrs) == 0) && (!has(self.denied_source_cidrs) || size(self.denied_source_cidrs) == 0))'
                   gpu_count:
+                    description: |-
+                      Transitional input accepted from pre-scheduler clients. New clients
+                      select a GPU by setting `gpu_type` and omit this field.
                     format: uint32
                     maximum: 1.0
                     minimum: 0.0
                     type: integer
+                  gpu_type:
+                    description: |-
+                      Requested GPU type. Supplying a type requests exactly one GPU; the
+                      scheduler selects the node and physical device.
+                    nullable: true
+                    type: string
                   image:
                     type: string
                   memory_mib:
@@ -243,6 +258,10 @@ spec:
                   rule: '!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)'
                 - message: min_replicas=0 requires web endpoint mode
                   rule: '!has(self.autoscaling) || self.autoscaling.min_replicas != 0 || (has(self.exposure.endpoint_mode) && self.exposure.endpoint_mode == ''web'')'
+                - message: gpu_type must be a canonical lowercase DNS label
+                  rule: '!has(self.gpu_type) || self.gpu_type.matches(''^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'')'
+                - message: GPU Flash VMs require replicas=1 and autoscaling max_replicas=1
+                  rule: (!has(self.gpu_type) && (!has(self.gpu_count) || self.gpu_count == 0)) || (self.replicas == 1 && (!has(self.autoscaling) || self.autoscaling.max_replicas == 1))
                 - message: web requires exactly one TCP port
                   rule: '!has(self.exposure.endpoint_mode) || self.exposure.endpoint_mode != ''web'' || (size(self.ports) == 1 && self.ports.all(p, p.protocol == ''tcp''))'
             required:
@@ -290,6 +309,28 @@ spec:
               gpu_quota_exhausted:
                 default: false
                 type: boolean
+              gpu_scheduling:
+                nullable: true
+                properties:
+                  display_name:
+                    nullable: true
+                    type: string
+                  gpu_type:
+                    nullable: true
+                    type: string
+                  phase:
+                    enum:
+                    - queued
+                    - reserved
+                    - running
+                    - retry
+                    - cancelled
+                    - released
+                    - rejected
+                    type: string
+                required:
+                - phase
+                type: object
               gpu_weekly_usage:
                 nullable: true
                 properties:

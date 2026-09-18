@@ -21,12 +21,12 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor|nvidia) -> Service
 ## Properties
 
 - CPU workloads run with the `gvisor` Kubernetes RuntimeClass. A spec with
-  `gpu_count: 1` runs with the `nvidia` RuntimeClass on a node that passed the
+  `gpu_type` runs with the `nvidia` RuntimeClass on a node that passed the
   cluster GPU smoke test. The provider chooses the runtime from the requested
   hardware and customers cannot set an arbitrary runtime.
-- A VM may request zero or one physical GPU. GPU requests and limits are both
-  set to `nvidia.com/gpu: 1`, so Kubernetes and the NVIDIA device plugin grant
-  one exclusive device to each replica.
+- A VM may select one accessible GPU type. Flash queues the request and chooses
+  the node and logical slot; Kubernetes and the NVIDIA device plugin grant the
+  final exclusive card. See [GPU inventory and scheduling](docs/GPU_SCHEDULER.md).
 - TCP and UDP ports use one typed model and support internal ClusterIP or the
   HeteroNetwork `heteronetwork.io/public` LoadBalancer class.
 - Public `forwarded` mode distributes traffic to Pods throughout the cluster;
@@ -71,10 +71,10 @@ Optional autoscaling and domain endpoints are described in
 {
   "region": "heteronet-global",
   "image": "ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash:0.1.23",
-  "replicas": 3,
+  "replicas": 1,
   "cpu_millis": 250,
   "memory_mib": 128,
-  "gpu_count": 1,
+  "gpu_type": "nvidia-geforce-gtx-1080-ti",
   "ephemeral_storage_gib": 10,
   "ports": [
     {

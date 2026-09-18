@@ -112,6 +112,10 @@ pub struct ProviderClaims {
     pub audience: String,
     #[serde(rename = "sub")]
     pub subject: Uuid,
+    /// Owner account user resolved from the principal. `sub` remains the
+    /// command-authentication PrincipalId.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
     pub organization_id: Uuid,
     pub project_id: Uuid,
     pub service_instance_id: Uuid,
@@ -145,4 +149,87 @@ pub enum AuthError {
     InvalidCommand,
     #[error("provider authentication is not configured correctly")]
     InvalidConfiguration,
+}
+
+#[cfg(test)]
+mod tests {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+
+    use super::*;
+    use crate::{
+        PROVIDER_GPU_ACCESS_UPDATE_ACTION, PROVIDER_GPU_CATALOG_LIST_ACTION,
+        PROVIDER_GPU_TYPES_LIST_ACTION,
+    };
+
+    fn signed_token(
+        action: &str,
+        subject: Uuid,
+        user_id: Option<Uuid>,
+    ) -> Result<(ProviderAuthenticator, String), Box<dyn std::error::Error>> {
+        // Test-only Ed25519 keypair.
+        let private_key = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEICKoEEWPLg2OazcyTWzBEw/mMPPXatNOUcEUWDHo2y0Y\n-----END PRIVATE KEY-----\n";
+        let public_key = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAcBpAFx4KtN1FYwvSN0XJMWSGiAJPjzetPXEiuMX2azg=\n-----END PUBLIC KEY-----\n";
+        let now = Utc::now().timestamp();
+        let claims = ProviderClaims {
+            issuer: "test".into(),
+            audience: "flash".into(),
+            subject,
+            user_id,
+            organization_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            service_instance_id: Uuid::nil(),
+            action: action.into(),
+            generation: 1,
+            jwt_id: Uuid::now_v7(),
+            issued_at: now,
+            not_before: now - NOT_BEFORE_OFFSET_SECONDS,
+            expires_at: now + MAX_TOKEN_TTL_SECONDS,
+        };
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some("gpu-management-test".into());
+        let token = encode(&header, &claims, &EncodingKey::from_ed_pem(private_key)?)?;
+        let authenticator = ProviderAuthenticator::from_public_keys_json(
+            "test",
+            "flash",
+            &serde_json::json!({"gpu-management-test": public_key}).to_string(),
+        )?;
+        Ok((authenticator, token))
+    }
+
+    #[test]
+    fn gpu_management_tokens_are_signed_and_action_scoped() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for action in [
+            PROVIDER_GPU_CATALOG_LIST_ACTION,
+            PROVIDER_GPU_ACCESS_UPDATE_ACTION,
+        ] {
+            let (authenticator, token) = signed_token(action, Uuid::nil(), None)?;
+            let claims = authenticator.verify(&token, action)?;
+            assert_eq!(claims.subject, Uuid::nil());
+            let other = if action == PROVIDER_GPU_CATALOG_LIST_ACTION {
+                PROVIDER_GPU_ACCESS_UPDATE_ACTION
+            } else {
+                PROVIDER_GPU_CATALOG_LIST_ACTION
+            };
+            assert_eq!(
+                authenticator.verify(&token, other),
+                Err(AuthError::InvalidCommand)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn signed_gpu_catalog_keeps_principal_and_owner_user_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let principal = Uuid::from_u128(1);
+        let user = Uuid::parse_str("01a05ad9-b529-7573-8d7b-0123456789ab")?;
+        let (authenticator, token) =
+            signed_token(PROVIDER_GPU_TYPES_LIST_ACTION, principal, Some(user))?;
+        let claims = authenticator.verify(&token, PROVIDER_GPU_TYPES_LIST_ACTION)?;
+        assert_eq!(claims.subject, principal);
+        assert_eq!(claims.user_id, Some(user));
+        assert_ne!(claims.subject, claims.user_id.ok_or("user_id")?);
+        Ok(())
+    }
 }

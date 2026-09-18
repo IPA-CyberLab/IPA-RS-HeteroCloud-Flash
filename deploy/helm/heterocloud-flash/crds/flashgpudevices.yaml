@@ -1,0 +1,129 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: flashgpudevices.flash.heterocloud.io
+spec:
+  group: flash.heterocloud.io
+  names:
+    categories: []
+    kind: FlashGpuDevice
+    plural: flashgpudevices
+    shortNames:
+    - flashgpu
+    singular: flashgpudevice
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FlashGpuDeviceSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              gpu_type:
+                description: Stable, user-selectable type used by the node label and catalog.
+                maxLength: 63
+                minLength: 1
+                type: string
+              memory_mib:
+                format: uint64
+                minimum: 1.0
+                type: integer
+              model:
+                description: Human-readable model name.
+                maxLength: 256
+                minLength: 1
+                type: string
+              node_name:
+                description: Kubernetes node that advertises this physical device.
+                maxLength: 253
+                minLength: 1
+                type: string
+              physical_id:
+                description: Provider-only stable identifier, normally the NVIDIA GPU UUID.
+                maxLength: 128
+                minLength: 1
+                type: string
+              private_assignments:
+                default: []
+                description: HeteroCloud UserId UUIDs allowed to see and consume a private GPU.
+                items:
+                  type: string
+                type: array
+              visibility:
+                default: open
+                enum:
+                - open
+                - private
+                type: string
+            required:
+            - gpu_type
+            - memory_mib
+            - model
+            - node_name
+            - physical_id
+            type: object
+            x-kubernetes-validations:
+            - message: private assignments must be lowercase UUIDs
+              rule: self.private_assignments.all(subject, subject.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
+            - message: gpu_type must be a canonical lowercase DNS label
+              rule: self.gpu_type.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')
+            - message: node_name must be a lowercase Kubernetes node name
+              rule: self.node_name.matches('^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$')
+            - message: physical_id contains unsupported characters
+              rule: self.physical_id.matches('^[A-Za-z0-9._:-]+$')
+          status:
+            nullable: true
+            properties:
+              health:
+                default: unknown
+                enum:
+                - unknown
+                - healthy
+                - unhealthy
+                type: string
+              last_allocated_at:
+                format: int64
+                nullable: true
+                type: integer
+              last_organization_id:
+                nullable: true
+                type: string
+              last_subject_id:
+                nullable: true
+                type: string
+              reservation:
+                nullable: true
+                properties:
+                  job_name:
+                    type: string
+                  job_namespace:
+                    type: string
+                  lease_expires_at:
+                    format: int64
+                    type: integer
+                  reserved_at:
+                    format: int64
+                    type: integer
+                  service_instance_id:
+                    type: string
+                  subject_id:
+                    type: string
+                required:
+                - job_name
+                - job_namespace
+                - lease_expires_at
+                - reserved_at
+                - service_instance_id
+                - subject_id
+                type: object
+            type: object
+        required:
+        - spec
+        title: FlashGpuDevice
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

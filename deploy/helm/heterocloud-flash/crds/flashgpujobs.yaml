@@ -1,0 +1,125 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: flashgpujobs.flash.heterocloud.io
+spec:
+  group: flash.heterocloud.io
+  names:
+    categories: []
+    kind: FlashGpuJob
+    plural: flashgpujobs
+    shortNames:
+    - flashgpujob
+    singular: flashgpujob
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FlashGpuJobSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              count:
+                format: uint32
+                maximum: 1.0
+                minimum: 1.0
+                type: integer
+              gpu_type:
+                description: |-
+                  None is accepted only for legacy `gpu_count=1` services and means any
+                  visible type. New requests always provide a type.
+                nullable: true
+                type: string
+              organization_id:
+                type: string
+              project_id:
+                type: string
+              queued_at:
+                format: int64
+                type: integer
+              quota_remaining_seconds:
+                description: Remaining organization quota captured when the request is queued.
+                format: uint64
+                minimum: 0.0
+                type: integer
+              service_generation:
+                format: int64
+                type: integer
+              service_instance_id:
+                type: string
+              subject_id:
+                type: string
+            required:
+            - count
+            - organization_id
+            - project_id
+            - queued_at
+            - quota_remaining_seconds
+            - service_generation
+            - service_instance_id
+            - subject_id
+            type: object
+            x-kubernetes-validations:
+            - message: a Flash VM may request exactly one GPU
+              rule: self.count == 1
+            - message: gpu_type must be a canonical lowercase DNS label
+              rule: '!has(self.gpu_type) || self.gpu_type.matches(''^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$'')'
+          status:
+            nullable: true
+            properties:
+              assignment:
+                nullable: true
+                properties:
+                  gpu_type:
+                    type: string
+                  inventory_name:
+                    description: Internal inventory identity. It is never returned by the user catalog.
+                    type: string
+                  lease_expires_at:
+                    format: int64
+                    type: integer
+                  model:
+                    type: string
+                  node_name:
+                    type: string
+                required:
+                - gpu_type
+                - inventory_name
+                - lease_expires_at
+                - model
+                - node_name
+                type: object
+              attempts:
+                default: 0
+                format: uint32
+                minimum: 0.0
+                type: integer
+              message:
+                nullable: true
+                type: string
+              phase:
+                default: queued
+                enum:
+                - queued
+                - reserved
+                - running
+                - retry
+                - cancelled
+                - released
+                - rejected
+                type: string
+              updated_at:
+                default: 0
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        title: FlashGpuJob
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

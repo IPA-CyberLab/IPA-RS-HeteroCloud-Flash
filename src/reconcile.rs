@@ -35,9 +35,12 @@ use uuid::Uuid;
 use crate::{
     GPU_READY_LABEL, GPU_RESOURCE_NAME, LOAD_BALANCER_CLASS, TRAFFIC_MODE_ANNOTATION,
     crd::{
-        FlashEndpoint, FlashGpuWeeklyUsage, FlashService, FlashServicePhase, FlashServiceStatus,
+        FlashEndpoint, FlashGpuAssignment, FlashGpuJob, FlashGpuJobPhase, FlashGpuJobSpec,
+        FlashGpuSchedulingStatus, FlashGpuWeeklyUsage, FlashService, FlashServicePhase,
+        FlashServiceStatus,
     },
     domain::{EndpointMode, ExposureType, TrafficMode, ValidationError},
+    gpu_scheduler::run_gpu_scheduler,
     image::{GIB_BYTES, ImageInspection, ImageInspector},
     web::{
         GATEWAY_NAME, GATEWAY_NAMESPACE, GATEWAY_SECTION, HTTPRoute, PROXY_NAMESPACE,
@@ -196,6 +199,7 @@ pub async fn run_controller(
 ) -> Result<()> {
     let namespace = config.namespace.clone();
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
+    let gpu_jobs = Api::<FlashGpuJob>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
     let network_services = Api::<Service>::namespaced(client.clone(), &namespace);
     let network_policies = Api::<NetworkPolicy>::namespaced(client.clone(), &namespace);
@@ -207,26 +211,36 @@ pub async fn run_controller(
     let context = Arc::new(ControllerContext::new(client, image_inspector, config));
 
     info!("FlashService controller started");
-    Controller::new(services, watcher::Config::default())
-        .owns(deployments, watcher::Config::default())
-        .owns(autoscalers, watcher::Config::default())
-        .owns(http_routes, watcher::Config::default())
-        .owns(network_services, watcher::Config::default())
-        .owns(network_policies, watcher::Config::default())
-        .owns(persistent_volume_claims, watcher::Config::default())
-        .watches(pods, watcher::Config::default(), flash_service_for_pod)
-        .run(reconcile, error_policy, context)
-        .for_each(|result| async move {
-            match result {
-                Ok((object, _action)) => info!(
-                    name = %object.name,
-                    namespace = %object.namespace.as_deref().unwrap_or(""),
-                    "FlashService reconciled"
-                ),
-                Err(error) => error!(error = %error, "FlashService reconciliation failed"),
-            }
-        })
-        .await;
+    let scheduler_client = context.client.clone();
+    let scheduler_namespace = namespace.clone();
+    let service_controller = async move {
+        Controller::new(services, watcher::Config::default())
+            .owns(deployments, watcher::Config::default())
+            .owns(autoscalers, watcher::Config::default())
+            .owns(http_routes, watcher::Config::default())
+            .owns(network_services, watcher::Config::default())
+            .owns(network_policies, watcher::Config::default())
+            .owns(persistent_volume_claims, watcher::Config::default())
+            .owns(gpu_jobs, watcher::Config::default())
+            .watches(pods, watcher::Config::default(), flash_service_for_pod)
+            .run(reconcile, error_policy, context)
+            .for_each(|result| async move {
+                match result {
+                    Ok((object, _action)) => info!(
+                        name = %object.name,
+                        namespace = %object.namespace.as_deref().unwrap_or(""),
+                        "FlashService reconciled"
+                    ),
+                    Err(error) => error!(error = %error, "FlashService reconciliation failed"),
+                }
+            })
+            .await;
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::try_join!(
+        service_controller,
+        run_gpu_scheduler(scheduler_client, scheduler_namespace)
+    )?;
     Ok(())
 }
 
@@ -234,6 +248,7 @@ pub async fn run_controller(
 struct GpuMeter {
     usage: Option<FlashGpuWeeklyUsage>,
     exhausted: bool,
+    remaining_seconds: u64,
 }
 
 fn utc_week_start(timestamp: i64) -> i64 {
@@ -248,7 +263,7 @@ async fn meter_gpu_usage(
     flash: &FlashService,
     now: i64,
 ) -> Result<GpuMeter, ReconcileError> {
-    if flash.spec.workload.gpu_count == 0 {
+    if flash.spec.workload.effective_gpu_count() == 0 {
         return Ok(GpuMeter::default());
     }
     let week_started_at = utc_week_start(now);
@@ -269,14 +284,14 @@ async fn meter_gpu_usage(
     used_seconds = used_seconds.saturating_add(
         elapsed
             .saturating_mul(ready_replicas)
-            .saturating_mul(u64::from(flash.spec.workload.gpu_count)),
+            .saturating_mul(u64::from(flash.spec.workload.effective_gpu_count())),
     );
 
     let mut organization_total = used_seconds;
     for peer in services.list(&ListParams::default()).await?.items {
         if peer.name_any() == flash.name_any()
             || peer.spec.organization_id != flash.spec.organization_id
-            || peer.spec.workload.gpu_count == 0
+            || peer.spec.workload.effective_gpu_count() == 0
         {
             continue;
         }
@@ -298,6 +313,98 @@ async fn meter_gpu_usage(
             limit_seconds,
         }),
         exhausted: organization_total >= limit_seconds,
+        remaining_seconds: limit_seconds.saturating_sub(organization_total),
+    })
+}
+
+struct GpuJobState {
+    phase: FlashGpuJobPhase,
+    assignment: Option<FlashGpuAssignment>,
+}
+
+async fn reconcile_gpu_job(
+    client: &Client,
+    namespace: &str,
+    flash: &FlashService,
+    owner: &OwnerReference,
+    now: i64,
+    quota_remaining_seconds: u64,
+    suspended: bool,
+) -> Result<Option<GpuJobState>, ReconcileError> {
+    let jobs = Api::<FlashGpuJob>::namespaced(client.clone(), namespace);
+    let name = flash.name_any();
+    if flash.spec.workload.effective_gpu_count() == 0 || suspended {
+        match jobs.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(response)) if response.code == 404 => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(None);
+    }
+    let existing = jobs.get_opt(&name).await?;
+    let unchanged_request = existing.as_ref().is_some_and(|job| {
+        job.spec.service_generation == flash.spec.desired_generation
+            && job.spec.gpu_type == flash.spec.workload.gpu_type
+            && job.spec.subject_id == flash.spec.subject_id.as_deref().unwrap_or_default()
+    });
+    let queued_at = existing
+        .as_ref()
+        .filter(|_| unchanged_request)
+        .map_or(now, |job| job.spec.queued_at);
+    let mut desired = FlashGpuJob::new(
+        &name,
+        FlashGpuJobSpec {
+            service_instance_id: flash.spec.service_instance_id.clone(),
+            service_generation: flash.spec.desired_generation,
+            subject_id: flash.spec.subject_id.clone().unwrap_or_default(),
+            organization_id: flash.spec.organization_id.clone(),
+            project_id: flash.spec.project_id.clone(),
+            gpu_type: flash.spec.workload.gpu_type.clone(),
+            count: 1,
+            quota_remaining_seconds,
+            queued_at,
+        },
+    );
+    desired.metadata.owner_references = Some(vec![owner.clone()]);
+    let applied = jobs
+        .patch(
+            &name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&desired),
+        )
+        .await?;
+    // A server-side apply keeps the old status when a generation, GPU type,
+    // or owner changes. Do not let that stale assignment reach a Deployment;
+    // the scheduler must validate it against the new request first.
+    Ok(Some(gpu_job_state(&applied, unchanged_request)))
+}
+
+fn gpu_job_state(job: &FlashGpuJob, status_is_current: bool) -> GpuJobState {
+    let status = status_is_current.then_some(job.status.as_ref()).flatten();
+    GpuJobState {
+        phase: status.map_or(FlashGpuJobPhase::Queued, |status| status.phase),
+        assignment: status.and_then(|status| {
+            matches!(
+                status.phase,
+                FlashGpuJobPhase::Reserved | FlashGpuJobPhase::Running
+            )
+            .then(|| status.assignment.clone())
+            .flatten()
+        }),
+    }
+}
+
+fn gpu_scheduling_status(
+    flash: &FlashService,
+    state: Option<&GpuJobState>,
+) -> Option<FlashGpuSchedulingStatus> {
+    state.map(|state| FlashGpuSchedulingStatus {
+        phase: state.phase,
+        gpu_type: flash.spec.workload.gpu_type.clone(),
+        display_name: state
+            .assignment
+            .as_ref()
+            .map(|assignment| assignment.model.clone()),
     })
 }
 
@@ -361,7 +468,7 @@ async fn reconcile(
     context: Arc<ControllerContext>,
 ) -> Result<Action, ReconcileError> {
     let name = flash.name_any();
-    let runtime_class = workload_runtime_class(flash.spec.workload.gpu_count);
+    let runtime_class = workload_runtime_class(flash.spec.workload.effective_gpu_count());
     let services = Api::<FlashService>::namespaced(context.client.clone(), &context.namespace);
 
     if let Err(error) = flash
@@ -371,6 +478,16 @@ async fn reconcile(
         .map_err(ReconcileError::from)
         .and_then(|()| public_hostname(&flash, context.public_domain.as_deref()).map(|_| ()))
     {
+        if flash.spec.workload.effective_gpu_count() > 0 {
+            suspend_deployment(&context.client, &context.namespace, &name).await?;
+            let gpu_jobs =
+                Api::<FlashGpuJob>::namespaced(context.client.clone(), &context.namespace);
+            match gpu_jobs.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => {}
+                Err(kube::Error::Api(response)) if response.code == 404 => {}
+                Err(delete_error) => return Err(delete_error.into()),
+            }
+        }
         patch_status_if_changed(
             &services,
             &flash,
@@ -391,9 +508,44 @@ async fn reconcile(
     let gpu_meter = meter_gpu_usage(&services, &flash, now).await?;
     let cold = should_scale_to_zero(&flash, now);
     let suspended = cold || gpu_meter.exhausted;
+    let owner = flash
+        .controller_owner_ref(&())
+        .ok_or(ReconcileError::MissingOwnerReference)?;
+    let gpu_job_state = reconcile_gpu_job(
+        &context.client,
+        &context.namespace,
+        &flash,
+        &owner,
+        now,
+        gpu_meter.remaining_seconds,
+        suspended,
+    )
+    .await?;
+    let gpu_assignment = gpu_job_state
+        .as_ref()
+        .and_then(|state| state.assignment.as_ref());
 
     let desired_replicas = i32::try_from(flash.spec.workload.replicas)
         .map_err(|_| ReconcileError::InvalidReplicaCount)?;
+    if flash.spec.workload.effective_gpu_count() > 0 && !suspended && gpu_assignment.is_none() {
+        suspend_deployment(&context.client, &context.namespace, &name).await?;
+        patch_status_if_changed(
+            &services,
+            &flash,
+            FlashServiceStatus {
+                phase: FlashServicePhase::Provisioning,
+                observed_generation: flash.spec.desired_generation,
+                desired_replicas,
+                runtime_class: runtime_class.into(),
+                gpu_weekly_usage: gpu_meter.usage,
+                gpu_scheduling: gpu_scheduling_status(&flash, gpu_job_state.as_ref()),
+                message: Some("queued for a visible healthy GPU of the requested type".into()),
+                ..FlashServiceStatus::default()
+            },
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    }
     let disk_budget_bytes = u64::from(flash.spec.workload.ephemeral_storage_gib)
         .checked_mul(GIB_BYTES)
         .ok_or(ReconcileError::StorageBudgetOverflow)?;
@@ -463,9 +615,6 @@ async fn reconcile(
         }
     };
 
-    let owner = flash
-        .controller_owner_ref(&())
-        .ok_or(ReconcileError::MissingOwnerReference)?;
     let storage = storage_allocation(
         inspection.writable_storage_bytes,
         context.persistent_storage_class.is_some(),
@@ -482,15 +631,18 @@ async fn reconcile(
         &owner,
         &inspection.resolved_image,
         storage.rootfs_bytes,
-        persistent_volume_claim
-            .as_ref()
-            .and_then(|claim| claim.metadata.name.as_deref()),
-        context.registry_pull_secret.as_deref(),
-        context
-            .admin_volume_mounts
-            .get(&flash.spec.service_instance_id)
-            .map(Vec::as_slice)
-            .unwrap_or_default(),
+        DeploymentOptions {
+            persistent_volume_claim: persistent_volume_claim
+                .as_ref()
+                .and_then(|claim| claim.metadata.name.as_deref()),
+            registry_pull_secret: context.registry_pull_secret.as_deref(),
+            admin_volume_mounts: context
+                .admin_volume_mounts
+                .get(&flash.spec.service_instance_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            gpu_assignment,
+        },
     )?;
     let hostname = public_hostname(&flash, context.public_domain.as_deref())?;
     let desired_network_service =
@@ -614,6 +766,7 @@ async fn reconcile(
         gpu_weekly_usage: gpu_meter.usage,
         gpu_quota_exhausted: gpu_meter.exhausted,
         cold,
+        gpu_scheduling: gpu_scheduling_status(&flash, gpu_job_state.as_ref()),
         ..FlashServiceStatus::default()
     };
     let action = update_workload_status(
@@ -652,7 +805,7 @@ async fn reconcile(
         mark_activity(&services, &flash, now).await?;
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
-    if flash.spec.workload.gpu_count > 0 || is_scale_to_zero(&flash) {
+    if flash.spec.workload.effective_gpu_count() > 0 || is_scale_to_zero(&flash) {
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
     Ok(action)
@@ -716,6 +869,7 @@ fn status_patch(flash: &FlashService, status: &FlashServiceStatus) -> Value {
     patch["status"]["image_size_bytes"] = json!(status.image_size_bytes);
     patch["status"]["writable_storage_bytes"] = json!(status.writable_storage_bytes);
     patch["status"]["gpu_weekly_usage"] = json!(status.gpu_weekly_usage);
+    patch["status"]["gpu_scheduling"] = json!(status.gpu_scheduling);
     if let Some(version) = &flash.metadata.resource_version {
         patch["metadata"] = json!({"resourceVersion": version});
     }
@@ -739,14 +893,20 @@ async fn patch_status_if_changed(
     Ok(())
 }
 
+#[derive(Default)]
+struct DeploymentOptions<'a> {
+    persistent_volume_claim: Option<&'a str>,
+    registry_pull_secret: Option<&'a str>,
+    admin_volume_mounts: &'a [AdminVolumeMount],
+    gpu_assignment: Option<&'a FlashGpuAssignment>,
+}
+
 fn desired_deployment(
     flash: &FlashService,
     owner: &OwnerReference,
     resolved_image: &str,
     rootfs_storage_bytes: u64,
-    persistent_volume_claim: Option<&str>,
-    registry_pull_secret: Option<&str>,
-    admin_volume_mounts: &[AdminVolumeMount],
+    options: DeploymentOptions<'_>,
 ) -> Result<Deployment, ReconcileError> {
     let name = flash.name_any();
     let workload = &flash.spec.workload;
@@ -805,8 +965,8 @@ fn desired_deployment(
             "capabilities": {"drop": ["NET_RAW"]},
         }
     });
-    if workload.gpu_count > 0 {
-        let count = workload.gpu_count.to_string();
+    if workload.effective_gpu_count() > 0 {
+        let count = workload.effective_gpu_count().to_string();
         container["resources"]["requests"][GPU_RESOURCE_NAME] = json!(count);
         container["resources"]["limits"][GPU_RESOURCE_NAME] = json!(count);
     }
@@ -817,13 +977,13 @@ fn desired_deployment(
         container["args"] = json!(workload.args);
     }
     let mut volume_mounts = Vec::new();
-    if persistent_volume_claim.is_some() {
+    if options.persistent_volume_claim.is_some() {
         volume_mounts.push(json!({
             "name": PERSISTENT_HOME_VOLUME,
             "mountPath": PERSISTENT_HOME_MOUNT_PATH,
         }));
     }
-    volume_mounts.extend(admin_volume_mounts.iter().map(|mount| {
+    volume_mounts.extend(options.admin_volume_mounts.iter().map(|mount| {
         json!({
             "name": mount.name,
             "mountPath": mount.mount_path,
@@ -834,7 +994,7 @@ fn desired_deployment(
         container["volumeMounts"] = Value::Array(volume_mounts);
     }
     let mut pod_spec = json!({
-        "runtimeClassName": workload_runtime_class(workload.gpu_count),
+        "runtimeClassName": workload_runtime_class(workload.effective_gpu_count()),
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
         "terminationGracePeriodSeconds": 30,
@@ -852,20 +1012,32 @@ fn desired_deployment(
         }],
         "containers": [container]
     });
-    if workload.gpu_count > 0 {
+    if workload.effective_gpu_count() > 0 {
         pod_spec["nodeSelector"] = json!({(GPU_READY_LABEL): "true"});
+        if let Some(assignment) = options.gpu_assignment {
+            pod_spec["affinity"] = json!({
+                "nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [{"matchExpressions": [
+                            {"key": "kubernetes.io/hostname", "operator": "In", "values": [assignment.node_name]},
+                            {"key": crate::GPU_TYPE_LABEL, "operator": "In", "values": [assignment.gpu_type]}
+                        ]}]
+                    }
+                }
+            });
+        }
     }
-    if let Some(secret) = registry_pull_secret {
+    if let Some(secret) = options.registry_pull_secret {
         pod_spec["imagePullSecrets"] = json!([{"name": secret}]);
     }
     let mut volumes = Vec::new();
-    if let Some(claim_name) = persistent_volume_claim {
+    if let Some(claim_name) = options.persistent_volume_claim {
         volumes.push(json!({
             "name": PERSISTENT_HOME_VOLUME,
             "persistentVolumeClaim": {"claimName": claim_name},
         }));
     }
-    volumes.extend(admin_volume_mounts.iter().map(|mount| {
+    volumes.extend(options.admin_volume_mounts.iter().map(|mount| {
         json!({
             "name": mount.name,
             "persistentVolumeClaim": {"claimName": mount.claim_name},
@@ -874,7 +1046,7 @@ fn desired_deployment(
     if !volumes.is_empty() {
         pod_spec["volumes"] = Value::Array(volumes);
     }
-    let strategy = if workload.gpu_count > 0 {
+    let strategy = if workload.effective_gpu_count() > 0 {
         json!({
             "type": "RollingUpdate",
             "rollingUpdate": {"maxUnavailable": 1, "maxSurge": 0}
@@ -1954,15 +2126,18 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AdminVolumeMount, desired_deployment, desired_network_policy,
+        AdminVolumeMount, DeploymentOptions, desired_deployment, desired_network_policy,
         desired_network_policy_with_networks, desired_persistent_volume_claim, desired_service,
-        storage_allocation, update_workload_status, validate_admin_volume_mounts,
-        workload_failure_message, workload_restart_message,
+        gpu_job_state, status_patch, storage_allocation, update_workload_status,
+        validate_admin_volume_mounts, workload_failure_message, workload_restart_message,
     };
     use crate::{
         GPU_READY_LABEL, GPU_RESOURCE_NAME, GPU_RUNTIME_CLASS_NAME, LOAD_BALANCER_CLASS,
         RUNTIME_CLASS_NAME,
-        crd::{FlashService, FlashServicePhase, FlashServiceSpec, FlashServiceStatus},
+        crd::{
+            FlashGpuAssignment, FlashGpuJob, FlashGpuJobPhase, FlashGpuJobSpec, FlashGpuJobStatus,
+            FlashService, FlashServicePhase, FlashServiceSpec, FlashServiceStatus,
+        },
         domain::{
             ExposureType, FlashEgress, FlashExposure, FlashPort, FlashSpec, TrafficMode,
             TransportProtocol,
@@ -2089,6 +2264,7 @@ mod tests {
                 organization_id: "00000000-0000-0000-0000-000000000002".into(),
                 project_id: "00000000-0000-0000-0000-000000000003".into(),
                 service_instance_id: "00000000-0000-0000-0000-000000000001".into(),
+                subject_id: Some("00000000-0000-0000-0000-000000000004".into()),
                 policy: crate::crd::FlashServicePolicy::default(),
                 workload: FlashSpec {
                     region: "heteronet-global".into(),
@@ -2097,6 +2273,7 @@ mod tests {
                     autoscaling: None,
                     cpu_millis: 250,
                     memory_mib: 128,
+                    gpu_type: None,
                     gpu_count: 0,
                     ephemeral_storage_gib: 10,
                     ports: vec![FlashPort {
@@ -2122,6 +2299,50 @@ mod tests {
         )
     }
 
+    #[test]
+    fn service_status_patch_clears_gpu_scheduling() {
+        let flash = service(TrafficMode::Forwarded);
+        let patch = status_patch(&flash, &FlashServiceStatus::default());
+        assert_eq!(patch["status"]["gpu_scheduling"], Value::Null);
+    }
+
+    #[test]
+    fn changed_gpu_request_does_not_reuse_stale_status_assignment() {
+        let assignment = FlashGpuAssignment {
+            inventory_name: "gpu-old".into(),
+            node_name: "node-old".into(),
+            gpu_type: "old-type".into(),
+            model: "Old GPU".into(),
+            lease_expires_at: 200,
+        };
+        let mut job = FlashGpuJob::new(
+            "flash-job",
+            FlashGpuJobSpec {
+                service_instance_id: "service".into(),
+                service_generation: 2,
+                subject_id: "user".into(),
+                organization_id: "organization".into(),
+                project_id: "project".into(),
+                gpu_type: Some("new-type".into()),
+                count: 1,
+                quota_remaining_seconds: 100,
+                queued_at: 10,
+            },
+        );
+        job.status = Some(FlashGpuJobStatus {
+            phase: FlashGpuJobPhase::Running,
+            assignment: Some(assignment.clone()),
+            ..FlashGpuJobStatus::default()
+        });
+
+        let stale = gpu_job_state(&job, false);
+        assert_eq!(stale.phase, FlashGpuJobPhase::Queued);
+        assert_eq!(stale.assignment, None);
+        let current = gpu_job_state(&job, true);
+        assert_eq!(current.phase, FlashGpuJobPhase::Running);
+        assert_eq!(current.assignment, Some(assignment));
+    }
+
     fn owner() -> OwnerReference {
         OwnerReference {
             api_version: "flash.heterocloud.io/v1alpha1".into(),
@@ -2145,9 +2366,10 @@ mod tests {
             &owner(),
             "example.invalid/udp@sha256:verified",
             10 * 1024 * 1024 * 1024 - 600,
-            None,
-            Some("heterocloud-registry-pull"),
-            &[],
+            DeploymentOptions {
+                registry_pull_secret: Some("heterocloud-registry-pull"),
+                ..DeploymentOptions::default()
+            },
         )?)?;
         assert_eq!(
             value.pointer("/spec/template/spec/runtimeClassName"),
@@ -2232,15 +2454,23 @@ mod tests {
     fn gpu_workload_requests_one_exclusive_gpu_on_a_ready_node()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut flash = service(TrafficMode::Forwarded);
-        flash.spec.workload.gpu_count = 1;
+        flash.spec.workload.replicas = 1;
+        flash.spec.workload.gpu_type = Some("nvidia-geforce-gtx-1080-ti".into());
         let value = serde_json::to_value(desired_deployment(
             &flash,
             &owner(),
             "example.invalid/cuda@sha256:verified",
             1024,
-            None,
-            None,
-            &[],
+            DeploymentOptions {
+                gpu_assignment: Some(&FlashGpuAssignment {
+                    inventory_name: "gpu-internal".into(),
+                    node_name: "uc-k8sp5".into(),
+                    gpu_type: "nvidia-geforce-gtx-1080-ti".into(),
+                    model: "NVIDIA GeForce GTX 1080 Ti".into(),
+                    lease_expires_at: 100,
+                }),
+                ..DeploymentOptions::default()
+            },
         )?)?;
 
         assert_eq!(
@@ -2253,6 +2483,14 @@ mod tests {
                 GPU_READY_LABEL.replace('/', "~1")
             )),
             Some(&json!("true"))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values/0"),
+            Some(&json!("uc-k8sp5"))
+        );
+        assert_eq!(
+            value.pointer("/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/1/values/0"),
+            Some(&json!("nvidia-geforce-gtx-1080-ti"))
         );
         for kind in ["requests", "limits"] {
             assert_eq!(
@@ -2289,9 +2527,7 @@ mod tests {
             &owner(),
             "example.invalid/udp@sha256:verified",
             1024,
-            None,
-            None,
-            &[],
+            DeploymentOptions::default(),
         )?)?;
         let service = serde_json::to_value(exposed_service(&flash)?)?;
 
@@ -2347,9 +2583,10 @@ mod tests {
             &owner(),
             "example.invalid/udp@sha256:verified",
             allocation.rootfs_bytes,
-            Some("flash-test-home"),
-            None,
-            &[],
+            DeploymentOptions {
+                persistent_volume_claim: Some("flash-test-home"),
+                ..DeploymentOptions::default()
+            },
         )?)?;
         assert_eq!(
             deployment.pointer("/spec/template/spec/containers/0/volumeMounts/0/mountPath"),
@@ -2577,9 +2814,11 @@ mod tests {
             &owner(),
             "example.invalid/udp@sha256:verified",
             1024,
-            Some("flash-test-home"),
-            None,
-            &[mount],
+            DeploymentOptions {
+                persistent_volume_claim: Some("flash-test-home"),
+                admin_volume_mounts: &[mount],
+                ..DeploymentOptions::default()
+            },
         )?)?;
         assert_eq!(
             deployment.pointer("/spec/template/spec/containers/0/volumeMounts/1"),
@@ -2862,9 +3101,7 @@ mod tests {
             &owner(),
             "example.invalid/test@sha256:verified",
             1024,
-            None,
-            None,
-            &[],
+            DeploymentOptions::default(),
         )?;
         let mut live = serde_json::to_value(&deployment)?;
         live["metadata"]["resourceVersion"] = json!("1");
@@ -3150,9 +3387,7 @@ mod tests {
                 &owner(),
                 "example.invalid/test@sha256:verified",
                 1024,
-                None,
-                None,
-                &[],
+                DeploymentOptions::default(),
             )
         };
         let mut current = build(&flash)?;
@@ -3331,9 +3566,7 @@ mod tests {
             &owner(),
             "example.invalid/udp@sha256:verified",
             1024,
-            None,
-            None,
-            &[],
+            DeploymentOptions::default(),
         )?)?;
         assert_eq!(
             deployment.pointer("/spec/template/spec/containers/0/ports"),

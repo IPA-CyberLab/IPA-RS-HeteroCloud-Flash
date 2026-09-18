@@ -13,14 +13,17 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use heterocloud_flash::{
-    PROVIDER_DELETE_ACTION, PROVIDER_EXEC_ACTION, PROVIDER_LIST_CONTAINERS_ACTION,
-    PROVIDER_RECONCILE_ACTION, PROVIDER_STATUS_GET_ACTION, RUNTIME_CLASS_NAME,
+    PROVIDER_DELETE_ACTION, PROVIDER_EXEC_ACTION, PROVIDER_GPU_ACCESS_UPDATE_ACTION,
+    PROVIDER_GPU_CATALOG_LIST_ACTION, PROVIDER_GPU_TYPES_LIST_ACTION,
+    PROVIDER_LIST_CONTAINERS_ACTION, PROVIDER_RECONCILE_ACTION, PROVIDER_STATUS_GET_ACTION,
+    RUNTIME_CLASS_NAME,
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
     crd::{
-        FlashService, FlashServicePhase, FlashServicePolicy, FlashServiceSpec, FlashServiceStatus,
-        MAX_WEEKLY_GPU_SECONDS,
+        FlashGpuDevice, FlashGpuVisibility, FlashService, FlashServicePhase, FlashServicePolicy,
+        FlashServiceSpec, FlashServiceStatus, MAX_WEEKLY_GPU_SECONDS,
     },
     domain::FlashSpec,
+    gpu_scheduler::{gpu_device_available, validate_gpu_inventory_models, visible_gpu_catalog},
     workload_runtime_class,
 };
 use k8s_openapi::api::core::v1::Pod;
@@ -41,6 +44,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const FIELD_MANAGER: &str = "heterocloud-flash-provider";
+const GPU_ACCESS_FIELD_MANAGER: &str = "heterocloud-owner-api";
 const MAX_EXEC_SESSION_SECONDS: u64 = 1_800;
 const MAX_EXEC_MESSAGE_BYTES: usize = 64 * 1024;
 const EXEC_SHUTDOWN_GRACE_SECONDS: u64 = 2;
@@ -49,6 +53,7 @@ const EXEC_SHELL_SCRIPT: &str = "export TERM=xterm-256color COLORTERM=truecolor 
 #[derive(Clone)]
 struct AppState {
     services: Api<FlashService>,
+    gpu_devices: Api<FlashGpuDevice>,
     pods: Api<Pod>,
     authenticator: ProviderAuthenticator,
     exec_sessions: Arc<Semaphore>,
@@ -91,6 +96,7 @@ async fn run() -> Result<()> {
         .clamp(1, 256);
     let state = Arc::new(AppState {
         services: Api::namespaced(client.clone(), &namespace),
+        gpu_devices: Api::all(client.clone()),
         pods: Api::namespaced(client, &namespace),
         authenticator,
         exec_sessions: Arc::new(Semaphore::new(max_exec_sessions)),
@@ -110,6 +116,9 @@ fn app_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
+        .route("/internal/v1/gpu-types", get(list_gpu_types))
+        .route("/internal/v1/gpus", get(list_gpu_inventory))
+        .route("/internal/v1/gpus/access", put(update_gpu_access))
         .route(
             "/internal/v1/service-instances/{service_instance_id}",
             put(reconcile).delete(remove).get(get_status),
@@ -123,6 +132,151 @@ fn app_router(state: Arc<AppState>) -> Router {
             get(exec),
         )
         .with_state(state)
+}
+
+async fn list_gpu_types(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_GPU_TYPES_LIST_ACTION)?;
+    let devices = state.gpu_devices.list(&ListParams::default()).await?;
+    let user_id = claims
+        .user_id
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "items": visible_gpu_catalog(
+            &devices.items,
+            &user_id,
+            chrono::Utc::now().timestamp(),
+        ).map_err(|_| ApiError::Internal)?
+    })))
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GpuManagementItem {
+    management_id: String,
+    gpu_type: String,
+    display_name: String,
+    visibility: FlashGpuVisibility,
+    assigned_user_ids: Vec<Uuid>,
+    available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GpuAccessUpdateRequest {
+    management_id: String,
+    gpu_type: String,
+    display_name: String,
+    visibility: FlashGpuVisibility,
+    assigned_user_ids: Vec<Uuid>,
+}
+
+fn gpu_access_apply_patch(request: &GpuAccessUpdateRequest) -> Value {
+    json!({
+        "apiVersion": "flash.heterocloud.io/v1alpha1",
+        "kind": "FlashGpuDevice",
+        "metadata": {"name": request.management_id},
+        "spec": {
+            "visibility": request.visibility,
+            "private_assignments": request
+                .assigned_user_ids
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>(),
+        }
+    })
+}
+
+fn management_item(device: &FlashGpuDevice, now: i64) -> GpuManagementItem {
+    let mut assigned_user_ids = device
+        .spec
+        .private_assignments
+        .iter()
+        .filter_map(|value| Uuid::parse_str(value).ok())
+        .collect::<Vec<_>>();
+    assigned_user_ids.sort_unstable();
+    assigned_user_ids.dedup();
+    GpuManagementItem {
+        management_id: device.metadata.name.clone().unwrap_or_default(),
+        gpu_type: device.spec.gpu_type.clone(),
+        display_name: device.spec.model.clone(),
+        visibility: device.spec.visibility,
+        assigned_user_ids,
+        available: gpu_device_available(device, now),
+    }
+}
+
+fn validate_gpu_admin_claims(claims: &ProviderClaims) -> Result<(), ApiError> {
+    if claims.subject != Uuid::nil()
+        || claims.user_id.is_some()
+        || claims.organization_id != Uuid::nil()
+        || claims.project_id != Uuid::nil()
+        || claims.service_instance_id != Uuid::nil()
+        || claims.generation != 1
+    {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+async fn list_gpu_inventory(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_GPU_CATALOG_LIST_ACTION)?;
+    validate_gpu_admin_claims(&claims)?;
+    let now = chrono::Utc::now().timestamp();
+    let devices = state.gpu_devices.list(&ListParams::default()).await?.items;
+    validate_gpu_inventory_models(&devices).map_err(|_| ApiError::Internal)?;
+    let mut items = devices
+        .iter()
+        .map(|device| management_item(device, now))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.management_id.cmp(&right.management_id));
+    Ok(Json(json!({"items": items})))
+}
+
+async fn update_gpu_access(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(mut request): Json<GpuAccessUpdateRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_GPU_ACCESS_UPDATE_ACTION)?;
+    validate_gpu_admin_claims(&claims)?;
+    request.assigned_user_ids.sort_unstable();
+    request.assigned_user_ids.dedup();
+    let current = state
+        .gpu_devices
+        .get_opt(&request.management_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if current.spec.gpu_type != request.gpu_type || current.spec.model != request.display_name {
+        return Err(ApiError::Conflict(
+            "GPU inventory changed; refresh the catalog and retry".into(),
+        ));
+    }
+    let access_patch = gpu_access_apply_patch(&request);
+    let updated = state
+        .gpu_devices
+        .patch(
+            &request.management_id,
+            &PatchParams::apply(GPU_ACCESS_FIELD_MANAGER).force(),
+            &Patch::Apply(access_patch),
+        )
+        .await?;
+    Ok(Json(management_item(
+        &updated,
+        chrono::Utc::now().timestamp(),
+    )))
 }
 
 async fn live() -> impl IntoResponse {
@@ -144,6 +298,10 @@ struct ReconcileRequest {
     policy: FlashServicePolicy,
 }
 
+fn requester_user_id(claims: &ProviderClaims) -> Option<String> {
+    claims.user_id.map(|value| value.to_string())
+}
+
 async fn reconcile(
     State(state): State<Arc<AppState>>,
     Path(service_instance_id): Path<Uuid>,
@@ -159,7 +317,8 @@ async fn reconcile(
         .map_err(|_| ApiError::BadRequest("Flash spec is invalid".into()))?;
     spec.validate()
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    let expected_runtime_class = workload_runtime_class(spec.gpu_count);
+    let expected_runtime_class = workload_runtime_class(spec.effective_gpu_count());
+    let requester_user_id = requester_user_id(&claims);
     if request.policy.max_weekly_gpu_seconds > MAX_WEEKLY_GPU_SECONDS {
         return Err(ApiError::BadRequest(
             "weekly GPU limit exceeds the provider safety maximum".into(),
@@ -172,7 +331,9 @@ async fn reconcile(
             return Err(ApiError::Conflict("generation is stale".into()));
         }
         if existing.spec.desired_generation == request.generation
-            && (existing.spec.display_name != request.name || existing.spec.workload != spec)
+            && (existing.spec.display_name != request.name
+                || existing.spec.workload != spec
+                || existing.spec.subject_id != requester_user_id)
         {
             return Err(ApiError::Conflict(
                 "generation was already used for different desired state".into(),
@@ -188,6 +349,7 @@ async fn reconcile(
             organization_id: claims.organization_id.to_string(),
             project_id: claims.project_id.to_string(),
             service_instance_id: service_instance_id.to_string(),
+            subject_id: requester_user_id,
             policy: request.policy,
             workload: spec,
         },
@@ -714,8 +876,8 @@ mod tests {
 
     use super::{
         ApiError, EXEC_SHELL_SCRIPT, FlashService, ProviderClaims, TerminalControl,
-        container_summary, pod_belongs_to_service, pod_can_exec, validate_command,
-        validate_resource_access,
+        container_summary, pod_belongs_to_service, pod_can_exec, requester_user_id,
+        validate_command, validate_gpu_admin_claims, validate_resource_access,
     };
 
     fn access_fixture() -> Result<(ProviderClaims, FlashService), serde_json::Error> {
@@ -748,6 +910,112 @@ mod tests {
             }
         }))?;
         Ok((claims, resource))
+    }
+
+    #[test]
+    fn gpu_management_scope_requires_nil_tenant_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut claims, _) = access_fixture()?;
+        claims.subject = Uuid::nil();
+        claims.organization_id = Uuid::nil();
+        claims.project_id = Uuid::nil();
+        claims.service_instance_id = Uuid::nil();
+        claims.generation = 1;
+        assert!(validate_gpu_admin_claims(&claims).is_ok());
+        claims.subject = Uuid::from_u128(1);
+        assert!(matches!(
+            validate_gpu_admin_claims(&claims),
+            Err(ApiError::Forbidden)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_access_payload_accepts_uuid_v7_and_private_empty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let assigned = Uuid::parse_str("01a05ad9-b529-7573-8d7b-0123456789ab")?;
+        let item: super::GpuAccessUpdateRequest = serde_json::from_value(json!({
+            "management_id": "gpu-0123456789abcdef",
+            "gpu_type": "nvidia-geforce-gtx-1080-ti",
+            "display_name": "NVIDIA GeForce GTX 1080 Ti",
+            "visibility": "private",
+            "assigned_user_ids": [assigned]
+        }))?;
+        assert_eq!(item.assigned_user_ids, vec![assigned]);
+        let isolated: super::GpuAccessUpdateRequest = serde_json::from_value(json!({
+            "management_id": "gpu-fedcba9876543210",
+            "gpu_type": "nvidia-geforce-gtx-1080-ti",
+            "display_name": "NVIDIA GeForce GTX 1080 Ti",
+            "visibility": "private",
+            "assigned_user_ids": []
+        }))?;
+        assert!(isolated.assigned_user_ids.is_empty());
+        let request_with_scheduler_state =
+            serde_json::from_value::<super::GpuAccessUpdateRequest>(json!({
+                "management_id": "gpu-fedcba9876543210",
+                "gpu_type": "nvidia-geforce-gtx-1080-ti",
+                "display_name": "NVIDIA GeForce GTX 1080 Ti",
+                "visibility": "private",
+                "assigned_user_ids": [],
+                "available": true
+            }));
+        assert!(request_with_scheduler_state.is_err());
+        let patch = super::gpu_access_apply_patch(&isolated);
+        assert_eq!(super::GPU_ACCESS_FIELD_MANAGER, "heterocloud-owner-api");
+        assert_eq!(patch["spec"]["visibility"], "private");
+        assert_eq!(patch["spec"]["private_assignments"], json!([]));
+        for hardware_field in [
+            "node_name",
+            "physical_id",
+            "gpu_type",
+            "model",
+            "memory_mib",
+        ] {
+            assert!(patch["spec"].get(hardware_field).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_management_catalog_includes_dynamic_availability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut device = heterocloud_flash::crd::FlashGpuDevice::new(
+            "gpu-0123456789abcdef",
+            heterocloud_flash::crd::FlashGpuDeviceSpec {
+                node_name: "uc-k8sp5".into(),
+                physical_id: "GPU-01234567-89ab-cdef-0123-456789abcdef".into(),
+                gpu_type: "nvidia-geforce-gtx-1080-ti".into(),
+                model: "NVIDIA GeForce GTX 1080 Ti".into(),
+                memory_mib: 11_264,
+                visibility: heterocloud_flash::crd::FlashGpuVisibility::Open,
+                private_assignments: Vec::new(),
+            },
+        );
+        device.status = Some(heterocloud_flash::crd::FlashGpuDeviceStatus {
+            health: heterocloud_flash::crd::FlashGpuHealth::Healthy,
+            ..heterocloud_flash::crd::FlashGpuDeviceStatus::default()
+        });
+        let item = super::management_item(&device, 100);
+        assert!(item.available);
+        let serialized = serde_json::to_value(item)?;
+        assert_eq!(serialized["available"], true);
+        assert!(serialized.get("physical_id").is_none());
+        assert!(serialized.get("node_name").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn gpu_visibility_uses_owner_user_id_instead_of_principal_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut claims, _) = access_fixture()?;
+        let principal_id = claims.subject;
+        let owner_user_id = Uuid::parse_str("01a05ad9-b529-7573-8d7b-0123456789ab")?;
+        claims.user_id = Some(owner_user_id);
+        assert_ne!(principal_id, owner_user_id);
+        assert_eq!(requester_user_id(&claims), Some(owner_user_id.to_string()));
+        claims.user_id = None;
+        assert_eq!(requester_user_id(&claims), None);
+        Ok(())
     }
 
     async fn signed_status_request(
@@ -817,6 +1085,7 @@ mod tests {
         );
         let app = super::app_router(Arc::new(super::AppState {
             services: Api::namespaced(client.clone(), "test"),
+            gpu_devices: Api::all(client.clone()),
             pods: Api::namespaced(client, "test"),
             authenticator,
             exec_sessions: Arc::new(tokio::sync::Semaphore::new(0)),

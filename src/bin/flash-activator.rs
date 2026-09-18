@@ -126,7 +126,12 @@ async fn proxy_inner(state: &AppState, request: Request) -> Result<Response, Act
         .map(|port| port.service_port)
         .ok_or(ActivatorError::NotFound)?;
     mark_activity(&state.services, &service).await?;
-    wake(&state.deployments, &resource_name).await?;
+    // GPU cold starts must pass through the durable reservation queue before
+    // a Pod is allowed to consume device-plugin capacity. CPU services can be
+    // woken directly.
+    if workload.effective_gpu_count() == 0 {
+        wake(&state.deployments, &resource_name).await?;
+    }
     wait_until_ready(state, &resource_name, service.spec.desired_generation).await?;
 
     let (parts, body) = request.into_parts();

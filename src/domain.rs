@@ -54,6 +54,12 @@ pub struct FlashSpec {
     pub autoscaling: Option<FlashAutoscaling>,
     pub cpu_millis: u32,
     pub memory_mib: u32,
+    /// Requested GPU type. Supplying a type requests exactly one GPU; the
+    /// scheduler selects the node and physical device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_type: Option<String>,
+    /// Transitional input accepted from pre-scheduler clients. New clients
+    /// select a GPU by setting `gpu_type` and omit this field.
     #[serde(default, skip_serializing_if = "is_zero")]
     #[schemars(range(min = 0, max = 1))]
     pub gpu_count: u32,
@@ -135,6 +141,20 @@ impl FlashSpec {
                 "gpu_count must be between 0 and {MAX_GPUS_PER_VM}"
             )));
         }
+        if let Some(gpu_type) = &self.gpu_type {
+            validate_gpu_type(gpu_type)?;
+        }
+        if self.effective_gpu_count() > 0
+            && (self.replicas != 1
+                || self
+                    .autoscaling
+                    .as_ref()
+                    .is_some_and(|scaling| scaling.max_replicas != 1))
+        {
+            return Err(ValidationError::Field(
+                "GPU Flash VMs require replicas=1 and autoscaling max_replicas=1".into(),
+            ));
+        }
         if !(MIN_EPHEMERAL_STORAGE_GIB..=MAX_EPHEMERAL_STORAGE_GIB)
             .contains(&self.ephemeral_storage_gib)
         {
@@ -198,6 +218,38 @@ impl FlashSpec {
         validate_string_list("args", &self.args, 256)?;
         Ok(())
     }
+
+    /// Effective per-VM GPU count. A typed request always means one GPU.
+    #[must_use]
+    pub const fn effective_gpu_count(&self) -> u32 {
+        if self.gpu_type.is_some() {
+            1
+        } else {
+            self.gpu_count
+        }
+    }
+}
+
+fn validate_gpu_type(value: &str) -> Result<(), ValidationError> {
+    let bytes = value.as_bytes();
+    if value.is_empty()
+        || value.len() > 63
+        || value.trim() != value
+        || !bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return Err(ValidationError::Field(
+            "gpu_type must be a 1-63 character lowercase DNS label".into(),
+        ));
+    }
+    Ok(())
 }
 
 const fn is_zero(value: &u32) -> bool {
@@ -654,6 +706,7 @@ mod tests {
             autoscaling: None,
             cpu_millis: 500,
             memory_mib: 256,
+            gpu_type: None,
             gpu_count: 0,
             ephemeral_storage_gib: 10,
             ports: vec![FlashPort {
@@ -695,6 +748,41 @@ mod tests {
         let mut oversized = valid_spec();
         oversized.gpu_count = 2;
         assert!(oversized.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn typed_gpu_request_implies_one_and_hides_physical_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = valid_spec();
+        spec.replicas = 1;
+        spec.gpu_type = Some("nvidia-geforce-gtx-1080-ti".into());
+        assert_eq!(spec.effective_gpu_count(), 1);
+        spec.validate()?;
+
+        for invalid in [
+            "NVIDIA-GeForce-GTX-1080-Ti",
+            "nvidia.geforce",
+            "nvidia_geforce",
+            "-nvidia",
+            "nvidia-",
+        ] {
+            spec.gpu_type = Some(invalid.into());
+            assert!(spec.validate().is_err(), "{invalid}");
+        }
+
+        spec.gpu_type = Some("nvidia-geforce-gtx-1080-ti".into());
+        spec.replicas = 2;
+        assert!(spec.validate().is_err());
+        spec.replicas = 1;
+        spec.autoscaling = Some(super::FlashAutoscaling {
+            min_replicas: 1,
+            max_replicas: 2,
+            target_cpu_utilization_percent: Some(70),
+            target_memory_utilization_percent: None,
+            idle_timeout_seconds: super::DEFAULT_IDLE_TIMEOUT_SECONDS,
+        });
+        assert!(spec.validate().is_err());
         Ok(())
     }
 
