@@ -27,11 +27,29 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: Verify release identity and artifact contract
         run: |
           node --test scripts/release-artifact-manifest.test.mjs
           node scripts/release-artifact-manifest.mjs validate
           node scripts/release-artifact-manifest.mjs guard flash-release-artifact.json
+      - run: cargo fmt --all -- --check
+      - run: cargo test --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Verify generated CRDs are current
+        run: |
+          ./scripts/generate-crd.sh
+          git diff --exit-code
+      - uses: azure/setup-helm@v5
+      - run: helm lint --strict deploy/helm/heterocloud-flash
+      - run: >-
+          helm template heterocloud-flash deploy/helm/heterocloud-flash
+          --set providerAuth.existingSecret=release-validation
+          >/tmp/heterocloud-flash.yaml
 
   image:
     needs: verify
