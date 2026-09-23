@@ -158,7 +158,7 @@ mod tests {
     use super::*;
     use crate::{
         PROVIDER_GPU_ACCESS_UPDATE_ACTION, PROVIDER_GPU_CATALOG_LIST_ACTION,
-        PROVIDER_GPU_TYPES_LIST_ACTION,
+        PROVIDER_GPU_TYPES_LIST_ACTION, PROVIDER_USAGE_LIST_ACTION,
     };
 
     fn signed_token(
@@ -197,11 +197,12 @@ mod tests {
     }
 
     #[test]
-    fn gpu_management_tokens_are_signed_and_action_scoped() -> Result<(), Box<dyn std::error::Error>>
+    fn administrative_tokens_are_signed_and_action_scoped() -> Result<(), Box<dyn std::error::Error>>
     {
         for action in [
             PROVIDER_GPU_CATALOG_LIST_ACTION,
             PROVIDER_GPU_ACCESS_UPDATE_ACTION,
+            PROVIDER_USAGE_LIST_ACTION,
         ] {
             let (authenticator, token) = signed_token(action, Uuid::nil(), None)?;
             let claims = authenticator.verify(&token, action)?;

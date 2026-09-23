@@ -30,15 +30,33 @@ spec:
                 type: string
               policy:
                 default:
+                  max_weekly_cpu_millicore_seconds: 3153600000000000
                   max_weekly_gpu_seconds: 31536000
+                  max_weekly_memory_mib_seconds: 33067892736000
                 properties:
+                  max_weekly_cpu_millicore_seconds:
+                    default: 3153600000000000
+                    description: |-
+                      Weekly allocated CPU time in millicore-seconds. The default is the
+                      provider safety ceiling so resources created before CPU metering keep
+                      running during a rolling upgrade.
+                    format: uint64
+                    maximum: 3153600000000000.0
+                    minimum: 0.0
+                    type: integer
                   max_weekly_gpu_seconds:
+                    default: 31536000
                     format: uint64
                     maximum: 31536000.0
                     minimum: 0.0
                     type: integer
-                required:
-                - max_weekly_gpu_seconds
+                  max_weekly_memory_mib_seconds:
+                    default: 33067892736000
+                    description: Weekly allocated memory time in MiB-seconds.
+                    format: uint64
+                    maximum: 33067892736000.0
+                    minimum: 0.0
+                    type: integer
                 type: object
               project_id:
                 type: string
@@ -278,6 +296,9 @@ spec:
               cold:
                 default: false
                 type: boolean
+              cpu_quota_exhausted:
+                default: false
+                type: boolean
               desired_replicas:
                 format: int32
                 type: integer
@@ -359,6 +380,9 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              memory_quota_exhausted:
+                default: false
+                type: boolean
               message:
                 nullable: true
                 type: string
@@ -379,6 +403,49 @@ spec:
                 type: string
               runtime_class:
                 type: string
+              weekly_usage:
+                nullable: true
+                properties:
+                  cpu_millicore_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  gpu_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  last_metered_at:
+                    format: int64
+                    type: integer
+                  max_cpu_millicore_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  max_gpu_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  max_memory_mib_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  memory_mib_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  week_started_at:
+                    format: int64
+                    type: integer
+                required:
+                - cpu_millicore_seconds
+                - gpu_seconds
+                - last_metered_at
+                - max_cpu_millicore_seconds
+                - max_gpu_seconds
+                - max_memory_mib_seconds
+                - memory_mib_seconds
+                - week_started_at
+                type: object
               writable_storage_bytes:
                 format: uint64
                 minimum: 0.0

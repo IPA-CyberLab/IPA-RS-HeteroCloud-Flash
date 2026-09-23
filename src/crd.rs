@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{FlashSpec, TransportProtocol};
 
 pub const MAX_WEEKLY_GPU_SECONDS: u64 = 31_536_000;
+pub const MAX_WEEKLY_CPU_MILLICORE_SECONDS: u64 = 3_153_600_000_000_000;
+pub const MAX_WEEKLY_MEMORY_MIB_SECONDS: u64 = 33_067_892_736_000;
 pub const MAX_PRIVATE_GPU_ASSIGNMENTS: u64 = 256;
 
 pub fn validated_crd() -> anyhow::Result<serde_json::Value> {
@@ -58,6 +60,19 @@ pub fn validated_gpu_job_crd() -> anyhow::Result<serde_json::Value> {
     spec["x-kubernetes-validations"] = json!([
         {"rule": "self.count == 1", "message": "a Flash VM may request exactly one GPU"},
         {"rule": "!has(self.gpu_type) || self.gpu_type.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')", "message": "gpu_type must be a canonical lowercase DNS label"}
+    ]);
+    Ok(crd)
+}
+
+pub fn validated_usage_record_crd() -> anyhow::Result<serde_json::Value> {
+    use kube::CustomResourceExt;
+    use serde_json::json;
+    let mut crd = serde_json::to_value(FlashUsageRecord::crd())?;
+    let spec = &mut crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+    spec["x-kubernetes-validations"] = json!([
+        {"rule": "self.service_instance_id.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')", "message": "service_instance_id must be a canonical UUID"},
+        {"rule": "self.organization_id.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')", "message": "organization_id must be a canonical UUID"},
+        {"rule": "self.project_id.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')", "message": "project_id must be a canonical UUID"}
     ]);
     Ok(crd)
 }
@@ -191,6 +206,30 @@ pub struct FlashGpuJobSpec {
     pub queued_at: i64,
 }
 
+/// Durable service-level allocation meter. It intentionally has no owner
+/// reference so deleting a FlashService cannot erase usage already consumed in
+/// the current week.
+#[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[kube(
+    group = "flash.heterocloud.io",
+    version = "v1alpha1",
+    kind = "FlashUsageRecord",
+    plural = "flashusagerecords",
+    shortname = "flashusage",
+    namespaced
+)]
+#[serde(deny_unknown_fields)]
+pub struct FlashUsageRecordSpec {
+    pub service_instance_id: String,
+    pub organization_id: String,
+    pub project_id: String,
+    pub display_name: String,
+    pub cpu_millis: u32,
+    pub memory_mib: u32,
+    pub gpu_count: u32,
+    pub usage: FlashWeeklyUsage,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlashGpuJobPhase {
@@ -233,6 +272,17 @@ pub struct FlashGpuAssignment {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlashServicePolicy {
+    /// Weekly allocated CPU time in millicore-seconds. The default is the
+    /// provider safety ceiling so resources created before CPU metering keep
+    /// running during a rolling upgrade.
+    #[serde(default = "default_max_weekly_cpu_millicore_seconds")]
+    #[schemars(range(min = 0_u64, max = 3_153_600_000_000_000_u64))]
+    pub max_weekly_cpu_millicore_seconds: u64,
+    /// Weekly allocated memory time in MiB-seconds.
+    #[serde(default = "default_max_weekly_memory_mib_seconds")]
+    #[schemars(range(min = 0_u64, max = 33_067_892_736_000_u64))]
+    pub max_weekly_memory_mib_seconds: u64,
+    #[serde(default = "default_max_weekly_gpu_seconds")]
     #[schemars(range(min = 0, max = 31_536_000))]
     pub max_weekly_gpu_seconds: u64,
 }
@@ -240,9 +290,23 @@ pub struct FlashServicePolicy {
 impl Default for FlashServicePolicy {
     fn default() -> Self {
         Self {
+            max_weekly_cpu_millicore_seconds: MAX_WEEKLY_CPU_MILLICORE_SECONDS,
+            max_weekly_memory_mib_seconds: MAX_WEEKLY_MEMORY_MIB_SECONDS,
             max_weekly_gpu_seconds: MAX_WEEKLY_GPU_SECONDS,
         }
     }
+}
+
+const fn default_max_weekly_cpu_millicore_seconds() -> u64 {
+    MAX_WEEKLY_CPU_MILLICORE_SECONDS
+}
+
+const fn default_max_weekly_memory_mib_seconds() -> u64 {
+    MAX_WEEKLY_MEMORY_MIB_SECONDS
+}
+
+const fn default_max_weekly_gpu_seconds() -> u64 {
+    MAX_WEEKLY_GPU_SECONDS
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -266,10 +330,23 @@ pub struct FlashServiceStatus {
     pub gpu_weekly_usage: Option<FlashGpuWeeklyUsage>,
     #[serde(default)]
     pub gpu_quota_exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_usage: Option<FlashWeeklyUsage>,
+    #[serde(default)]
+    pub cpu_quota_exhausted: bool,
+    #[serde(default)]
+    pub memory_quota_exhausted: bool,
     #[serde(default)]
     pub cold: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_scheduling: Option<FlashGpuSchedulingStatus>,
+}
+
+impl FlashServiceStatus {
+    #[must_use]
+    pub const fn quota_exhausted(&self) -> bool {
+        self.cpu_quota_exhausted || self.memory_quota_exhausted || self.gpu_quota_exhausted
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -289,6 +366,19 @@ pub struct FlashGpuWeeklyUsage {
     pub used_seconds: u64,
     pub last_metered_at: i64,
     pub limit_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlashWeeklyUsage {
+    pub week_started_at: i64,
+    pub cpu_millicore_seconds: u64,
+    pub memory_mib_seconds: u64,
+    pub gpu_seconds: u64,
+    pub last_metered_at: i64,
+    pub max_cpu_millicore_seconds: u64,
+    pub max_memory_mib_seconds: u64,
+    pub max_gpu_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -338,6 +428,16 @@ mod tests {
                 .any(|rule| rule["message"]
                     == "GPU Flash VMs require replicas=1 and autoscaling max_replicas=1")
         );
+        let legacy_policy: super::FlashServicePolicy =
+            serde_json::from_value(serde_json::json!({"max_weekly_gpu_seconds": 40_320}))?;
+        assert_eq!(
+            legacy_policy.max_weekly_cpu_millicore_seconds,
+            super::MAX_WEEKLY_CPU_MILLICORE_SECONDS
+        );
+        assert_eq!(
+            legacy_policy.max_weekly_memory_mib_seconds,
+            super::MAX_WEEKLY_MEMORY_MIB_SECONDS
+        );
         Ok(())
     }
 
@@ -378,6 +478,12 @@ mod tests {
             "../deploy/helm/heterocloud-flash/crds/flashgpujobs.yaml"
         ))?;
         assert_eq!(job, checked_job);
+
+        let usage = super::validated_usage_record_crd()?;
+        let checked_usage: serde_json::Value = serde_yaml::from_str(include_str!(
+            "../deploy/helm/heterocloud-flash/crds/flashusagerecords.yaml"
+        ))?;
+        assert_eq!(usage, checked_usage);
         Ok(())
     }
 }

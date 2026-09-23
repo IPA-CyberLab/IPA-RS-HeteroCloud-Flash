@@ -117,6 +117,16 @@ granted through the tenant spec. Per-VM and organization-wide resource limits
 are managed by the HeteroCloud owner quota policy. The OCI image counts toward
 each VM's configured disk limit.
 
+Flash also meters weekly allocated runtime for CPU, memory, and GPU. CPU is
+recorded as `cpu_millis × ready replicas × seconds`, memory as
+`memory_mib × ready replicas × seconds`, and GPU as
+`GPU count × ready replicas × seconds`. A service at scale zero consumes no
+runtime quota. Counters reset every Monday at 00:00 UTC; reaching the shared
+organization CPU or memory limit suspends all of that organization's Flash
+workloads, while the GPU limit suspends its GPU workloads. Durable
+`FlashUsageRecord` resources retain the current week's counters when a service
+is deleted.
+
 Production clusters should enable restart-safe Web Shell homes and select a
 CSI storage class that supports `ReadWriteMany`:
 

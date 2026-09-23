@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use heterocloud_flash::{
-    crd::{FlashService, FlashServicePhase},
+    crd::{FlashService, FlashServicePhase, FlashServiceStatus},
     domain::EndpointMode,
     reconcile::LAST_ACTIVITY_ANNOTATION,
 };
@@ -116,7 +116,7 @@ async fn proxy_inner(state: &AppState, request: Request) -> Result<Response, Act
     if service
         .status
         .as_ref()
-        .is_some_and(|status| status.gpu_quota_exhausted)
+        .is_some_and(FlashServiceStatus::quota_exhausted)
     {
         return Err(ActivatorError::QuotaExceeded);
     }
@@ -242,7 +242,7 @@ async fn wait_until_ready(
         if service
             .status
             .as_ref()
-            .is_some_and(|status| status.gpu_quota_exhausted)
+            .is_some_and(FlashServiceStatus::quota_exhausted)
         {
             return Err(ActivatorError::QuotaExceeded);
         }

@@ -37,7 +37,7 @@ use crate::{
     crd::{
         FlashEndpoint, FlashGpuAssignment, FlashGpuJob, FlashGpuJobPhase, FlashGpuJobSpec,
         FlashGpuSchedulingStatus, FlashGpuWeeklyUsage, FlashService, FlashServicePhase,
-        FlashServiceStatus,
+        FlashServiceStatus, FlashUsageRecord, FlashUsageRecordSpec, FlashWeeklyUsage,
     },
     domain::{EndpointMode, ExposureType, TrafficMode, ValidationError},
     gpu_scheduler::run_gpu_scheduler,
@@ -244,76 +244,193 @@ pub async fn run_controller(
     Ok(())
 }
 
-#[derive(Default)]
-struct GpuMeter {
-    usage: Option<FlashGpuWeeklyUsage>,
-    exhausted: bool,
-    remaining_seconds: u64,
+struct WeeklyMeter {
+    usage: FlashWeeklyUsage,
+    gpu_usage: Option<FlashGpuWeeklyUsage>,
+    cpu_exhausted: bool,
+    memory_exhausted: bool,
+    gpu_exhausted: bool,
+    gpu_remaining_seconds: u64,
 }
 
-fn utc_week_start(timestamp: i64) -> i64 {
+#[must_use]
+pub fn utc_week_start(timestamp: i64) -> i64 {
     const WEEK_SECONDS: i64 = 7 * 24 * 60 * 60;
     const FIRST_MONDAY_AFTER_UNIX_EPOCH: i64 = 4 * 24 * 60 * 60;
     (timestamp - FIRST_MONDAY_AFTER_UNIX_EPOCH).div_euclid(WEEK_SECONDS) * WEEK_SECONDS
         + FIRST_MONDAY_AFTER_UNIX_EPOCH
 }
 
-async fn meter_gpu_usage(
-    services: &Api<FlashService>,
-    flash: &FlashService,
-    now: i64,
-) -> Result<GpuMeter, ReconcileError> {
-    if flash.spec.workload.effective_gpu_count() == 0 {
-        return Ok(GpuMeter::default());
-    }
+/// Returns this service's up-to-date allocation meter without changing the
+/// resource. The controller persists the projection every reconciliation and
+/// the read-only usage API uses the same calculation between reconciliations.
+#[must_use]
+pub fn projected_weekly_usage(flash: &FlashService, now: i64) -> FlashWeeklyUsage {
     let week_started_at = utc_week_start(now);
-    let previous = flash.status.as_ref().and_then(|status| {
-        status
-            .gpu_weekly_usage
-            .as_ref()
-            .filter(|usage| usage.week_started_at == week_started_at)
-    });
-    let mut used_seconds = previous.map_or(0, |usage| usage.used_seconds);
+    let status = flash.status.as_ref();
+    let previous = status
+        .and_then(|status| status.weekly_usage.as_ref())
+        .filter(|usage| usage.week_started_at == week_started_at);
+    let legacy_gpu = status
+        .and_then(|status| status.gpu_weekly_usage.as_ref())
+        .filter(|usage| usage.week_started_at == week_started_at);
     let last_metered_at = previous
-        .map_or(now, |usage| usage.last_metered_at.max(week_started_at))
+        .map(|usage| usage.last_metered_at)
+        .or_else(|| legacy_gpu.map(|usage| usage.last_metered_at))
+        .unwrap_or(now)
+        .max(week_started_at)
         .min(now);
-    let ready_replicas = flash.status.as_ref().map_or(0, |status| {
+    let ready_replicas = status.map_or(0, |status| {
         u64::try_from(status.ready_replicas.max(0)).unwrap_or_default()
     });
     let elapsed = u64::try_from(now.saturating_sub(last_metered_at)).unwrap_or_default();
-    used_seconds = used_seconds.saturating_add(
-        elapsed
-            .saturating_mul(ready_replicas)
-            .saturating_mul(u64::from(flash.spec.workload.effective_gpu_count())),
-    );
+    let replica_seconds = elapsed.saturating_mul(ready_replicas);
+    FlashWeeklyUsage {
+        week_started_at,
+        cpu_millicore_seconds: previous
+            .map_or(0, |usage| usage.cpu_millicore_seconds)
+            .saturating_add(
+                replica_seconds.saturating_mul(u64::from(flash.spec.workload.cpu_millis)),
+            ),
+        memory_mib_seconds: previous
+            .map_or(0, |usage| usage.memory_mib_seconds)
+            .saturating_add(
+                replica_seconds.saturating_mul(u64::from(flash.spec.workload.memory_mib)),
+            ),
+        gpu_seconds: previous
+            .map(|usage| usage.gpu_seconds)
+            .or_else(|| legacy_gpu.map(|usage| usage.used_seconds))
+            .unwrap_or_default()
+            .saturating_add(
+                replica_seconds
+                    .saturating_mul(u64::from(flash.spec.workload.effective_gpu_count())),
+            ),
+        last_metered_at: now,
+        max_cpu_millicore_seconds: flash.spec.policy.max_weekly_cpu_millicore_seconds,
+        max_memory_mib_seconds: flash.spec.policy.max_weekly_memory_mib_seconds,
+        max_gpu_seconds: flash.spec.policy.max_weekly_gpu_seconds,
+    }
+}
 
-    let mut organization_total = used_seconds;
-    for peer in services.list(&ListParams::default()).await?.items {
-        if peer.name_any() == flash.name_any()
-            || peer.spec.organization_id != flash.spec.organization_id
-            || peer.spec.workload.effective_gpu_count() == 0
+async fn meter_weekly_usage(
+    services: &Api<FlashService>,
+    usage_records: &Api<FlashUsageRecord>,
+    flash: &FlashService,
+    now: i64,
+) -> Result<WeeklyMeter, ReconcileError> {
+    let mut usage = projected_weekly_usage(flash, now);
+    let record_name = flash.name_any();
+    if let Some(record) = usage_records.get_opt(&record_name).await? {
+        if record.spec.service_instance_id != flash.spec.service_instance_id
+            || record.spec.organization_id != flash.spec.organization_id
+        {
+            return Err(ReconcileError::Resource(anyhow::anyhow!(
+                "usage record identity does not match FlashService"
+            )));
+        }
+        if record.spec.usage.week_started_at == usage.week_started_at {
+            usage.cpu_millicore_seconds = usage
+                .cpu_millicore_seconds
+                .max(record.spec.usage.cpu_millicore_seconds);
+            usage.memory_mib_seconds = usage
+                .memory_mib_seconds
+                .max(record.spec.usage.memory_mib_seconds);
+            usage.gpu_seconds = usage.gpu_seconds.max(record.spec.usage.gpu_seconds);
+        }
+    }
+    usage.last_metered_at = now;
+    let desired_record = FlashUsageRecord::new(
+        &record_name,
+        FlashUsageRecordSpec {
+            service_instance_id: flash.spec.service_instance_id.clone(),
+            organization_id: flash.spec.organization_id.clone(),
+            project_id: flash.spec.project_id.clone(),
+            display_name: flash.spec.display_name.clone(),
+            cpu_millis: flash.spec.workload.cpu_millis,
+            memory_mib: flash.spec.workload.memory_mib,
+            gpu_count: flash.spec.workload.effective_gpu_count(),
+            usage: usage.clone(),
+        },
+    );
+    usage_records
+        .patch(
+            &record_name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&desired_record),
+        )
+        .await?;
+
+    let mut recorded_services = BTreeSet::new();
+    let mut organization_cpu = 0_u64;
+    let mut organization_memory = 0_u64;
+    let mut organization_gpu = 0_u64;
+    for record in usage_records.list(&ListParams::default()).await?.items {
+        if record.spec.organization_id != flash.spec.organization_id
+            || record.spec.usage.week_started_at != usage.week_started_at
         {
             continue;
         }
-        if let Some(usage) = peer
-            .status
-            .as_ref()
-            .and_then(|status| status.gpu_weekly_usage.as_ref())
-            .filter(|usage| usage.week_started_at == week_started_at)
-        {
-            organization_total = organization_total.saturating_add(usage.used_seconds);
-        }
+        recorded_services.insert(record.spec.service_instance_id.clone());
+        organization_cpu = organization_cpu.saturating_add(record.spec.usage.cpu_millicore_seconds);
+        organization_memory =
+            organization_memory.saturating_add(record.spec.usage.memory_mib_seconds);
+        organization_gpu = organization_gpu.saturating_add(record.spec.usage.gpu_seconds);
     }
-    let limit_seconds = flash.spec.policy.max_weekly_gpu_seconds;
-    Ok(GpuMeter {
-        usage: Some(FlashGpuWeeklyUsage {
-            week_started_at,
-            used_seconds,
+    // During the first rolling-upgrade pass, peers may not have durable records
+    // yet. Include their status projection until their controller pass creates
+    // one, without counting services that already have a record twice.
+    for peer in services.list(&ListParams::default()).await?.items {
+        if peer.spec.organization_id != flash.spec.organization_id
+            || recorded_services.contains(&peer.spec.service_instance_id)
+        {
+            continue;
+        }
+        let peer_usage = projected_weekly_usage(&peer, now);
+        organization_cpu = organization_cpu.saturating_add(peer_usage.cpu_millicore_seconds);
+        organization_memory = organization_memory.saturating_add(peer_usage.memory_mib_seconds);
+        organization_gpu = organization_gpu.saturating_add(peer_usage.gpu_seconds);
+    }
+    let gpu_limit = flash.spec.policy.max_weekly_gpu_seconds;
+    Ok(WeeklyMeter {
+        gpu_usage: (flash.spec.workload.effective_gpu_count() > 0).then_some(FlashGpuWeeklyUsage {
+            week_started_at: usage.week_started_at,
+            used_seconds: usage.gpu_seconds,
             last_metered_at: now,
-            limit_seconds,
+            limit_seconds: gpu_limit,
         }),
-        exhausted: organization_total >= limit_seconds,
-        remaining_seconds: limit_seconds.saturating_sub(organization_total),
+        cpu_exhausted: organization_cpu >= flash.spec.policy.max_weekly_cpu_millicore_seconds,
+        memory_exhausted: organization_memory >= flash.spec.policy.max_weekly_memory_mib_seconds,
+        gpu_exhausted: flash.spec.workload.effective_gpu_count() > 0
+            && organization_gpu >= gpu_limit,
+        gpu_remaining_seconds: gpu_limit.saturating_sub(organization_gpu),
+        usage,
+    })
+}
+
+fn apply_weekly_meter(status: &mut FlashServiceStatus, meter: &WeeklyMeter) {
+    status.weekly_usage = Some(meter.usage.clone());
+    status.cpu_quota_exhausted = meter.cpu_exhausted;
+    status.memory_quota_exhausted = meter.memory_exhausted;
+    status.gpu_weekly_usage = meter.gpu_usage.clone();
+    status.gpu_quota_exhausted = meter.gpu_exhausted;
+}
+
+fn exhausted_quota_message(meter: &WeeklyMeter) -> Option<String> {
+    let mut resources = Vec::new();
+    if meter.cpu_exhausted {
+        resources.push("CPU");
+    }
+    if meter.memory_exhausted {
+        resources.push("memory");
+    }
+    if meter.gpu_exhausted {
+        resources.push("GPU");
+    }
+    (!resources.is_empty()).then(|| {
+        format!(
+            "weekly {} runtime limit reached; service resumes at the next UTC week or after the owner raises the limit",
+            resources.join(", ")
+        )
     })
 }
 
@@ -470,6 +587,8 @@ async fn reconcile(
     let name = flash.name_any();
     let runtime_class = workload_runtime_class(flash.spec.workload.effective_gpu_count());
     let services = Api::<FlashService>::namespaced(context.client.clone(), &context.namespace);
+    let usage_records =
+        Api::<FlashUsageRecord>::namespaced(context.client.clone(), &context.namespace);
 
     if let Err(error) = flash
         .spec
@@ -505,9 +624,10 @@ async fn reconcile(
     }
 
     let now = Utc::now().timestamp();
-    let gpu_meter = meter_gpu_usage(&services, &flash, now).await?;
+    let weekly_meter = meter_weekly_usage(&services, &usage_records, &flash, now).await?;
     let cold = should_scale_to_zero(&flash, now);
-    let suspended = cold || gpu_meter.exhausted;
+    let quota_message = exhausted_quota_message(&weekly_meter);
+    let suspended = cold || quota_message.is_some();
     let owner = flash
         .controller_owner_ref(&())
         .ok_or(ReconcileError::MissingOwnerReference)?;
@@ -517,7 +637,7 @@ async fn reconcile(
         &flash,
         &owner,
         now,
-        gpu_meter.remaining_seconds,
+        weekly_meter.gpu_remaining_seconds,
         suspended,
     )
     .await?;
@@ -529,21 +649,17 @@ async fn reconcile(
         .map_err(|_| ReconcileError::InvalidReplicaCount)?;
     if flash.spec.workload.effective_gpu_count() > 0 && !suspended && gpu_assignment.is_none() {
         suspend_deployment(&context.client, &context.namespace, &name).await?;
-        patch_status_if_changed(
-            &services,
-            &flash,
-            FlashServiceStatus {
-                phase: FlashServicePhase::Provisioning,
-                observed_generation: flash.spec.desired_generation,
-                desired_replicas,
-                runtime_class: runtime_class.into(),
-                gpu_weekly_usage: gpu_meter.usage,
-                gpu_scheduling: gpu_scheduling_status(&flash, gpu_job_state.as_ref()),
-                message: Some("queued for a visible healthy GPU of the requested type".into()),
-                ..FlashServiceStatus::default()
-            },
-        )
-        .await?;
+        let mut status = FlashServiceStatus {
+            phase: FlashServicePhase::Provisioning,
+            observed_generation: flash.spec.desired_generation,
+            desired_replicas,
+            runtime_class: runtime_class.into(),
+            gpu_scheduling: gpu_scheduling_status(&flash, gpu_job_state.as_ref()),
+            message: Some("queued for a visible healthy GPU of the requested type".into()),
+            ..FlashServiceStatus::default()
+        };
+        apply_weekly_meter(&mut status, &weekly_meter);
+        patch_status_if_changed(&services, &flash, status).await?;
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
     let disk_budget_bytes = u64::from(flash.spec.workload.ephemeral_storage_gib)
@@ -562,54 +678,45 @@ async fn reconcile(
         {
             Ok(Ok(inspection)) => inspection,
             Ok(Err(error)) if error.retryable() => {
-                patch_status_if_changed(
-                    &services,
-                    &flash,
-                    FlashServiceStatus {
-                        phase: FlashServicePhase::Provisioning,
-                        observed_generation: flash.spec.desired_generation,
-                        desired_replicas,
-                        runtime_class: runtime_class.into(),
-                        message: Some(format!("waiting for image inspection: {error}")),
-                        ..FlashServiceStatus::default()
-                    },
-                )
-                .await?;
+                let mut status = FlashServiceStatus {
+                    phase: FlashServicePhase::Provisioning,
+                    observed_generation: flash.spec.desired_generation,
+                    desired_replicas,
+                    runtime_class: runtime_class.into(),
+                    message: Some(format!("waiting for image inspection: {error}")),
+                    ..FlashServiceStatus::default()
+                };
+                apply_weekly_meter(&mut status, &weekly_meter);
+                patch_status_if_changed(&services, &flash, status).await?;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
             Ok(Err(error)) => {
                 suspend_deployment(&context.client, &context.namespace, &name).await?;
-                patch_status_if_changed(
-                    &services,
-                    &flash,
-                    FlashServiceStatus {
-                        phase: FlashServicePhase::Error,
-                        observed_generation: flash.spec.desired_generation,
-                        desired_replicas,
-                        runtime_class: runtime_class.into(),
-                        message: Some(error.to_string()),
-                        ..FlashServiceStatus::default()
-                    },
-                )
-                .await?;
+                let mut status = FlashServiceStatus {
+                    phase: FlashServicePhase::Error,
+                    observed_generation: flash.spec.desired_generation,
+                    desired_replicas,
+                    runtime_class: runtime_class.into(),
+                    message: Some(error.to_string()),
+                    ..FlashServiceStatus::default()
+                };
+                apply_weekly_meter(&mut status, &weekly_meter);
+                patch_status_if_changed(&services, &flash, status).await?;
                 return Ok(Action::await_change());
             }
             Err(_) => {
-                patch_status_if_changed(
-                    &services,
-                    &flash,
-                    FlashServiceStatus {
-                        phase: FlashServicePhase::Provisioning,
-                        observed_generation: flash.spec.desired_generation,
-                        desired_replicas,
-                        runtime_class: runtime_class.into(),
-                        message: Some(
-                            "waiting for image inspection: OCI registry request timed out".into(),
-                        ),
-                        ..FlashServiceStatus::default()
-                    },
-                )
-                .await?;
+                let mut status = FlashServiceStatus {
+                    phase: FlashServicePhase::Provisioning,
+                    observed_generation: flash.spec.desired_generation,
+                    desired_replicas,
+                    runtime_class: runtime_class.into(),
+                    message: Some(
+                        "waiting for image inspection: OCI registry request timed out".into(),
+                    ),
+                    ..FlashServiceStatus::default()
+                };
+                apply_weekly_meter(&mut status, &weekly_meter);
+                patch_status_if_changed(&services, &flash, status).await?;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
         }
@@ -763,12 +870,11 @@ async fn reconcile(
         resolved_image: Some(inspection.resolved_image),
         image_size_bytes: Some(inspection.image_size_bytes),
         writable_storage_bytes: Some(inspection.writable_storage_bytes),
-        gpu_weekly_usage: gpu_meter.usage,
-        gpu_quota_exhausted: gpu_meter.exhausted,
         cold,
         gpu_scheduling: gpu_scheduling_status(&flash, gpu_job_state.as_ref()),
         ..FlashServiceStatus::default()
     };
+    apply_weekly_meter(&mut status, &weekly_meter);
     let action = update_workload_status(
         &mut status,
         &pods.items,
@@ -779,10 +885,8 @@ async fn reconcile(
         status.desired_replicas = 0;
         status.ready_replicas = 0;
         status.phase = FlashServicePhase::Ready;
-        status.message = Some(if gpu_meter.exhausted {
-            "weekly GPU runtime limit reached; service resumes at the next UTC week or after the owner raises the limit".into()
-        } else {
-            "scaled to zero; the next HTTP request will cold-start one replica".into()
+        status.message = quota_message.or_else(|| {
+            Some("scaled to zero; the next HTTP request will cold-start one replica".into())
         });
     }
     if hostname.is_some()
@@ -805,10 +909,11 @@ async fn reconcile(
         mark_activity(&services, &flash, now).await?;
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
-    if flash.spec.workload.effective_gpu_count() > 0 || is_scale_to_zero(&flash) {
-        return Ok(Action::requeue(Duration::from_secs(30)));
+    if phase_ready {
+        Ok(Action::requeue(Duration::from_secs(30)))
+    } else {
+        Ok(action)
     }
-    Ok(action)
 }
 
 fn update_workload_status(
@@ -869,6 +974,7 @@ fn status_patch(flash: &FlashService, status: &FlashServiceStatus) -> Value {
     patch["status"]["image_size_bytes"] = json!(status.image_size_bytes);
     patch["status"]["writable_storage_bytes"] = json!(status.writable_storage_bytes);
     patch["status"]["gpu_weekly_usage"] = json!(status.gpu_weekly_usage);
+    patch["status"]["weekly_usage"] = json!(status.weekly_usage);
     patch["status"]["gpu_scheduling"] = json!(status.gpu_scheduling);
     if let Some(version) = &flash.metadata.resource_version {
         patch["metadata"] = json!({"resourceVersion": version});
@@ -2128,15 +2234,17 @@ mod tests {
     use super::{
         AdminVolumeMount, DeploymentOptions, desired_deployment, desired_network_policy,
         desired_network_policy_with_networks, desired_persistent_volume_claim, desired_service,
-        gpu_job_state, status_patch, storage_allocation, update_workload_status,
-        validate_admin_volume_mounts, workload_failure_message, workload_restart_message,
+        gpu_job_state, projected_weekly_usage, status_patch, storage_allocation,
+        update_workload_status, validate_admin_volume_mounts, workload_failure_message,
+        workload_restart_message,
     };
     use crate::{
         GPU_READY_LABEL, GPU_RESOURCE_NAME, GPU_RUNTIME_CLASS_NAME, LOAD_BALANCER_CLASS,
         RUNTIME_CLASS_NAME,
         crd::{
             FlashGpuAssignment, FlashGpuJob, FlashGpuJobPhase, FlashGpuJobSpec, FlashGpuJobStatus,
-            FlashService, FlashServicePhase, FlashServiceSpec, FlashServiceStatus,
+            FlashGpuWeeklyUsage, FlashService, FlashServicePhase, FlashServiceSpec,
+            FlashServiceStatus, FlashWeeklyUsage,
         },
         domain::{
             ExposureType, FlashEgress, FlashExposure, FlashPort, FlashSpec, TrafficMode,
@@ -2300,10 +2408,66 @@ mod tests {
     }
 
     #[test]
+    fn weekly_meter_counts_ready_allocations_and_resets_on_monday() {
+        const MONDAY: i64 = 4 * 24 * 60 * 60;
+        const WEEK: i64 = 7 * 24 * 60 * 60;
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.status = Some(FlashServiceStatus {
+            ready_replicas: 2,
+            weekly_usage: Some(FlashWeeklyUsage {
+                week_started_at: MONDAY,
+                cpu_millicore_seconds: 1_000,
+                memory_mib_seconds: 2_000,
+                gpu_seconds: 0,
+                last_metered_at: MONDAY + 100,
+                max_cpu_millicore_seconds: 10_000_000,
+                max_memory_mib_seconds: 10_000_000,
+                max_gpu_seconds: 10_000,
+            }),
+            ..FlashServiceStatus::default()
+        });
+
+        let usage = projected_weekly_usage(&flash, MONDAY + 130);
+        assert_eq!(usage.cpu_millicore_seconds, 16_000);
+        assert_eq!(usage.memory_mib_seconds, 9_680);
+        assert_eq!(usage.gpu_seconds, 0);
+
+        let reset = projected_weekly_usage(&flash, MONDAY + WEEK + 50);
+        assert_eq!(reset.week_started_at, MONDAY + WEEK);
+        assert_eq!(reset.cpu_millicore_seconds, 0);
+        assert_eq!(reset.memory_mib_seconds, 0);
+        assert_eq!(reset.gpu_seconds, 0);
+    }
+
+    #[test]
+    fn weekly_meter_imports_legacy_gpu_counter_during_upgrade() {
+        const MONDAY: i64 = 4 * 24 * 60 * 60;
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.replicas = 1;
+        flash.spec.workload.gpu_count = 1;
+        flash.status = Some(FlashServiceStatus {
+            ready_replicas: 1,
+            gpu_weekly_usage: Some(FlashGpuWeeklyUsage {
+                week_started_at: MONDAY,
+                used_seconds: 25,
+                last_metered_at: MONDAY + 100,
+                limit_seconds: 100,
+            }),
+            ..FlashServiceStatus::default()
+        });
+
+        let usage = projected_weekly_usage(&flash, MONDAY + 110);
+        assert_eq!(usage.cpu_millicore_seconds, 2_500);
+        assert_eq!(usage.memory_mib_seconds, 1_280);
+        assert_eq!(usage.gpu_seconds, 35);
+    }
+
+    #[test]
     fn service_status_patch_clears_gpu_scheduling() {
         let flash = service(TrafficMode::Forwarded);
         let patch = status_patch(&flash, &FlashServiceStatus::default());
         assert_eq!(patch["status"]["gpu_scheduling"], Value::Null);
+        assert_eq!(patch["status"]["weekly_usage"], Value::Null);
     }
 
     #[test]

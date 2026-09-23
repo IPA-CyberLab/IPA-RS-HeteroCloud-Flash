@@ -1,4 +1,4 @@
-use std::{env, process::ExitCode, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, process::ExitCode, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -16,14 +16,16 @@ use heterocloud_flash::{
     PROVIDER_DELETE_ACTION, PROVIDER_EXEC_ACTION, PROVIDER_GPU_ACCESS_UPDATE_ACTION,
     PROVIDER_GPU_CATALOG_LIST_ACTION, PROVIDER_GPU_TYPES_LIST_ACTION,
     PROVIDER_LIST_CONTAINERS_ACTION, PROVIDER_RECONCILE_ACTION, PROVIDER_STATUS_GET_ACTION,
-    RUNTIME_CLASS_NAME,
+    PROVIDER_USAGE_LIST_ACTION, RUNTIME_CLASS_NAME,
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
     crd::{
         FlashGpuDevice, FlashGpuVisibility, FlashService, FlashServicePhase, FlashServicePolicy,
-        FlashServiceSpec, FlashServiceStatus, MAX_WEEKLY_GPU_SECONDS,
+        FlashServiceSpec, FlashServiceStatus, FlashUsageRecord, FlashWeeklyUsage,
+        MAX_WEEKLY_CPU_MILLICORE_SECONDS, MAX_WEEKLY_GPU_SECONDS, MAX_WEEKLY_MEMORY_MIB_SECONDS,
     },
     domain::FlashSpec,
     gpu_scheduler::{gpu_device_available, validate_gpu_inventory_models, visible_gpu_catalog},
+    reconcile::{projected_weekly_usage, utc_week_start},
     workload_runtime_class,
 };
 use k8s_openapi::api::core::v1::Pod;
@@ -53,6 +55,7 @@ const EXEC_SHELL_SCRIPT: &str = "export TERM=xterm-256color COLORTERM=truecolor 
 #[derive(Clone)]
 struct AppState {
     services: Api<FlashService>,
+    usage_records: Api<FlashUsageRecord>,
     gpu_devices: Api<FlashGpuDevice>,
     pods: Api<Pod>,
     authenticator: ProviderAuthenticator,
@@ -96,6 +99,7 @@ async fn run() -> Result<()> {
         .clamp(1, 256);
     let state = Arc::new(AppState {
         services: Api::namespaced(client.clone(), &namespace),
+        usage_records: Api::namespaced(client.clone(), &namespace),
         gpu_devices: Api::all(client.clone()),
         pods: Api::namespaced(client, &namespace),
         authenticator,
@@ -119,6 +123,7 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route("/internal/v1/gpu-types", get(list_gpu_types))
         .route("/internal/v1/gpus", get(list_gpu_inventory))
         .route("/internal/v1/gpus/access", put(update_gpu_access))
+        .route("/internal/v1/usage", get(list_usage))
         .route(
             "/internal/v1/service-instances/{service_instance_id}",
             put(reconcile).delete(remove).get(get_status),
@@ -211,7 +216,7 @@ fn management_item(device: &FlashGpuDevice, now: i64) -> GpuManagementItem {
     }
 }
 
-fn validate_gpu_admin_claims(claims: &ProviderClaims) -> Result<(), ApiError> {
+fn validate_admin_claims(claims: &ProviderClaims) -> Result<(), ApiError> {
     if claims.subject != Uuid::nil()
         || claims.user_id.is_some()
         || claims.organization_id != Uuid::nil()
@@ -224,6 +229,125 @@ fn validate_gpu_admin_claims(claims: &ProviderClaims) -> Result<(), ApiError> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct UsageItem {
+    organization_id: Uuid,
+    project_id: Uuid,
+    service_instance_id: Uuid,
+    display_name: String,
+    active: bool,
+    ready_replicas: u32,
+    cpu_millis: u32,
+    memory_mib: u32,
+    gpu_count: u32,
+    weekly_usage: FlashWeeklyUsage,
+}
+
+fn usage_id(value: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(value).map_err(|_| ApiError::Internal)
+}
+
+fn merge_usage(current: &mut FlashWeeklyUsage, other: &FlashWeeklyUsage) {
+    if current.week_started_at != other.week_started_at {
+        return;
+    }
+    current.cpu_millicore_seconds = current
+        .cpu_millicore_seconds
+        .max(other.cpu_millicore_seconds);
+    current.memory_mib_seconds = current.memory_mib_seconds.max(other.memory_mib_seconds);
+    current.gpu_seconds = current.gpu_seconds.max(other.gpu_seconds);
+    current.last_metered_at = current.last_metered_at.max(other.last_metered_at);
+}
+
+fn usage_items(
+    services: Vec<FlashService>,
+    records: Vec<FlashUsageRecord>,
+    now: i64,
+) -> Result<Vec<UsageItem>, ApiError> {
+    let week_started_at = utc_week_start(now);
+    let mut items = BTreeMap::new();
+    for record in records {
+        if record.spec.usage.week_started_at != week_started_at {
+            continue;
+        }
+        let service_instance_id = usage_id(&record.spec.service_instance_id)?;
+        items.insert(
+            service_instance_id,
+            UsageItem {
+                organization_id: usage_id(&record.spec.organization_id)?,
+                project_id: usage_id(&record.spec.project_id)?,
+                service_instance_id,
+                display_name: record.spec.display_name,
+                active: false,
+                ready_replicas: 0,
+                cpu_millis: record.spec.cpu_millis,
+                memory_mib: record.spec.memory_mib,
+                gpu_count: record.spec.gpu_count,
+                weekly_usage: record.spec.usage,
+            },
+        );
+    }
+    for service in services {
+        if service.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let service_instance_id = usage_id(&service.spec.service_instance_id)?;
+        let mut weekly_usage = projected_weekly_usage(&service, now);
+        if let Some(recorded) = items.get(&service_instance_id) {
+            if recorded.organization_id != usage_id(&service.spec.organization_id)? {
+                return Err(ApiError::Internal);
+            }
+            merge_usage(&mut weekly_usage, &recorded.weekly_usage);
+        }
+        // Current policy is authoritative even when the durable counter was
+        // written before an owner changed a quota.
+        weekly_usage.max_cpu_millicore_seconds =
+            service.spec.policy.max_weekly_cpu_millicore_seconds;
+        weekly_usage.max_memory_mib_seconds = service.spec.policy.max_weekly_memory_mib_seconds;
+        weekly_usage.max_gpu_seconds = service.spec.policy.max_weekly_gpu_seconds;
+        items.insert(
+            service_instance_id,
+            UsageItem {
+                organization_id: usage_id(&service.spec.organization_id)?,
+                project_id: usage_id(&service.spec.project_id)?,
+                service_instance_id,
+                display_name: service.spec.display_name,
+                active: true,
+                ready_replicas: service.status.as_ref().map_or(0, |status| {
+                    u32::try_from(status.ready_replicas.max(0)).unwrap_or_default()
+                }),
+                cpu_millis: service.spec.workload.cpu_millis,
+                memory_mib: service.spec.workload.memory_mib,
+                gpu_count: service.spec.workload.effective_gpu_count(),
+                weekly_usage,
+            },
+        );
+    }
+    Ok(items.into_values().collect())
+}
+
+async fn list_usage(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_USAGE_LIST_ACTION)?;
+    validate_admin_claims(&claims)?;
+    let now = chrono::Utc::now().timestamp();
+    let service_params = ListParams::default();
+    let record_params = ListParams::default();
+    let (services, records) = tokio::try_join!(
+        state.services.list(&service_params),
+        state.usage_records.list(&record_params)
+    )?;
+    Ok(Json(json!({
+        "generated_at": now,
+        "week_started_at": utc_week_start(now),
+        "items": usage_items(services.items, records.items, now)?,
+    })))
+}
+
 async fn list_gpu_inventory(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -231,7 +355,7 @@ async fn list_gpu_inventory(
     let claims = state
         .authenticator
         .authenticate(&headers, PROVIDER_GPU_CATALOG_LIST_ACTION)?;
-    validate_gpu_admin_claims(&claims)?;
+    validate_admin_claims(&claims)?;
     let now = chrono::Utc::now().timestamp();
     let devices = state.gpu_devices.list(&ListParams::default()).await?.items;
     validate_gpu_inventory_models(&devices).map_err(|_| ApiError::Internal)?;
@@ -251,7 +375,7 @@ async fn update_gpu_access(
     let claims = state
         .authenticator
         .authenticate(&headers, PROVIDER_GPU_ACCESS_UPDATE_ACTION)?;
-    validate_gpu_admin_claims(&claims)?;
+    validate_admin_claims(&claims)?;
     request.assigned_user_ids.sort_unstable();
     request.assigned_user_ids.dedup();
     let current = state
@@ -322,6 +446,16 @@ async fn reconcile(
     if request.policy.max_weekly_gpu_seconds > MAX_WEEKLY_GPU_SECONDS {
         return Err(ApiError::BadRequest(
             "weekly GPU limit exceeds the provider safety maximum".into(),
+        ));
+    }
+    if request.policy.max_weekly_cpu_millicore_seconds > MAX_WEEKLY_CPU_MILLICORE_SECONDS {
+        return Err(ApiError::BadRequest(
+            "weekly CPU limit exceeds the provider safety maximum".into(),
+        ));
+    }
+    if request.policy.max_weekly_memory_mib_seconds > MAX_WEEKLY_MEMORY_MIB_SECONDS {
+        return Err(ApiError::BadRequest(
+            "weekly memory limit exceeds the provider safety maximum".into(),
         ));
     }
     let resource_name = resource_name(service_instance_id);
@@ -877,7 +1011,7 @@ mod tests {
     use super::{
         ApiError, EXEC_SHELL_SCRIPT, FlashService, ProviderClaims, TerminalControl,
         container_summary, pod_belongs_to_service, pod_can_exec, requester_user_id,
-        validate_command, validate_gpu_admin_claims, validate_resource_access,
+        validate_admin_claims, validate_command, validate_resource_access,
     };
 
     fn access_fixture() -> Result<(ProviderClaims, FlashService), serde_json::Error> {
@@ -921,10 +1055,10 @@ mod tests {
         claims.project_id = Uuid::nil();
         claims.service_instance_id = Uuid::nil();
         claims.generation = 1;
-        assert!(validate_gpu_admin_claims(&claims).is_ok());
+        assert!(validate_admin_claims(&claims).is_ok());
         claims.subject = Uuid::from_u128(1);
         assert!(matches!(
-            validate_gpu_admin_claims(&claims),
+            validate_admin_claims(&claims),
             Err(ApiError::Forbidden)
         ));
         Ok(())
@@ -1018,6 +1152,79 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn usage_listing_keeps_deleted_service_counters_and_merges_live_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MONDAY: i64 = 4 * 24 * 60 * 60;
+        let (_, live_service) = access_fixture()?;
+        let live_id = live_service.spec.service_instance_id.clone();
+        let organization_id = live_service.spec.organization_id.clone();
+        let project_id = live_service.spec.project_id.clone();
+        let deleted_id = Uuid::from_u128(8);
+        let records = vec![
+            serde_json::from_value::<heterocloud_flash::crd::FlashUsageRecord>(json!({
+                "metadata": {"name": format!("flash-{live_id}")},
+                "spec": {
+                    "service_instance_id": live_id,
+                    "organization_id": organization_id,
+                    "project_id": project_id,
+                    "display_name": "live",
+                    "cpu_millis": 500,
+                    "memory_mib": 256,
+                    "gpu_count": 0,
+                    "usage": {
+                        "week_started_at": MONDAY,
+                        "cpu_millicore_seconds": 1000,
+                        "memory_mib_seconds": 2000,
+                        "gpu_seconds": 0,
+                        "last_metered_at": MONDAY + 100,
+                        "max_cpu_millicore_seconds": 10_000,
+                        "max_memory_mib_seconds": 20_000,
+                        "max_gpu_seconds": 30_000
+                    }
+                }
+            }))?,
+            serde_json::from_value::<heterocloud_flash::crd::FlashUsageRecord>(json!({
+                "metadata": {"name": format!("flash-{deleted_id}")},
+                "spec": {
+                    "service_instance_id": deleted_id,
+                    "organization_id": organization_id,
+                    "project_id": project_id,
+                    "display_name": "deleted",
+                    "cpu_millis": 250,
+                    "memory_mib": 128,
+                    "gpu_count": 0,
+                    "usage": {
+                        "week_started_at": MONDAY,
+                        "cpu_millicore_seconds": 3000,
+                        "memory_mib_seconds": 4000,
+                        "gpu_seconds": 0,
+                        "last_metered_at": MONDAY + 90,
+                        "max_cpu_millicore_seconds": 10_000,
+                        "max_memory_mib_seconds": 20_000,
+                        "max_gpu_seconds": 30_000
+                    }
+                }
+            }))?,
+        ];
+
+        let items = super::usage_items(vec![live_service], records, MONDAY + 120)?;
+        let live = items
+            .iter()
+            .find(|item| item.service_instance_id.to_string() == live_id)
+            .ok_or("live usage")?;
+        assert!(live.active);
+        assert_eq!(live.weekly_usage.cpu_millicore_seconds, 1_000);
+        let deleted = items
+            .iter()
+            .find(|item| item.service_instance_id == deleted_id)
+            .ok_or("deleted usage")?;
+        assert!(!deleted.active);
+        assert_eq!(deleted.ready_replicas, 0);
+        assert_eq!(deleted.weekly_usage.cpu_millicore_seconds, 3_000);
+        Ok(())
+    }
+
     async fn signed_status_request(
         mut claims: ProviderClaims,
         resource: Option<FlashService>,
@@ -1085,6 +1292,7 @@ mod tests {
         );
         let app = super::app_router(Arc::new(super::AppState {
             services: Api::namespaced(client.clone(), "test"),
+            usage_records: Api::namespaced(client.clone(), "test"),
             gpu_devices: Api::all(client.clone()),
             pods: Api::namespaced(client, "test"),
             authenticator,

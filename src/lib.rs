@@ -11,6 +11,7 @@ pub const PROVIDER_DELETE_ACTION: &str = "service-instance.delete";
 pub const PROVIDER_LIST_CONTAINERS_ACTION: &str = "flash.containers.list";
 pub const PROVIDER_EXEC_ACTION: &str = "flash.exec";
 pub const PROVIDER_STATUS_GET_ACTION: &str = "flash.status.get";
+pub const PROVIDER_USAGE_LIST_ACTION: &str = "flash.usage.list";
 pub const PROVIDER_GPU_TYPES_LIST_ACTION: &str = "flash.gpu-types.list";
 pub const PROVIDER_GPU_CATALOG_LIST_ACTION: &str = "flash.gpus.catalog.list";
 pub const PROVIDER_GPU_ACCESS_UPDATE_ACTION: &str = "flash.gpus.access.update";

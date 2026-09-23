@@ -83,9 +83,9 @@ Job deletion releases its reservation through a finalizer. Lost leases return
 the job to the queue.
 
 Cold or weekly-quota-suspended services release their job and run zero Pods. A
-cold-start request recreates the job. A zero remaining weekly limit is rejected
-before placement. Existing Flash usage metering remains the source of the quota
-value copied into a job.
+cold-start request recreates the job. A zero remaining weekly GPU limit is
+rejected before placement. The shared weekly CPU, memory, and GPU allocation
+meter remains the source of the GPU quota value copied into a job.
 
 The Pod requests and limits `nvidia.com/gpu: 1`, uses the `nvidia`
 RuntimeClass, and has required node affinity for the selected node and GPU type.

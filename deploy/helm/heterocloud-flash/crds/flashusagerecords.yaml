@@ -1,0 +1,113 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: flashusagerecords.flash.heterocloud.io
+spec:
+  group: flash.heterocloud.io
+  names:
+    categories: []
+    kind: FlashUsageRecord
+    plural: flashusagerecords
+    shortNames:
+    - flashusage
+    singular: flashusagerecord
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FlashUsageRecordSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Durable service-level allocation meter. It intentionally has no owner
+              reference so deleting a FlashService cannot erase usage already consumed in
+              the current week.
+            properties:
+              cpu_millis:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              display_name:
+                type: string
+              gpu_count:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              memory_mib:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              organization_id:
+                type: string
+              project_id:
+                type: string
+              service_instance_id:
+                type: string
+              usage:
+                properties:
+                  cpu_millicore_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  gpu_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  last_metered_at:
+                    format: int64
+                    type: integer
+                  max_cpu_millicore_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  max_gpu_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  max_memory_mib_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  memory_mib_seconds:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  week_started_at:
+                    format: int64
+                    type: integer
+                required:
+                - cpu_millicore_seconds
+                - gpu_seconds
+                - last_metered_at
+                - max_cpu_millicore_seconds
+                - max_gpu_seconds
+                - max_memory_mib_seconds
+                - memory_mib_seconds
+                - week_started_at
+                type: object
+            required:
+            - cpu_millis
+            - display_name
+            - gpu_count
+            - memory_mib
+            - organization_id
+            - project_id
+            - service_instance_id
+            - usage
+            type: object
+            x-kubernetes-validations:
+            - message: service_instance_id must be a canonical UUID
+              rule: self.service_instance_id.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+            - message: organization_id must be a canonical UUID
+              rule: self.organization_id.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+            - message: project_id must be a canonical UUID
+              rule: self.project_id.matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+        required:
+        - spec
+        title: FlashUsageRecord
+        type: object
+    served: true
+    storage: true
+    subresources: {}
