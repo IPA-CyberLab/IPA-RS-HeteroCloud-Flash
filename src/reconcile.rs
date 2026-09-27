@@ -1093,7 +1093,7 @@ fn desired_deployment(
             );
             pod_annotations.insert(
                 format!("vault.hashicorp.com/agent-inject-perms-{file_name}"),
-                "0400".to_owned(),
+                "0444".to_owned(),
             );
         }
     }
@@ -2685,6 +2685,10 @@ mod tests {
         assert_eq!(
             deployment["spec"]["template"]["metadata"]["annotations"]["vault.hashicorp.com/agent-inject-secret-database-url"],
             "secret/data/flash/flash-00000000000000000000000000000001/database-url"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["metadata"]["annotations"]["vault.hashicorp.com/agent-inject-perms-database-url"],
+            "0444"
         );
         assert!(!deployment.to_string().contains("secret-value-marker"));
         let network = "163.220.236.61/32".parse()?;
