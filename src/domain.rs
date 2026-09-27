@@ -12,6 +12,7 @@ use thiserror::Error;
 pub const MAX_REPLICAS: u32 = 100_000;
 pub const MAX_PORTS: usize = 16;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 128;
+pub const MAX_SECRET_FILES: usize = 32;
 pub const MAX_SOURCE_CIDRS: usize = 64;
 pub const MAX_EFFECTIVE_SOURCE_CIDRS: usize = 4_096;
 pub const MAX_CPU_MILLIS: u32 = 100_000_000;
@@ -72,6 +73,8 @@ pub struct FlashSpec {
     pub egress: FlashEgress,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_files: BTreeMap<String, String>,
     #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
@@ -213,6 +216,15 @@ impl FlashSpec {
                     "environment variable {name:?} exceeds 32768 characters"
                 )));
             }
+        }
+        if self.secret_files.len() > MAX_SECRET_FILES {
+            return Err(ValidationError::Field(format!(
+                "secret_files must contain at most {MAX_SECRET_FILES} entries"
+            )));
+        }
+        for (file_name, secret_name) in &self.secret_files {
+            validate_dns_label("secret file name", file_name)?;
+            validate_dns_label("secret name", secret_name)?;
         }
         validate_string_list("command", &self.command, 128)?;
         validate_string_list("args", &self.args, 256)?;
@@ -724,6 +736,7 @@ mod tests {
             },
             egress: FlashEgress::default(),
             env: BTreeMap::new(),
+            secret_files: BTreeMap::new(),
             command: Vec::new(),
             args: Vec::new(),
             metadata: BTreeMap::new(),

@@ -89,6 +89,7 @@ networkPolicy:
   # is enabled. RFC1918, CGNAT, loopback and link-local ranges are protected
   # by the provider itself; add deployment-specific public infrastructure here.
   additionalProtectedCidrs: []
+  secretManagerCidrs: []
   dnsCidrs:
     - 10.96.0.10/32
 

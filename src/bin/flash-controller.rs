@@ -47,6 +47,7 @@ async fn run() -> Result<()> {
     validate_admin_volume_mounts(&admin_volume_mounts)?;
     let additional_protected_networks = network_cidrs("FLASH_ADDITIONAL_PROTECTED_CIDRS_JSON")?;
     let dns_networks = network_cidrs("FLASH_DNS_CIDRS_JSON")?;
+    let secret_manager_networks = network_cidrs("FLASH_SECRET_MANAGER_CIDRS_JSON")?;
     if dns_networks.is_empty() {
         anyhow::bail!("FLASH_DNS_CIDRS_JSON must contain at least one DNS service address");
     }
@@ -99,6 +100,7 @@ async fn run() -> Result<()> {
             admin_volume_mounts,
             additional_protected_networks,
             dns_networks,
+            secret_manager_networks,
             public_domain,
             activator_namespace,
             activator_service,

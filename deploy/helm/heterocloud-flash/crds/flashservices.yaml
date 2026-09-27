@@ -262,6 +262,10 @@ spec:
                     format: uint32
                     minimum: 0.0
                     type: integer
+                  secret_files:
+                    additionalProperties:
+                      type: string
+                    type: object
                 required:
                 - cpu_millis
                 - exposure

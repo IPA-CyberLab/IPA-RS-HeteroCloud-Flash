@@ -12,7 +12,7 @@ use k8s_openapi::{
     api::{
         apps::v1::Deployment,
         autoscaling::v2::HorizontalPodAutoscaler,
-        core::v1::{Node, PersistentVolumeClaim, Pod, Service},
+        core::v1::{Node, PersistentVolumeClaim, Pod, Service, ServiceAccount},
         networking::v1::NetworkPolicy,
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
@@ -153,6 +153,7 @@ pub struct ControllerContext {
     admin_volume_mounts: AdminVolumeMounts,
     additional_protected_networks: Vec<IpNet>,
     dns_networks: Vec<IpNet>,
+    secret_manager_networks: Vec<IpNet>,
     public_domain: Option<String>,
     activator_namespace: String,
     activator_service: String,
@@ -166,6 +167,7 @@ pub struct ControllerConfig {
     pub admin_volume_mounts: AdminVolumeMounts,
     pub additional_protected_networks: Vec<IpNet>,
     pub dns_networks: Vec<IpNet>,
+    pub secret_manager_networks: Vec<IpNet>,
     pub public_domain: Option<String>,
     pub activator_namespace: String,
     pub activator_service: String,
@@ -184,6 +186,7 @@ impl ControllerContext {
             admin_volume_mounts: config.admin_volume_mounts,
             additional_protected_networks: config.additional_protected_networks,
             dns_networks: config.dns_networks,
+            secret_manager_networks: config.secret_manager_networks,
             public_domain: config.public_domain,
             activator_namespace: config.activator_namespace,
             activator_service: config.activator_service,
@@ -202,6 +205,7 @@ pub async fn run_controller(
     let gpu_jobs = Api::<FlashGpuJob>::namespaced(client.clone(), &namespace);
     let deployments = Api::<Deployment>::namespaced(client.clone(), &namespace);
     let network_services = Api::<Service>::namespaced(client.clone(), &namespace);
+    let service_accounts = Api::<ServiceAccount>::namespaced(client.clone(), &namespace);
     let network_policies = Api::<NetworkPolicy>::namespaced(client.clone(), &namespace);
     let persistent_volume_claims =
         Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace);
@@ -219,6 +223,7 @@ pub async fn run_controller(
             .owns(autoscalers, watcher::Config::default())
             .owns(http_routes, watcher::Config::default())
             .owns(network_services, watcher::Config::default())
+            .owns(service_accounts, watcher::Config::default())
             .owns(network_policies, watcher::Config::default())
             .owns(persistent_volume_claims, watcher::Config::default())
             .owns(gpu_jobs, watcher::Config::default())
@@ -771,6 +776,8 @@ async fn reconcile(
         Api::<NetworkPolicy>::namespaced(context.client.clone(), &context.namespace);
     let persistent_volume_claims =
         Api::<PersistentVolumeClaim>::namespaced(context.client.clone(), &context.namespace);
+    let service_accounts =
+        Api::<ServiceAccount>::namespaced(context.client.clone(), &context.namespace);
     let params = PatchParams::apply(FIELD_MANAGER).force();
     let current_network_service = network_services.get_opt(&name).await?;
     let forwarded_ingress_networks = if flash.spec.workload.exposure.kind == ExposureType::Public
@@ -784,11 +791,14 @@ async fn reconcile(
     let network_policy = desired_network_policy_with_networks(
         &flash,
         &owner,
-        &context.additional_protected_networks,
-        &context.dns_networks,
-        &forwarded_ingress_networks,
-        &context.activator_namespace,
-        is_scale_to_zero(&flash),
+        NetworkPolicyOptions {
+            additional_protected_networks: &context.additional_protected_networks,
+            dns_networks: &context.dns_networks,
+            secret_manager_networks: &context.secret_manager_networks,
+            forwarded_ingress_networks: &forwarded_ingress_networks,
+            activator_namespace: &context.activator_namespace,
+            allow_activator: is_scale_to_zero(&flash),
+        },
     )?;
 
     if let Some(persistent_volume_claim) = &persistent_volume_claim {
@@ -798,6 +808,22 @@ async fn reconcile(
                 &params,
                 &Patch::Apply(persistent_volume_claim),
             )
+            .await?;
+    }
+    let secret_account_name = flash_secret_service_account_name(&flash)?;
+    if flash.spec.workload.secret_files.is_empty() {
+        match service_accounts
+            .delete(&secret_account_name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(response)) if response.code == 404 => {}
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        let account = desired_secret_service_account(&flash, &owner)?;
+        service_accounts
+            .patch(&secret_account_name, &params, &Patch::Apply(&account))
             .await?;
     }
     network_policies
@@ -1007,6 +1033,28 @@ struct DeploymentOptions<'a> {
     gpu_assignment: Option<&'a FlashGpuAssignment>,
 }
 
+fn flash_secret_service_account_name(flash: &FlashService) -> Result<String, ReconcileError> {
+    let id = Uuid::parse_str(&flash.spec.service_instance_id)
+        .map_err(|_| ReconcileError::InvalidServiceId)?;
+    Ok(format!("flash-{}", id.simple()))
+}
+
+fn desired_secret_service_account(
+    flash: &FlashService,
+    owner: &OwnerReference,
+) -> Result<ServiceAccount, ReconcileError> {
+    from_value(json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": flash_secret_service_account_name(flash)?,
+            "labels": base_labels(flash),
+            "ownerReferences": [owner],
+        },
+        "automountServiceAccountToken": false,
+    }))
+}
+
 fn desired_deployment(
     flash: &FlashService,
     owner: &OwnerReference,
@@ -1016,6 +1064,39 @@ fn desired_deployment(
 ) -> Result<Deployment, ReconcileError> {
     let name = flash.name_any();
     let workload = &flash.spec.workload;
+    let secret_account_name = flash_secret_service_account_name(flash)?;
+    let mut pod_annotations = BTreeMap::new();
+    if !workload.secret_files.is_empty() {
+        pod_annotations.insert(
+            "vault.hashicorp.com/agent-inject".to_owned(),
+            "true".to_owned(),
+        );
+        pod_annotations.insert(
+            "vault.hashicorp.com/role".to_owned(),
+            "heterosecrets-flash-workload".to_owned(),
+        );
+        pod_annotations.insert(
+            "vault.hashicorp.com/agent-inject-containers".to_owned(),
+            "workload".to_owned(),
+        );
+        for (file_name, secret_name) in &workload.secret_files {
+            let path = format!("secret/data/flash/{secret_account_name}/{secret_name}");
+            pod_annotations.insert(
+                format!("vault.hashicorp.com/agent-inject-secret-{file_name}"),
+                path.clone(),
+            );
+            pod_annotations.insert(
+                format!("vault.hashicorp.com/agent-inject-template-{file_name}"),
+                format!(
+                    "{{{{- with secret \"{path}\" -}}}}{{{{ .Data.data.value }}}}{{{{- end -}}}}"
+                ),
+            );
+            pod_annotations.insert(
+                format!("vault.hashicorp.com/agent-inject-perms-{file_name}"),
+                "0400".to_owned(),
+            );
+        }
+    }
     let mut labels = base_labels(flash);
     labels.insert(
         GENERATION_LABEL.into(),
@@ -1118,6 +1199,10 @@ fn desired_deployment(
         }],
         "containers": [container]
     });
+    if !workload.secret_files.is_empty() {
+        pod_spec["serviceAccountName"] = json!(secret_account_name);
+        pod_spec["automountServiceAccountToken"] = json!(true);
+    }
     if workload.effective_gpu_count() > 0 {
         pod_spec["nodeSelector"] = json!({(GPU_READY_LABEL): "true"});
         if let Some(assignment) = options.gpu_assignment {
@@ -1163,6 +1248,10 @@ fn desired_deployment(
             "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}
         })
     };
+    let mut template_metadata = json!({"labels": labels});
+    if !pod_annotations.is_empty() {
+        template_metadata["annotations"] = json!(pod_annotations);
+    }
     from_value(json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -1176,7 +1265,7 @@ fn desired_deployment(
             "strategy": strategy,
             "selector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}},
             "template": {
-                "metadata": {"labels": labels},
+                "metadata": template_metadata,
                 "spec": pod_spec
             }
         }
@@ -1856,18 +1945,42 @@ fn desired_network_policy(
     flash: &FlashService,
     owner: &OwnerReference,
 ) -> Result<NetworkPolicy, ReconcileError> {
-    desired_network_policy_with_networks(flash, owner, &[], &[], &[], "heterocloud-flash", false)
+    desired_network_policy_with_networks(
+        flash,
+        owner,
+        NetworkPolicyOptions {
+            additional_protected_networks: &[],
+            dns_networks: &[],
+            secret_manager_networks: &[],
+            forwarded_ingress_networks: &[],
+            activator_namespace: "heterocloud-flash",
+            allow_activator: false,
+        },
+    )
+}
+
+struct NetworkPolicyOptions<'a> {
+    additional_protected_networks: &'a [IpNet],
+    dns_networks: &'a [IpNet],
+    secret_manager_networks: &'a [IpNet],
+    forwarded_ingress_networks: &'a [IpNet],
+    activator_namespace: &'a str,
+    allow_activator: bool,
 }
 
 fn desired_network_policy_with_networks(
     flash: &FlashService,
     owner: &OwnerReference,
-    additional_protected_networks: &[IpNet],
-    dns_networks: &[IpNet],
-    forwarded_ingress_networks: &[IpNet],
-    activator_namespace: &str,
-    allow_activator: bool,
+    options: NetworkPolicyOptions<'_>,
 ) -> Result<NetworkPolicy, ReconcileError> {
+    let NetworkPolicyOptions {
+        additional_protected_networks,
+        dns_networks,
+        secret_manager_networks,
+        forwarded_ingress_networks,
+        activator_namespace,
+        allow_activator,
+    } = options;
     let exposure = &flash.spec.workload.exposure;
     let mut seen_ports = BTreeSet::new();
     let ports = flash
@@ -1965,6 +2078,17 @@ fn desired_network_policy_with_networks(
             {"protocol": "TCP", "port": 53}
         ],
     }));
+    if !flash.spec.workload.secret_files.is_empty() {
+        if secret_manager_networks.is_empty() {
+            return Err(ReconcileError::MissingSecretManagerNetwork);
+        }
+        egress.push(json!({
+            "to": secret_manager_networks.iter().map(|network| json!({
+                "ipBlock": {"cidr": network.to_string()}
+            })).collect::<Vec<_>>(),
+            "ports": [{"protocol": "TCP", "port": 443}]
+        }));
+    }
     if flash.spec.workload.egress.allow_same_organization {
         egress.push(json!({
             "to": [{
@@ -2208,6 +2332,10 @@ impl TrafficMode {
 pub enum ReconcileError {
     #[error("FlashService is missing a controller owner reference")]
     MissingOwnerReference,
+    #[error("FlashService has an invalid service instance ID")]
+    InvalidServiceId,
+    #[error("Flash secret files require configured Secret Manager gateway CIDRs")]
+    MissingSecretManagerNetwork,
     #[error("replica count cannot be represented by Kubernetes")]
     InvalidReplicaCount,
     #[error("disk budget cannot be represented in bytes")]
@@ -2232,8 +2360,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AdminVolumeMount, DeploymentOptions, desired_deployment, desired_network_policy,
-        desired_network_policy_with_networks, desired_persistent_volume_claim, desired_service,
+        AdminVolumeMount, DeploymentOptions, NetworkPolicyOptions, desired_deployment,
+        desired_network_policy, desired_network_policy_with_networks,
+        desired_persistent_volume_claim, desired_secret_service_account, desired_service,
         gpu_job_state, projected_weekly_usage, status_patch, storage_allocation,
         update_workload_status, validate_admin_volume_mounts, workload_failure_message,
         workload_restart_message,
@@ -2399,6 +2528,7 @@ mod tests {
                     },
                     egress: FlashEgress::default(),
                     env: BTreeMap::new(),
+                    secret_files: BTreeMap::new(),
                     command: Vec::new(),
                     args: Vec::new(),
                     metadata: BTreeMap::new(),
@@ -2521,6 +2651,65 @@ mod tests {
     fn exposed_service(flash: &FlashService) -> Result<Service, Box<dyn std::error::Error>> {
         desired_service(flash, &owner())?
             .ok_or_else(|| std::io::Error::other("expected a Kubernetes Service").into())
+    }
+
+    #[test]
+    fn secret_injection_uses_service_identity_and_no_plaintext()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash
+            .spec
+            .workload
+            .secret_files
+            .insert("database-url".into(), "database-url".into());
+        let account = serde_json::to_value(desired_secret_service_account(&flash, &owner())?)?;
+        assert_eq!(
+            account["metadata"]["name"],
+            "flash-00000000000000000000000000000001"
+        );
+        let deployment = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "example.invalid/udp@sha256:verified",
+            10 * 1024 * 1024 * 1024 - 600,
+            DeploymentOptions::default(),
+        )?)?;
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["serviceAccountName"],
+            account["metadata"]["name"]
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["automountServiceAccountToken"],
+            true
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["metadata"]["annotations"]["vault.hashicorp.com/agent-inject-secret-database-url"],
+            "secret/data/flash/flash-00000000000000000000000000000001/database-url"
+        );
+        assert!(!deployment.to_string().contains("secret-value-marker"));
+        let network = "163.220.236.61/32".parse()?;
+        let policy = serde_json::to_value(desired_network_policy_with_networks(
+            &flash,
+            &owner(),
+            NetworkPolicyOptions {
+                additional_protected_networks: &[],
+                dns_networks: &[],
+                secret_manager_networks: &[network],
+                forwarded_ingress_networks: &[],
+                activator_namespace: "heterocloud-flash",
+                allow_activator: false,
+            },
+        )?)?;
+        assert!(
+            policy["spec"]["egress"]
+                .as_array()
+                .is_some_and(
+                    |rules| rules.iter().any(|rule| rule["to"][0]["ipBlock"]["cidr"]
+                        == "163.220.236.61/32"
+                        && rule["ports"][0]["port"] == 443)
+                )
+        );
+        Ok(())
     }
 
     #[test]
@@ -3691,11 +3880,14 @@ mod tests {
         let policy = serde_json::to_value(desired_network_policy_with_networks(
             &flash,
             &owner(),
-            &[],
-            &[],
-            &["10.244.2.0/32".parse()?],
-            "heterocloud-flash",
-            false,
+            NetworkPolicyOptions {
+                additional_protected_networks: &[],
+                dns_networks: &[],
+                secret_manager_networks: &[],
+                forwarded_ingress_networks: &["10.244.2.0/32".parse()?],
+                activator_namespace: "heterocloud-flash",
+                allow_activator: false,
+            },
         )?)?;
         assert_eq!(
             policy.pointer("/spec/ingress/0/from/2/ipBlock/cidr"),
