@@ -59,6 +59,8 @@ pub const LAST_ACTIVITY_ANNOTATION: &str = "flash.heterocloud.io/last-activity-a
 const ASSIGNED_NODES_ANNOTATION: &str = "networking.heteronetwork.io/assigned-nodes";
 const PERSISTENT_HOME_VOLUME: &str = "persistent-home";
 const PERSISTENT_HOME_MOUNT_PATH: &str = "/root";
+const SECRET_HELPER_VOLUME: &str = "flash-secret-launcher";
+const SECRET_HELPER_MOUNT: &str = "/run/flash-helper";
 const MIB_BYTES: u64 = 1024 * 1024;
 const MIN_PERSISTENT_STORAGE_BYTES: u64 = 64 * MIB_BYTES;
 const MIN_ROOTFS_STORAGE_BYTES: u64 = 64 * MIB_BYTES;
@@ -148,6 +150,7 @@ pub struct ControllerContext {
     client: Client,
     namespace: String,
     image_inspector: ImageInspector,
+    helper_image: String,
     registry_pull_secret: Option<String>,
     persistent_storage_class: Option<String>,
     admin_volume_mounts: AdminVolumeMounts,
@@ -162,6 +165,7 @@ pub struct ControllerContext {
 
 pub struct ControllerConfig {
     pub namespace: String,
+    pub helper_image: String,
     pub registry_pull_secret: Option<String>,
     pub persistent_storage_class: Option<String>,
     pub admin_volume_mounts: AdminVolumeMounts,
@@ -180,6 +184,7 @@ impl ControllerContext {
         Self {
             client,
             image_inspector,
+            helper_image: config.helper_image,
             namespace: config.namespace,
             registry_pull_secret: config.registry_pull_secret,
             persistent_storage_class: config.persistent_storage_class,
@@ -744,6 +749,10 @@ async fn reconcile(
         &inspection.resolved_image,
         storage.rootfs_bytes,
         DeploymentOptions {
+            image_entrypoint: &inspection.image_entrypoint,
+            image_cmd: &inspection.image_cmd,
+            image_architecture: Some(&inspection.architecture),
+            helper_image: Some(&context.helper_image),
             persistent_volume_claim: persistent_volume_claim
                 .as_ref()
                 .and_then(|claim| claim.metadata.name.as_deref()),
@@ -811,7 +820,7 @@ async fn reconcile(
             .await?;
     }
     let secret_account_name = flash_secret_service_account_name(&flash)?;
-    if flash.spec.workload.secret_files.is_empty() {
+    if flash.spec.workload.secret_env.is_empty() && flash.spec.workload.secret_files.is_empty() {
         match service_accounts
             .delete(&secret_account_name, &DeleteParams::default())
             .await
@@ -896,6 +905,9 @@ async fn reconcile(
         resolved_image: Some(inspection.resolved_image),
         image_size_bytes: Some(inspection.image_size_bytes),
         writable_storage_bytes: Some(inspection.writable_storage_bytes),
+        image_entrypoint: Some(inspection.image_entrypoint),
+        image_cmd: Some(inspection.image_cmd),
+        image_architecture: Some(inspection.architecture),
         cold,
         gpu_scheduling: gpu_scheduling_status(&flash, gpu_job_state.as_ref()),
         ..FlashServiceStatus::default()
@@ -999,6 +1011,9 @@ fn status_patch(flash: &FlashService, status: &FlashServiceStatus) -> Value {
     patch["status"]["resolved_image"] = json!(status.resolved_image);
     patch["status"]["image_size_bytes"] = json!(status.image_size_bytes);
     patch["status"]["writable_storage_bytes"] = json!(status.writable_storage_bytes);
+    patch["status"]["image_entrypoint"] = json!(status.image_entrypoint);
+    patch["status"]["image_cmd"] = json!(status.image_cmd);
+    patch["status"]["image_architecture"] = json!(status.image_architecture);
     patch["status"]["gpu_weekly_usage"] = json!(status.gpu_weekly_usage);
     patch["status"]["weekly_usage"] = json!(status.weekly_usage);
     patch["status"]["gpu_scheduling"] = json!(status.gpu_scheduling);
@@ -1027,6 +1042,10 @@ async fn patch_status_if_changed(
 
 #[derive(Default)]
 struct DeploymentOptions<'a> {
+    image_entrypoint: &'a [String],
+    image_cmd: &'a [String],
+    image_architecture: Option<&'a str>,
+    helper_image: Option<&'a str>,
     persistent_volume_claim: Option<&'a str>,
     registry_pull_secret: Option<&'a str>,
     admin_volume_mounts: &'a [AdminVolumeMount],
@@ -1064,11 +1083,16 @@ fn desired_deployment(
 ) -> Result<Deployment, ReconcileError> {
     let name = flash.name_any();
     let workload = &flash.spec.workload;
+    let secret_env = workload.effective_secret_env()?;
     let secret_account_name = flash_secret_service_account_name(flash)?;
     let mut pod_annotations = BTreeMap::new();
-    if !workload.secret_files.is_empty() {
+    if !secret_env.is_empty() {
         pod_annotations.insert(
             "vault.hashicorp.com/agent-inject".to_owned(),
+            "true".to_owned(),
+        );
+        pod_annotations.insert(
+            "vault.hashicorp.com/agent-pre-populate-only".to_owned(),
             "true".to_owned(),
         );
         pod_annotations.insert(
@@ -1079,21 +1103,21 @@ fn desired_deployment(
             "vault.hashicorp.com/agent-inject-containers".to_owned(),
             "workload".to_owned(),
         );
-        for (file_name, secret_name) in &workload.secret_files {
+        for secret_name in secret_env.values().collect::<BTreeSet<_>>() {
             let path = format!("secret/data/flash/{secret_account_name}/{secret_name}");
             pod_annotations.insert(
-                format!("vault.hashicorp.com/agent-inject-secret-{file_name}"),
+                format!("vault.hashicorp.com/agent-inject-secret-{secret_name}"),
                 path.clone(),
             );
             pod_annotations.insert(
-                format!("vault.hashicorp.com/agent-inject-template-{file_name}"),
+                format!("vault.hashicorp.com/agent-inject-template-{secret_name}"),
                 format!(
                     "{{{{- with secret \"{path}\" -}}}}{{{{ .Data.data.value }}}}{{{{- end -}}}}"
                 ),
             );
             pod_annotations.insert(
-                format!("vault.hashicorp.com/agent-inject-perms-{file_name}"),
-                "0444".to_owned(),
+                format!("vault.hashicorp.com/agent-inject-perms-{secret_name}"),
+                "0400".to_owned(),
             );
         }
     }
@@ -1163,7 +1187,42 @@ fn desired_deployment(
     if !workload.args.is_empty() {
         container["args"] = json!(workload.args);
     }
+    if !secret_env.is_empty() {
+        let mut original_command = if workload.command.is_empty() {
+            options.image_entrypoint.to_vec()
+        } else {
+            workload.command.clone()
+        };
+        original_command.extend(if workload.args.is_empty() {
+            options.image_cmd.to_vec()
+        } else {
+            workload.args.clone()
+        });
+        if original_command.first().is_none_or(String::is_empty) {
+            return Err(ReconcileError::MissingWorkloadCommand);
+        }
+        let mut launcher_args = secret_env
+            .iter()
+            .flat_map(|(env_name, secret_name)| {
+                [
+                    "--secret-env".to_owned(),
+                    format!("{env_name}={secret_name}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        launcher_args.push("--".to_owned());
+        launcher_args.extend(original_command);
+        container["command"] = json!([format!("{SECRET_HELPER_MOUNT}/launcher")]);
+        container["args"] = json!(launcher_args);
+    }
     let mut volume_mounts = Vec::new();
+    if !secret_env.is_empty() {
+        volume_mounts.push(json!({
+            "name": SECRET_HELPER_VOLUME,
+            "mountPath": SECRET_HELPER_MOUNT,
+            "readOnly": true,
+        }));
+    }
     if options.persistent_volume_claim.is_some() {
         volume_mounts.push(json!({
             "name": PERSISTENT_HOME_VOLUME,
@@ -1199,12 +1258,33 @@ fn desired_deployment(
         }],
         "containers": [container]
     });
-    if !workload.secret_files.is_empty() {
+    if !secret_env.is_empty() {
         pod_spec["serviceAccountName"] = json!(secret_account_name);
         pod_spec["automountServiceAccountToken"] = json!(true);
+        let helper_image = options
+            .helper_image
+            .ok_or(ReconcileError::MissingHelperImage)?;
+        pod_spec["initContainers"] = json!([{
+            "name": SECRET_HELPER_VOLUME,
+            "image": helper_image,
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["/bin/cp", "/usr/local/bin/flash-secret-env-launcher", format!("{SECRET_HELPER_MOUNT}/launcher")],
+            "volumeMounts": [{"name": SECRET_HELPER_VOLUME, "mountPath": SECRET_HELPER_MOUNT}],
+            "securityContext": {
+                "runAsUser": 0,
+                "runAsGroup": 0,
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": true,
+                "capabilities": {"drop": ["ALL"]},
+            },
+        }]);
+        let architecture = options
+            .image_architecture
+            .ok_or(ReconcileError::MissingImageArchitecture)?;
+        pod_spec["nodeSelector"] = json!({"kubernetes.io/arch": architecture});
     }
     if workload.effective_gpu_count() > 0 {
-        pod_spec["nodeSelector"] = json!({(GPU_READY_LABEL): "true"});
+        pod_spec["nodeSelector"][GPU_READY_LABEL] = json!("true");
         if let Some(assignment) = options.gpu_assignment {
             pod_spec["affinity"] = json!({
                 "nodeAffinity": {
@@ -1222,6 +1302,12 @@ fn desired_deployment(
         pod_spec["imagePullSecrets"] = json!([{"name": secret}]);
     }
     let mut volumes = Vec::new();
+    if !secret_env.is_empty() {
+        volumes.push(json!({
+            "name": SECRET_HELPER_VOLUME,
+            "emptyDir": {"medium": "Memory"},
+        }));
+    }
     if let Some(claim_name) = options.persistent_volume_claim {
         volumes.push(json!({
             "name": PERSISTENT_HOME_VOLUME,
@@ -1339,6 +1425,9 @@ fn cached_image_inspection(
     let resolved_image = status.resolved_image.clone()?;
     let image_size_bytes = status.image_size_bytes?;
     let writable_storage_bytes = status.writable_storage_bytes?;
+    let image_entrypoint = status.image_entrypoint.clone()?;
+    let image_cmd = status.image_cmd.clone()?;
+    let architecture = status.image_architecture.clone()?;
     let expected_writable = disk_budget_bytes.checked_sub(image_size_bytes)?;
     if image_size_bytes >= disk_budget_bytes || writable_storage_bytes != expected_writable {
         return None;
@@ -1347,6 +1436,9 @@ fn cached_image_inspection(
         resolved_image,
         image_size_bytes,
         writable_storage_bytes,
+        image_entrypoint,
+        image_cmd,
+        architecture,
     })
 }
 
@@ -2078,7 +2170,7 @@ fn desired_network_policy_with_networks(
             {"protocol": "TCP", "port": 53}
         ],
     }));
-    if !flash.spec.workload.secret_files.is_empty() {
+    if !flash.spec.workload.secret_env.is_empty() || !flash.spec.workload.secret_files.is_empty() {
         if secret_manager_networks.is_empty() {
             return Err(ReconcileError::MissingSecretManagerNetwork);
         }
@@ -2334,8 +2426,14 @@ pub enum ReconcileError {
     MissingOwnerReference,
     #[error("FlashService has an invalid service instance ID")]
     InvalidServiceId,
-    #[error("Flash secret files require configured Secret Manager gateway CIDRs")]
+    #[error("Flash secret environment variables require configured Secret Manager gateway CIDRs")]
     MissingSecretManagerNetwork,
+    #[error("Flash secret environment variables require a workload command")]
+    MissingWorkloadCommand,
+    #[error("Flash secret environment variables require a helper image")]
+    MissingHelperImage,
+    #[error("Flash secret environment variables require an inspected image architecture")]
+    MissingImageArchitecture,
     #[error("replica count cannot be represented by Kubernetes")]
     InvalidReplicaCount,
     #[error("disk budget cannot be represented in bytes")]
@@ -2528,6 +2626,7 @@ mod tests {
                     },
                     egress: FlashEgress::default(),
                     env: BTreeMap::new(),
+                    secret_env: BTreeMap::new(),
                     secret_files: BTreeMap::new(),
                     command: Vec::new(),
                     args: Vec::new(),
@@ -2654,14 +2753,14 @@ mod tests {
     }
 
     #[test]
-    fn secret_injection_uses_service_identity_and_no_plaintext()
+    fn secret_injection_uses_environment_and_service_identity_without_plaintext()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut flash = service(TrafficMode::Forwarded);
         flash
             .spec
             .workload
-            .secret_files
-            .insert("database-url".into(), "database-url".into());
+            .secret_env
+            .insert("DATABASE_URL".into(), "database-url".into());
         let account = serde_json::to_value(desired_secret_service_account(&flash, &owner())?)?;
         assert_eq!(
             account["metadata"]["name"],
@@ -2672,7 +2771,13 @@ mod tests {
             &owner(),
             "example.invalid/udp@sha256:verified",
             10 * 1024 * 1024 * 1024 - 600,
-            DeploymentOptions::default(),
+            DeploymentOptions {
+                image_entrypoint: &["/usr/local/bin/server".into()],
+                image_cmd: &["--listen".into()],
+                image_architecture: Some("amd64"),
+                helper_image: Some("example.invalid/flash-helper@sha256:verified"),
+                ..DeploymentOptions::default()
+            },
         )?)?;
         assert_eq!(
             deployment["spec"]["template"]["spec"]["serviceAccountName"],
@@ -2688,7 +2793,38 @@ mod tests {
         );
         assert_eq!(
             deployment["spec"]["template"]["metadata"]["annotations"]["vault.hashicorp.com/agent-inject-perms-database-url"],
-            "0444"
+            "0400"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["command"],
+            json!(["/run/flash-helper/launcher"])
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["args"],
+            json!([
+                "--secret-env",
+                "DATABASE_URL=database-url",
+                "--",
+                "/usr/local/bin/server",
+                "--listen"
+            ])
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["nodeSelector"]["kubernetes.io/arch"],
+            "amd64"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["initContainers"][0]["image"],
+            "example.invalid/flash-helper@sha256:verified"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["metadata"]["annotations"]["vault.hashicorp.com/agent-pre-populate-only"],
+            "true"
+        );
+        assert!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().all(|entry| entry["name"] != "DATABASE_URL"))
         );
         assert!(!deployment.to_string().contains("secret-value-marker"));
         let network = "163.220.236.61/32".parse()?;

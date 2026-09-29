@@ -327,6 +327,12 @@ pub struct FlashServiceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writable_storage_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_entrypoint: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_cmd: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_architecture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_weekly_usage: Option<FlashGpuWeeklyUsage>,
     #[serde(default)]
     pub gpu_quota_exhausted: bool,

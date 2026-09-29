@@ -262,9 +262,14 @@ spec:
                     format: uint32
                     minimum: 0.0
                     type: integer
+                  secret_env:
+                    additionalProperties:
+                      type: string
+                    type: object
                   secret_files:
                     additionalProperties:
                       type: string
+                    description: Legacy mappings are converted to environment variable names when read.
                     type: object
                 required:
                 - cpu_millis
@@ -379,6 +384,19 @@ spec:
                 - used_seconds
                 - week_started_at
                 type: object
+              image_architecture:
+                nullable: true
+                type: string
+              image_cmd:
+                items:
+                  type: string
+                nullable: true
+                type: array
+              image_entrypoint:
+                items:
+                  type: string
+                nullable: true
+                type: array
               image_size_bytes:
                 format: uint64
                 minimum: 0.0

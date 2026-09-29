@@ -12,7 +12,7 @@ use thiserror::Error;
 pub const MAX_REPLICAS: u32 = 100_000;
 pub const MAX_PORTS: usize = 16;
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 128;
-pub const MAX_SECRET_FILES: usize = 32;
+pub const MAX_SECRET_ENV: usize = 32;
 pub const MAX_SOURCE_CIDRS: usize = 64;
 pub const MAX_EFFECTIVE_SOURCE_CIDRS: usize = 4_096;
 pub const MAX_CPU_MILLIS: u32 = 100_000_000;
@@ -73,6 +73,9 @@ pub struct FlashSpec {
     pub egress: FlashEgress,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_env: BTreeMap<String, String>,
+    /// Legacy mappings are converted to environment variable names when read.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secret_files: BTreeMap<String, String>,
     #[serde(default)]
@@ -217,18 +220,44 @@ impl FlashSpec {
                 )));
             }
         }
-        if self.secret_files.len() > MAX_SECRET_FILES {
+        let secret_env = self.effective_secret_env()?;
+        if secret_env.len() > MAX_SECRET_ENV {
             return Err(ValidationError::Field(format!(
-                "secret_files must contain at most {MAX_SECRET_FILES} entries"
+                "secret_env must contain at most {MAX_SECRET_ENV} entries"
             )));
         }
         for (file_name, secret_name) in &self.secret_files {
             validate_dns_label("secret file name", file_name)?;
             validate_dns_label("secret name", secret_name)?;
         }
+        for (env_name, secret_name) in &secret_env {
+            validate_env_name(env_name)?;
+            validate_dns_label("secret name", secret_name)?;
+            if self.env.contains_key(env_name) {
+                return Err(ValidationError::Field(format!(
+                    "environment variable {env_name:?} is configured as both plain text and a secret"
+                )));
+            }
+        }
         validate_string_list("command", &self.command, 128)?;
         validate_string_list("args", &self.args, 256)?;
         Ok(())
+    }
+
+    pub fn effective_secret_env(&self) -> Result<BTreeMap<String, String>, ValidationError> {
+        let mut effective = self.secret_env.clone();
+        for (file_name, secret_name) in &self.secret_files {
+            let env_name = file_name.to_ascii_uppercase().replace('-', "_");
+            if effective
+                .insert(env_name.clone(), secret_name.clone())
+                .is_some()
+            {
+                return Err(ValidationError::Field(format!(
+                    "secret environment variable {env_name:?} is configured more than once"
+                )));
+            }
+        }
+        Ok(effective)
     }
 
     /// Effective per-VM GPU count. A typed request always means one GPU.
@@ -736,6 +765,7 @@ mod tests {
             },
             egress: FlashEgress::default(),
             env: BTreeMap::new(),
+            secret_env: BTreeMap::new(),
             secret_files: BTreeMap::new(),
             command: Vec::new(),
             args: Vec::new(),
@@ -746,6 +776,31 @@ mod tests {
     #[test]
     fn accepts_udp_service() {
         assert!(valid_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn secret_environment_names_are_validated_and_legacy_files_migrate() {
+        let mut spec = valid_spec();
+        spec.secret_env
+            .insert("DATABASE_URL".into(), "database-url".into());
+        assert!(spec.validate().is_ok());
+        assert_eq!(
+            spec.effective_secret_env()
+                .ok()
+                .and_then(|env| env.get("DATABASE_URL").cloned()),
+            Some("database-url".into())
+        );
+        spec.env.insert("DATABASE_URL".into(), "plain-text".into());
+        assert!(spec.validate().is_err());
+        spec.env.remove("DATABASE_URL");
+        spec.secret_files.insert("api-key".into(), "api-key".into());
+        assert!(spec.validate().is_ok());
+        assert_eq!(
+            spec.effective_secret_env()
+                .ok()
+                .and_then(|env| env.get("API_KEY").cloned()),
+            Some("api-key".into())
+        );
     }
 
     #[test]

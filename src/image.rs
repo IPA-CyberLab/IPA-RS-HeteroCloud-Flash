@@ -3,6 +3,7 @@ use std::time::Duration;
 use oci_client::{
     Client, Reference,
     client::ClientConfig,
+    config::ConfigFile,
     manifest::{OciImageManifest, OciManifest},
     secrets::RegistryAuth,
 };
@@ -15,6 +16,9 @@ pub struct ImageInspection {
     pub resolved_image: String,
     pub image_size_bytes: u64,
     pub writable_storage_bytes: u64,
+    pub image_entrypoint: Vec<String>,
+    pub image_cmd: Vec<String>,
+    pub architecture: String,
 }
 
 #[derive(Clone)]
@@ -115,11 +119,52 @@ impl ImageInspector {
             }
         };
         let writable_storage_bytes = writable_storage_bytes(image_size_bytes, disk_budget_bytes)?;
+        let resolved_reference = reference.clone_with_digest(digest);
+        let (selected_manifest, _) = self
+            .client
+            .pull_image_manifest(&resolved_reference, &auth)
+            .await
+            .map_err(|error| ImageInspectionError::Registry {
+                image: image.to_owned(),
+                reason: error.to_string(),
+            })?;
+        if selected_manifest.config.size < 0 || selected_manifest.config.size > 1_048_576 {
+            return Err(ImageInspectionError::InvalidImageConfig);
+        }
+        let mut config_bytes = Vec::new();
+        self.client
+            .pull_blob(
+                &resolved_reference,
+                &selected_manifest.config,
+                &mut config_bytes,
+            )
+            .await
+            .map_err(|error| ImageInspectionError::Registry {
+                image: image.to_owned(),
+                reason: error.to_string(),
+            })?;
+        let config: ConfigFile = serde_json::from_slice(&config_bytes)
+            .map_err(|_| ImageInspectionError::InvalidImageConfig)?;
+        if !config.os.to_string().eq_ignore_ascii_case("linux") {
+            return Err(ImageInspectionError::UnsupportedPlatform);
+        }
+        let (image_entrypoint, image_cmd) = config.config.map_or_else(
+            || (Vec::new(), Vec::new()),
+            |runtime| {
+                (
+                    runtime.entrypoint.unwrap_or_default(),
+                    runtime.cmd.unwrap_or_default(),
+                )
+            },
+        );
 
         Ok(ImageInspection {
-            resolved_image: reference.clone_with_digest(digest).to_string(),
+            resolved_image: resolved_reference.to_string(),
             image_size_bytes,
             writable_storage_bytes,
+            image_entrypoint,
+            image_cmd,
+            architecture: config.architecture.to_string(),
         })
     }
 
@@ -184,6 +229,10 @@ pub enum ImageInspectionError {
     NestedImageIndex { image: String },
     #[error("OCI descriptor {digest} has invalid size {size}")]
     InvalidDescriptorSize { digest: String, size: i64 },
+    #[error("OCI image configuration is invalid or too large")]
+    InvalidImageConfig,
+    #[error("OCI image is not a Linux image")]
+    UnsupportedPlatform,
     #[error("OCI image descriptor sizes overflow the supported range")]
     ImageSizeOverflow,
     #[error(

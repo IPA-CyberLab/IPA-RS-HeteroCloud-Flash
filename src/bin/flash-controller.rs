@@ -30,6 +30,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let namespace =
         env::var("FLASH_WORKLOAD_NAMESPACE").context("FLASH_WORKLOAD_NAMESPACE is required")?;
+    let helper_image = env::var("FLASH_HELPER_IMAGE").context("FLASH_HELPER_IMAGE is required")?;
     let registry_host = optional("FLASH_REGISTRY_HOST");
     let registry_username = optional("FLASH_REGISTRY_USERNAME");
     let registry_password_file = optional("FLASH_REGISTRY_PASSWORD_FILE");
@@ -95,6 +96,7 @@ async fn run() -> Result<()> {
         image_inspector,
         ControllerConfig {
             namespace,
+            helper_image,
             registry_pull_secret,
             persistent_storage_class,
             admin_volume_mounts,

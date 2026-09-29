@@ -38,6 +38,8 @@ spec:
               value: {{ .Values.publicDomain | quote }}
             - name: FLASH_WORKLOAD_NAMESPACE
               value: {{ .Values.workloadNamespace | quote }}
+            - name: FLASH_HELPER_IMAGE
+              value: {{ include "flash.image" . | quote }}
             - name: FLASH_ACTIVATOR_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: FLASH_ACTIVATOR_SERVICE
