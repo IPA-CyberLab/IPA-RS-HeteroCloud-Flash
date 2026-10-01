@@ -67,6 +67,11 @@ pub struct FlashSpec {
     #[serde(default = "default_ephemeral_storage_gib")]
     #[schemars(range(min = 1, max = 1_000_000))]
     pub ephemeral_storage_gib: u32,
+    /// Optional writable container filesystem allocation. The remainder of
+    /// the disk budget is assigned to the persistent /root volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1_000_000))]
+    pub rootfs_storage_gib: Option<u32>,
     pub ports: Vec<FlashPort>,
     pub exposure: FlashExposure,
     #[serde(default)]
@@ -167,6 +172,14 @@ impl FlashSpec {
             return Err(ValidationError::Field(format!(
                 "ephemeral_storage_gib must be between {MIN_EPHEMERAL_STORAGE_GIB} and {MAX_EPHEMERAL_STORAGE_GIB}"
             )));
+        }
+        if self
+            .rootfs_storage_gib
+            .is_some_and(|rootfs| rootfs == 0 || rootfs >= self.ephemeral_storage_gib)
+        {
+            return Err(ValidationError::Field(
+                "rootfs_storage_gib must be at least 1 and less than ephemeral_storage_gib".into(),
+            ));
         }
         if self.ports.len() > MAX_PORTS {
             return Err(ValidationError::Field(format!(
@@ -750,6 +763,7 @@ mod tests {
             gpu_type: None,
             gpu_count: 0,
             ephemeral_storage_gib: 10,
+            rootfs_storage_gib: None,
             ports: vec![FlashPort {
                 name: "game-udp".into(),
                 protocol: TransportProtocol::Udp,
@@ -982,10 +996,17 @@ mod tests {
             .remove("ephemeral_storage_gib");
         let defaulted = serde_json::from_value::<FlashSpec>(value)?;
         assert_eq!(defaulted.ephemeral_storage_gib, 10);
+        assert_eq!(defaulted.rootfs_storage_gib, None);
 
         let mut oversized = valid_spec();
         oversized.ephemeral_storage_gib = MAX_EPHEMERAL_STORAGE_GIB + 1;
         assert!(oversized.validate().is_err());
+        let mut split = valid_spec();
+        split.ephemeral_storage_gib = 30;
+        split.rootfs_storage_gib = Some(20);
+        assert!(split.validate().is_ok());
+        split.rootfs_storage_gib = Some(30);
+        assert!(split.validate().is_err());
         Ok(())
     }
 

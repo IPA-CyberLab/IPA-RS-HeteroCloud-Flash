@@ -735,6 +735,7 @@ async fn reconcile(
     let storage = storage_allocation(
         inspection.writable_storage_bytes,
         context.persistent_storage_class.is_some(),
+        flash.spec.workload.rootfs_storage_gib,
     )?;
     let persistent_volume_claim = context
         .persistent_storage_class
@@ -1367,10 +1368,22 @@ struct StorageAllocation {
 fn storage_allocation(
     writable_storage_bytes: u64,
     persistent: bool,
+    requested_rootfs_gib: Option<u32>,
 ) -> Result<StorageAllocation, ReconcileError> {
+    let requested_rootfs_bytes = requested_rootfs_gib
+        .map(|gib| {
+            u64::from(gib)
+                .checked_mul(GIB_BYTES)
+                .ok_or(ReconcileError::StorageBudgetOverflow)
+        })
+        .transpose()?;
     if !persistent {
+        let rootfs_bytes = requested_rootfs_bytes.unwrap_or(writable_storage_bytes);
+        if rootfs_bytes > writable_storage_bytes {
+            return Err(ReconcileError::InsufficientWritableStorage);
+        }
         return Ok(StorageAllocation {
-            rootfs_bytes: writable_storage_bytes,
+            rootfs_bytes,
             persistent_bytes: 0,
         });
     }
@@ -1380,9 +1393,16 @@ fn storage_allocation(
     if writable_storage_bytes < minimum {
         return Err(ReconcileError::InsufficientWritableStorage);
     }
-    let rootfs_bytes = (writable_storage_bytes / 10)
-        .clamp(MIN_ROOTFS_STORAGE_BYTES, MAX_ROOTFS_STORAGE_BYTES)
-        .min(writable_storage_bytes - MIN_PERSISTENT_STORAGE_BYTES);
+    let rootfs_bytes = requested_rootfs_bytes.unwrap_or_else(|| {
+        (writable_storage_bytes / 10)
+            .clamp(MIN_ROOTFS_STORAGE_BYTES, MAX_ROOTFS_STORAGE_BYTES)
+            .min(writable_storage_bytes - MIN_PERSISTENT_STORAGE_BYTES)
+    });
+    if rootfs_bytes < MIN_ROOTFS_STORAGE_BYTES
+        || rootfs_bytes > writable_storage_bytes - MIN_PERSISTENT_STORAGE_BYTES
+    {
+        return Err(ReconcileError::InsufficientWritableStorage);
+    }
     Ok(StorageAllocation {
         rootfs_bytes,
         persistent_bytes: writable_storage_bytes - rootfs_bytes,
@@ -2438,7 +2458,7 @@ pub enum ReconcileError {
     InvalidReplicaCount,
     #[error("disk budget cannot be represented in bytes")]
     StorageBudgetOverflow,
-    #[error("disk budget leaves less than 128 MiB for writable storage")]
+    #[error("disk budget cannot provide the requested container filesystem and persistent storage")]
     InsufficientWritableStorage,
     #[error(transparent)]
     Kubernetes(#[from] kube::Error),
@@ -2458,7 +2478,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AdminVolumeMount, DeploymentOptions, NetworkPolicyOptions, desired_deployment,
+        AdminVolumeMount, DeploymentOptions, GIB_BYTES, NetworkPolicyOptions, desired_deployment,
         desired_network_policy, desired_network_policy_with_networks,
         desired_persistent_volume_claim, desired_secret_service_account, desired_service,
         gpu_job_state, projected_weekly_usage, status_patch, storage_allocation,
@@ -2611,6 +2631,7 @@ mod tests {
                     gpu_type: None,
                     gpu_count: 0,
                     ephemeral_storage_gib: 10,
+                    rootfs_storage_gib: None,
                     ports: vec![FlashPort {
                         name: "game-udp".into(),
                         protocol: TransportProtocol::Udp,
@@ -3046,9 +3067,13 @@ mod tests {
     #[test]
     fn persistent_home_and_rootfs_share_the_writable_disk_budget()
     -> Result<(), Box<dyn std::error::Error>> {
-        let allocation = storage_allocation(10 * 1024 * 1024 * 1024, true)?;
+        let allocation = storage_allocation(10 * 1024 * 1024 * 1024, true, None)?;
         assert_eq!(allocation.rootfs_bytes, 1024 * 1024 * 1024);
         assert_eq!(allocation.persistent_bytes, 9 * 1024 * 1024 * 1024);
+        let build_allocation = storage_allocation(29 * GIB_BYTES, true, Some(20))?;
+        assert_eq!(build_allocation.rootfs_bytes, 20 * GIB_BYTES);
+        assert_eq!(build_allocation.persistent_bytes, 9 * GIB_BYTES);
+        assert!(storage_allocation(19 * GIB_BYTES, true, Some(20)).is_err());
 
         let flash = service(TrafficMode::Forwarded);
         let claim = desired_persistent_volume_claim(

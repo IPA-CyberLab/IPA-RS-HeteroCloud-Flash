@@ -262,6 +262,15 @@ spec:
                     format: uint32
                     minimum: 0.0
                     type: integer
+                  rootfs_storage_gib:
+                    description: |-
+                      Optional writable container filesystem allocation. The remainder of
+                      the disk budget is assigned to the persistent /root volume.
+                    format: uint32
+                    maximum: 1000000.0
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
                   secret_env:
                     additionalProperties:
                       type: string
