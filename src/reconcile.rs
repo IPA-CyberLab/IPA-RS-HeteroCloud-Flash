@@ -15,7 +15,7 @@ use k8s_openapi::{
         core::v1::{Node, PersistentVolumeClaim, Pod, Service, ServiceAccount},
         networking::v1::NetworkPolicy,
     },
-    apimachinery::pkg::apis::meta::v1::OwnerReference,
+    apimachinery::pkg::apis::meta::v1::{ManagedFieldsEntry, OwnerReference},
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
@@ -1617,6 +1617,65 @@ fn legacy_owns_replicas(deployment: &Deployment) -> bool {
         })
 }
 
+fn merge_field_sets(target: &mut Value, source: &Value) {
+    if let (Value::Object(target), Value::Object(source)) = (target, source) {
+        for (key, value) in source {
+            if let Some(existing) = target.get_mut(key) {
+                merge_field_sets(existing, value);
+            } else {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn migrated_deployment_fields(deployment: &Deployment) -> Option<Vec<ManagedFieldsEntry>> {
+    let fields = deployment.metadata.managed_fields.as_ref()?;
+    let is_legacy = |entry: &ManagedFieldsEntry| {
+        entry.manager.as_deref() == Some(FIELD_MANAGER)
+            && entry.operation.as_deref() == Some("Update")
+            && entry.api_version.as_deref() == Some("apps/v1")
+            && entry.subresource.as_deref().unwrap_or_default().is_empty()
+            && entry.fields_type.as_deref() == Some("FieldsV1")
+            && entry
+                .fields_v1
+                .as_ref()
+                .is_some_and(|fields| fields.0.is_object())
+    };
+    if !fields.iter().any(is_legacy) {
+        return None;
+    }
+    let mut migrated: Vec<ManagedFieldsEntry> = fields
+        .iter()
+        .filter(|entry| !is_legacy(entry))
+        .cloned()
+        .collect();
+    // Older releases used POST for initialization. Its Update ownership is
+    // separate from Apply ownership, even with the same manager name, and keeps
+    // omitted annotations, init containers and mounts alive. Transfer only our
+    // original ownership; preserve every other manager and subresource.
+    for legacy in fields.iter().filter(|entry| is_legacy(entry)) {
+        if let Some(applied) = migrated.iter_mut().find(|entry| {
+            entry.manager == legacy.manager
+                && entry.operation.as_deref() == Some("Apply")
+                && entry.api_version == legacy.api_version
+                && entry.subresource.as_deref().unwrap_or_default().is_empty()
+        }) {
+            if let (Some(target), Some(source)) = (&mut applied.fields_v1, &legacy.fields_v1) {
+                merge_field_sets(&mut target.0, &source.0);
+            } else if applied.fields_v1.is_none() {
+                applied.fields_v1 = legacy.fields_v1.clone();
+                applied.fields_type = legacy.fields_type.clone();
+            }
+        } else {
+            let mut applied = legacy.clone();
+            applied.operation = Some("Apply".into());
+            migrated.push(applied);
+        }
+    }
+    Some(migrated)
+}
+
 async fn reconcile_scaling(
     client: &Client,
     namespace: &str,
@@ -1638,13 +1697,7 @@ async fn reconcile_scaling(
         // Initialize once at the requested count, then relinquish main-manager ownership.
         None => {
             deployments
-                .create(
-                    &kube::api::PostParams {
-                        field_manager: Some(FIELD_MANAGER.into()),
-                        ..Default::default()
-                    },
-                    &desired,
-                )
+                .patch(&name, &params, &Patch::Apply(&desired))
                 .await?
         }
     };
@@ -1668,6 +1721,20 @@ async fn reconcile_scaling(
             "metadata": {"name": name, "resourceVersion": current.metadata.resource_version},
             "spec": {"replicas": replicas}
         }))).await?;
+    }
+    if let Some(fields) = migrated_deployment_fields(&current) {
+        // Fence the one-time ownership migration against HPA and other writers.
+        // This changes metadata only; the following apply removes stale fields.
+        current = deployments
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(json!({"metadata": {
+                    "resourceVersion": current.metadata.resource_version,
+                    "managedFields": fields,
+                }})),
+            )
+            .await?;
     }
     if let Some(spec) = desired.spec.as_mut() {
         spec.replicas = None;
@@ -3789,6 +3856,74 @@ mod tests {
         assert!(
             super::desired_autoscaler(&service(TrafficMode::Forwarded), &owner(), false)?.is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn initial_create_ownership_migrates_without_changing_other_managers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = json!({
+            "manager": super::FIELD_MANAGER, "operation": "Update",
+            "apiVersion": "apps/v1", "fieldsType": "FieldsV1",
+            "fieldsV1": {"f:spec": {"f:replicas": {}, "f:template": {
+                "f:metadata": {"f:annotations": {"f:vault.hashicorp.com/agent-inject": {}}},
+                "f:spec": {"f:initContainers": {"k:{\"name\":\"flash-secret-launcher\"}": {".": {}, "f:image": {}}}}
+            }}}
+        });
+        let apply = json!({
+            "manager": super::FIELD_MANAGER, "operation": "Apply",
+            "apiVersion": "apps/v1", "fieldsType": "FieldsV1",
+            "fieldsV1": {"f:spec": {"f:template": {"f:spec": {
+                "f:containers": {"k:{\"name\":\"workload\"}": {".": {}, "f:image": {}}}
+            }}}}
+        });
+        let replicas = json!({
+            "manager": super::REPLICAS_MANAGER, "operation": "Apply",
+            "apiVersion": "apps/v1", "fieldsType": "FieldsV1",
+            "fieldsV1": {"f:spec": {"f:replicas": {}}}
+        });
+        let external = json!({
+            "manager": "other-controller", "operation": "Update",
+            "apiVersion": "apps/v1", "fieldsType": "FieldsV1",
+            "fieldsV1": {"f:spec": {"f:template": {"f:metadata": {
+                "f:annotations": {"f:other.example/setting": {}}
+            }}}}
+        });
+        let status = json!({
+            "manager": super::FIELD_MANAGER, "operation": "Update", "subresource": "status",
+            "apiVersion": "apps/v1", "fieldsType": "FieldsV1",
+            "fieldsV1": {"f:status": {"f:readyReplicas": {}}}
+        });
+        let mut deployment: Deployment = serde_json::from_value(json!({
+            "metadata": {"name": "test", "managedFields": [legacy, apply, replicas, external, status]}
+        }))?;
+        let migrated = super::migrated_deployment_fields(&deployment).ok_or("missing migration")?;
+        assert_eq!(migrated.len(), 4);
+        let fields = serde_json::to_value(&migrated[0])?;
+        assert_eq!(fields["operation"], "Apply");
+        assert!(
+            fields
+                .pointer("/fieldsV1/f:spec/f:template/f:spec/f:initContainers")
+                .is_some()
+        );
+        assert!(
+            fields
+                .pointer("/fieldsV1/f:spec/f:template/f:spec/f:containers")
+                .is_some()
+        );
+        assert!(fields.pointer("/fieldsV1/f:spec/f:template/f:metadata/f:annotations/f:vault.hashicorp.com~1agent-inject").is_some());
+        assert_eq!(serde_json::to_value(&migrated[1])?, replicas);
+        assert_eq!(serde_json::to_value(&migrated[2])?, external);
+        assert_eq!(serde_json::to_value(&migrated[3])?, status);
+        deployment.metadata.managed_fields = Some(migrated);
+        assert!(super::migrated_deployment_fields(&deployment).is_none());
+        deployment.metadata.managed_fields = Some(vec![serde_json::from_value(legacy.clone())?]);
+        let first_apply =
+            super::migrated_deployment_fields(&deployment).ok_or("missing initial migration")?;
+        assert_eq!(first_apply.len(), 1);
+        let first_apply = serde_json::to_value(&first_apply[0])?;
+        assert_eq!(first_apply["operation"], "Apply");
+        assert_eq!(first_apply["fieldsV1"], legacy["fieldsV1"]);
         Ok(())
     }
 
