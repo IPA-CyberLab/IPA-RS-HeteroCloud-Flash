@@ -917,6 +917,7 @@ async fn reconcile(
     let action = update_workload_status(
         &mut status,
         &pods.items,
+        &applied_deployment,
         endpoint_ready,
         !flash.spec.workload.ports.is_empty(),
     );
@@ -958,6 +959,7 @@ async fn reconcile(
 fn update_workload_status(
     status: &mut FlashServiceStatus,
     pods: &[Pod],
+    deployment: &Deployment,
     endpoint_ready: bool,
     needs_endpoint: bool,
 ) -> Action {
@@ -965,7 +967,11 @@ fn update_workload_status(
     status.ready_replicas =
         i32::try_from(pods.iter().filter(|pod| pod_is_ready(pod)).count()).unwrap_or(i32::MAX);
     let ready = status.ready_replicas == desired_replicas && endpoint_ready;
-    let failure = workload_failure_message(pods);
+    let failure = workload_failure_message(pods).or_else(|| {
+        (!ready)
+            .then(|| deployment_failure_message(deployment))
+            .flatten()
+    });
     status.phase = if failure.is_some() {
         FlashServicePhase::Error
     } else if ready {
@@ -995,6 +1001,36 @@ fn update_workload_status(
     } else {
         Action::requeue(Duration::from_secs(5))
     }
+}
+
+fn deployment_failure_message(deployment: &Deployment) -> Option<String> {
+    let generation = deployment.metadata.generation?;
+    let status = deployment.status.as_ref()?;
+    if status.observed_generation? < generation {
+        return None;
+    }
+    // FailedCreate can prevent every Pod from existing, so Pod status alone
+    // cannot explain an unsuccessful rollout. Prefer its actionable cause.
+    let conditions = status.conditions.as_deref().unwrap_or_default();
+    let failure = conditions
+        .iter()
+        .find(|condition| condition.type_ == "ReplicaFailure" && condition.status == "True")
+        .or_else(|| {
+            conditions.iter().find(|condition| {
+                condition.type_ == "Progressing"
+                    && condition.status == "False"
+                    && condition.reason.as_deref() == Some("ProgressDeadlineExceeded")
+            })
+        })?;
+    Some(format!(
+        "deployment {} cannot complete its update ({}): {}",
+        deployment.name_any(),
+        failure.reason.as_deref().unwrap_or("ReplicaFailure"),
+        failure
+            .message
+            .as_deref()
+            .unwrap_or("replica creation failed")
+    ))
 }
 
 fn error_policy(
@@ -1242,6 +1278,11 @@ fn desired_deployment(
     }
     let mut pod_spec = json!({
         "runtimeClassName": workload_runtime_class(workload.effective_gpu_count()),
+        // Both fields must be explicit: API defaulting can restore an omitted
+        // serviceAccountName from the deprecated serviceAccount alias during
+        // server-side apply after secret injection is removed.
+        "serviceAccountName": "default",
+        "serviceAccount": "default",
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
         "terminationGracePeriodSeconds": 30,
@@ -1261,6 +1302,7 @@ fn desired_deployment(
     });
     if !secret_env.is_empty() {
         pod_spec["serviceAccountName"] = json!(secret_account_name);
+        pod_spec["serviceAccount"] = json!(secret_account_name);
         pod_spec["automountServiceAccountToken"] = json!(true);
         let helper_image = options
             .helper_image
@@ -2472,7 +2514,10 @@ pub enum ReconcileError {
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
-    use k8s_openapi::api::core::v1::{Pod, Service};
+    use k8s_openapi::api::{
+        apps::v1::Deployment,
+        core::v1::{Pod, Service},
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use kube::runtime::controller::Action;
     use serde_json::{Value, json};
@@ -3123,6 +3168,120 @@ mod tests {
     }
 
     #[test]
+    fn removing_secrets_resets_the_service_account_and_disables_token_mounts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash
+            .spec
+            .workload
+            .secret_env
+            .insert("TOKEN".into(), "api-token".into());
+        let render = |flash: &FlashService| -> Result<Value, Box<dyn std::error::Error>> {
+            Ok(serde_json::to_value(desired_deployment(
+                flash,
+                &owner(),
+                "example.invalid/workload@sha256:verified",
+                GIB_BYTES,
+                DeploymentOptions {
+                    image_entrypoint: &["/usr/local/bin/server".into()],
+                    image_architecture: Some("amd64"),
+                    helper_image: Some("example.invalid/helper@sha256:verified"),
+                    ..DeploymentOptions::default()
+                },
+            )?)?)
+        };
+        let with_secrets = render(&flash)?;
+        for field in ["serviceAccountName", "serviceAccount"] {
+            assert_eq!(
+                with_secrets["spec"]["template"]["spec"][field],
+                "flash-00000000000000000000000000000001"
+            );
+        }
+        flash.spec.workload.secret_env.clear();
+        let without_secrets = render(&flash)?;
+        let pod = &without_secrets["spec"]["template"]["spec"];
+        for field in ["serviceAccountName", "serviceAccount"] {
+            assert_eq!(pod[field], "default");
+        }
+        assert_eq!(pod["automountServiceAccountToken"], false);
+        assert!(pod["initContainers"].is_null());
+        assert!(
+            without_secrets
+                .pointer("/spec/template/metadata/annotations/vault.hashicorp.com~1agent-inject")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deployment_failures_without_pods_are_reported_and_clear_on_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (kind, condition_status, reason, message) in [
+            (
+                "ReplicaFailure",
+                "True",
+                "FailedCreate",
+                "required service account not found",
+            ),
+            (
+                "Progressing",
+                "False",
+                "ProgressDeadlineExceeded",
+                "replica set timed out progressing",
+            ),
+        ] {
+            let mut deployment: Deployment = serde_json::from_value(json!({
+                "metadata": {"name": "flash-test", "generation": 7},
+                "status": {
+                    "observedGeneration": 6,
+                    "conditions": [{"type": kind, "status": condition_status,
+                        "reason": reason, "message": message}]
+                }
+            }))?;
+            let mut status = FlashServiceStatus {
+                desired_replicas: 1,
+                ..FlashServiceStatus::default()
+            };
+            update_workload_status(&mut status, &[], &deployment, true, true);
+            assert_eq!(status.phase, FlashServicePhase::Provisioning);
+            if let Some(deployment_status) = deployment.status.as_mut() {
+                deployment_status.observed_generation = Some(7);
+            }
+            assert_eq!(
+                update_workload_status(&mut status, &[], &deployment, true, true),
+                Action::requeue(Duration::from_secs(5))
+            );
+            assert_eq!(status.phase, FlashServicePhase::Error);
+            assert!(
+                status
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(reason)
+            );
+            assert!(
+                status
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(message)
+            );
+            let pod: Pod = serde_json::from_value(json!({
+                "metadata": {"name": "flash-test-ready"},
+                "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+            }))?;
+            assert_eq!(
+                update_workload_status(&mut status, &[pod], &deployment, true, true),
+                Action::await_change()
+            );
+            assert_eq!(status.phase, FlashServicePhase::Ready);
+            assert_eq!(status.ready_replicas, 1);
+            assert_eq!(status.message, None);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn pending_pvc_recovers_without_a_user_update() -> Result<(), Box<dyn std::error::Error>> {
         let mut flash = service(TrafficMode::Forwarded);
         flash.spec.workload.replicas = 1;
@@ -3145,7 +3304,13 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(workload_failure_message(std::slice::from_ref(&pod)), None);
             assert_eq!(
-                update_workload_status(&mut status, std::slice::from_ref(&pod), true, true),
+                update_workload_status(
+                    &mut status,
+                    std::slice::from_ref(&pod),
+                    &Deployment::default(),
+                    true,
+                    true
+                ),
                 Action::requeue(Duration::from_secs(5))
             );
             assert_eq!(status.phase, FlashServicePhase::Provisioning);
@@ -3162,7 +3327,13 @@ mod tests {
             "conditions": [{"type": "PodScheduled", "status": "True"}]
         }))?);
         assert_eq!(
-            update_workload_status(&mut status, std::slice::from_ref(&pod), true, true),
+            update_workload_status(
+                &mut status,
+                std::slice::from_ref(&pod),
+                &Deployment::default(),
+                true,
+                true
+            ),
             Action::requeue(Duration::from_secs(5))
         );
         assert_eq!(status.phase, FlashServicePhase::Provisioning);
@@ -3182,12 +3353,18 @@ mod tests {
             ]
         }))?);
         assert_eq!(
-            update_workload_status(&mut status, std::slice::from_ref(&pod), false, true),
+            update_workload_status(
+                &mut status,
+                std::slice::from_ref(&pod),
+                &Deployment::default(),
+                false,
+                true
+            ),
             Action::requeue(Duration::from_secs(5))
         );
         assert_eq!(status.phase, FlashServicePhase::Provisioning);
         assert_eq!(
-            update_workload_status(&mut status, &[pod], true, true),
+            update_workload_status(&mut status, &[pod], &Deployment::default(), true, true),
             Action::await_change()
         );
         assert_eq!(status.phase, FlashServicePhase::Ready);
@@ -3218,7 +3395,7 @@ mod tests {
                 ..FlashServiceStatus::default()
             };
             assert_eq!(
-                update_workload_status(&mut status, &[pod], true, false),
+                update_workload_status(&mut status, &[pod], &Deployment::default(), true, false),
                 Action::requeue(Duration::from_secs(5))
             );
             assert_eq!(status.phase, FlashServicePhase::Provisioning);
@@ -3265,7 +3442,13 @@ mod tests {
                 ..FlashServiceStatus::default()
             };
             assert_eq!(
-                update_workload_status(&mut status, &[pending.clone(), failed], true, false),
+                update_workload_status(
+                    &mut status,
+                    &[pending.clone(), failed],
+                    &Deployment::default(),
+                    true,
+                    false
+                ),
                 Action::requeue(Duration::from_secs(5))
             );
             assert_eq!(status.phase, FlashServicePhase::Error);
