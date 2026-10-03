@@ -50,6 +50,8 @@ spec:
               value: {{ .Values.networkPolicy.additionalProtectedCidrs | toJson | quote }}
             - name: FLASH_DNS_CIDRS_JSON
               value: {{ required "networkPolicy.dnsCidrs must contain the cluster DNS service addresses" .Values.networkPolicy.dnsCidrs | toJson | quote }}
+            - name: FLASH_VPC_GUARD_CIDRS_JSON
+              value: {{ .Values.networkPolicy.vpcGuardCidrs | toJson | quote }}
             - name: FLASH_SECRET_MANAGER_CIDRS_JSON
               value: {{ .Values.networkPolicy.secretManagerCidrs | toJson | quote }}
             {{- if .Values.persistence.enabled }}

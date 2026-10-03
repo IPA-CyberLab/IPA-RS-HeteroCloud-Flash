@@ -4,6 +4,7 @@ pub mod domain;
 pub mod gpu_scheduler;
 pub mod image;
 pub mod reconcile;
+pub mod vpc;
 mod web;
 
 pub const PROVIDER_RECONCILE_ACTION: &str = "service-instance.reconcile";

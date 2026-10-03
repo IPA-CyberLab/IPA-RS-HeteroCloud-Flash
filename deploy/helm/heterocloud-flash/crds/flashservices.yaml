@@ -229,6 +229,24 @@ spec:
                     additionalProperties: true
                     default: {}
                     type: object
+                  network:
+                    nullable: true
+                    properties:
+                      private_name:
+                        nullable: true
+                        type: string
+                      security_groups:
+                        default:
+                        - default
+                        items:
+                          type: string
+                        type: array
+                      vpc_id:
+                        format: uuid
+                        type: string
+                    required:
+                    - vpc_id
+                    type: object
                   ports:
                     items:
                       properties:
@@ -426,6 +444,30 @@ spec:
                 - ready
                 - error
                 type: string
+              private_endpoints:
+                items:
+                  properties:
+                    host:
+                      type: string
+                    name:
+                      type: string
+                    port:
+                      format: uint16
+                      maximum: 65535.0
+                      minimum: 0.0
+                      type: integer
+                    protocol:
+                      enum:
+                      - tcp
+                      - udp
+                      type: string
+                  required:
+                  - host
+                  - name
+                  - port
+                  - protocol
+                  type: object
+                type: array
               ready_replicas:
                 format: int32
                 type: integer

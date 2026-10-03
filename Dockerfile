@@ -14,6 +14,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin flash
+COPY --from=builder /src/target/release/flash-vpc-ready /usr/local/bin/flash-vpc-ready
 COPY --from=builder /src/target/release/flash-api /usr/local/bin/flash-api
 COPY --from=builder /src/target/release/flash-controller /usr/local/bin/flash-controller
 COPY --from=builder /src/target/release/flash-activator /usr/local/bin/flash-activator

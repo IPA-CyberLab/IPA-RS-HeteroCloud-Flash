@@ -157,6 +157,7 @@ pub struct ControllerContext {
     additional_protected_networks: Vec<IpNet>,
     dns_networks: Vec<IpNet>,
     secret_manager_networks: Vec<IpNet>,
+    vpc_guard_networks: Vec<IpNet>,
     public_domain: Option<String>,
     activator_namespace: String,
     activator_service: String,
@@ -172,6 +173,7 @@ pub struct ControllerConfig {
     pub additional_protected_networks: Vec<IpNet>,
     pub dns_networks: Vec<IpNet>,
     pub secret_manager_networks: Vec<IpNet>,
+    pub vpc_guard_networks: Vec<IpNet>,
     pub public_domain: Option<String>,
     pub activator_namespace: String,
     pub activator_service: String,
@@ -192,6 +194,7 @@ impl ControllerContext {
             additional_protected_networks: config.additional_protected_networks,
             dns_networks: config.dns_networks,
             secret_manager_networks: config.secret_manager_networks,
+            vpc_guard_networks: config.vpc_guard_networks,
             public_domain: config.public_domain,
             activator_namespace: config.activator_namespace,
             activator_service: config.activator_service,
@@ -633,6 +636,27 @@ async fn reconcile(
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
+    if flash.spec.workload.network.is_some()
+        && flash
+            .annotations()
+            .get("vpc.heterocloud.io/applied-generation")
+            != Some(&flash.spec.desired_generation.to_string())
+    {
+        patch_status_if_changed(
+            &services,
+            &flash,
+            FlashServiceStatus {
+                phase: FlashServicePhase::Provisioning,
+                observed_generation: flash.spec.desired_generation,
+                desired_replicas: i32::try_from(flash.spec.workload.replicas).unwrap_or(i32::MAX),
+                runtime_class: runtime_class.into(),
+                message: Some("waiting for VPC policies and private DNS".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(2)));
+    }
     let now = Utc::now().timestamp();
     let weekly_meter = meter_weekly_usage(&services, &usage_records, &flash, now).await?;
     let cold = should_scale_to_zero(&flash, now);
@@ -805,6 +829,7 @@ async fn reconcile(
             additional_protected_networks: &context.additional_protected_networks,
             dns_networks: &context.dns_networks,
             secret_manager_networks: &context.secret_manager_networks,
+            vpc_guard_networks: &context.vpc_guard_networks,
             forwarded_ingress_networks: &forwarded_ingress_networks,
             activator_namespace: &context.activator_namespace,
             allow_activator: is_scale_to_zero(&flash),
@@ -903,6 +928,7 @@ async fn reconcile(
         desired_replicas,
         runtime_class: runtime_class.into(),
         endpoints,
+        private_endpoints: private_endpoints(&flash),
         resolved_image: Some(inspection.resolved_image),
         image_size_bytes: Some(inspection.image_size_bytes),
         writable_storage_bytes: Some(inspection.writable_storage_bytes),
@@ -1325,6 +1351,26 @@ fn desired_deployment(
             .image_architecture
             .ok_or(ReconcileError::MissingImageArchitecture)?;
         pod_spec["nodeSelector"] = json!({"kubernetes.io/arch": architecture});
+    }
+    if workload.network.is_some() {
+        let helper_image = options
+            .helper_image
+            .ok_or(ReconcileError::MissingHelperImage)?;
+        let guard = json!({
+            "name": "flash-vpc-ready", "image": helper_image, "imagePullPolicy": "IfNotPresent",
+            "command": ["/usr/local/bin/flash-vpc-ready"],
+            "env": [
+                {"name":"NODE_IP","valueFrom":{"fieldRef":{"fieldPath":"status.hostIP"}}},
+                {"name":"POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}
+            ],
+            "securityContext":{"runAsUser":65532,"runAsGroup":65532,"runAsNonRoot":true,"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
+            "resources":{"requests":{"cpu":"10m","memory":"16Mi"},"limits":{"cpu":"100m","memory":"64Mi"}}
+        });
+        if let Some(init) = pod_spec["initContainers"].as_array_mut() {
+            init.push(guard);
+        } else {
+            pod_spec["initContainers"] = json!([guard]);
+        }
     }
     if workload.effective_gpu_count() > 0 {
         pod_spec["nodeSelector"][GPU_READY_LABEL] = json!("true");
@@ -2173,6 +2219,7 @@ fn desired_network_policy(
             additional_protected_networks: &[],
             dns_networks: &[],
             secret_manager_networks: &[],
+            vpc_guard_networks: &[],
             forwarded_ingress_networks: &[],
             activator_namespace: "heterocloud-flash",
             allow_activator: false,
@@ -2184,6 +2231,7 @@ struct NetworkPolicyOptions<'a> {
     additional_protected_networks: &'a [IpNet],
     dns_networks: &'a [IpNet],
     secret_manager_networks: &'a [IpNet],
+    vpc_guard_networks: &'a [IpNet],
     forwarded_ingress_networks: &'a [IpNet],
     activator_namespace: &'a str,
     allow_activator: bool,
@@ -2198,6 +2246,7 @@ fn desired_network_policy_with_networks(
         additional_protected_networks,
         dns_networks,
         secret_manager_networks,
+        vpc_guard_networks,
         forwarded_ingress_networks,
         activator_namespace,
         allow_activator,
@@ -2245,6 +2294,7 @@ fn desired_network_policy_with_networks(
         })]
     } else {
         match (exposure.kind, exposure.traffic_mode) {
+            (ExposureType::Internal, _) if flash.spec.workload.network.is_some() => Vec::new(),
             (ExposureType::Internal, _) => vec![json!({
                 "from": [{
                     "podSelector": {"matchLabels": {
@@ -2310,7 +2360,7 @@ fn desired_network_policy_with_networks(
             "ports": [{"protocol": "TCP", "port": 443}]
         }));
     }
-    if flash.spec.workload.egress.allow_same_organization {
+    if flash.spec.workload.network.is_none() && flash.spec.workload.egress.allow_same_organization {
         egress.push(json!({
             "to": [{
                 "podSelector": {"matchLabels": {
@@ -2332,10 +2382,18 @@ fn desired_network_policy_with_networks(
             }})
         })
         .collect::<Vec<_>>();
-    if !destinations.is_empty() {
+    if flash.spec.workload.network.is_none() && !destinations.is_empty() {
         egress.push(json!({"to": destinations}));
     }
 
+    if flash.spec.workload.network.is_some() {
+        if vpc_guard_networks.is_empty() {
+            return Err(ReconcileError::Resource(anyhow::anyhow!(
+                "VPC node guard addresses are not configured"
+            )));
+        }
+        egress.push(json!({"to": vpc_guard_networks.iter().map(|n| json!({"ipBlock": {"cidr": n.to_string()}})).collect::<Vec<_>>(), "ports": [{"protocol": "TCP", "port": 18083}]}));
+    }
     let mut policy: NetworkPolicy = from_value(json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -2456,6 +2514,27 @@ async fn assigned_forwarder_networks(
     Ok(networks.into_iter().collect())
 }
 
+fn private_endpoints(flash: &FlashService) -> Vec<FlashEndpoint> {
+    if flash.spec.workload.network.is_none() {
+        return Vec::new();
+    }
+    let Some(host) = flash.annotations().get("vpc.heterocloud.io/private-dns") else {
+        return Vec::new();
+    };
+    flash
+        .spec
+        .workload
+        .ports
+        .iter()
+        .map(|p| FlashEndpoint {
+            name: p.name.clone(),
+            protocol: p.protocol,
+            host: host.clone(),
+            port: p.container_port,
+        })
+        .collect()
+}
+
 fn service_endpoints(
     flash: &FlashService,
     service: &Service,
@@ -2517,7 +2596,7 @@ fn service_endpoints(
 }
 
 fn base_labels(flash: &FlashService) -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut labels = BTreeMap::from([
         ("app.kubernetes.io/name".into(), "heterocloud-flash".into()),
         ("app.kubernetes.io/managed-by".into(), FIELD_MANAGER.into()),
         (
@@ -2528,7 +2607,14 @@ fn base_labels(flash: &FlashService) -> BTreeMap<String, String> {
             "flash.heterocloud.io/organization".into(),
             flash.spec.organization_id.clone(),
         ),
-    ])
+    ]);
+    if let Some(network) = &flash.spec.workload.network {
+        labels.insert(
+            "vpc.heterocloud.io/network".into(),
+            network.vpc_id.to_string(),
+        );
+    }
+    labels
 }
 
 fn from_value<T>(value: Value) -> Result<T, ReconcileError>
@@ -2758,6 +2844,7 @@ mod tests {
                         denied_source_cidrs: Vec::new(),
                     },
                     egress: FlashEgress::default(),
+                    network: None,
                     env: BTreeMap::new(),
                     secret_env: BTreeMap::new(),
                     secret_files: BTreeMap::new(),
@@ -2767,6 +2854,67 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn vpc_attachment_does_not_inherit_organization_or_public_egress_grants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.exposure.kind = ExposureType::Internal;
+        flash.spec.workload.network = Some(crate::vpc::FlashVpcAttachment {
+            vpc_id: uuid::Uuid::from_u128(1),
+            security_groups: vec!["default".into()],
+            private_name: Some("child".into()),
+        });
+        let policy = serde_json::to_value(desired_network_policy_with_networks(
+            &flash,
+            &owner(),
+            NetworkPolicyOptions {
+                additional_protected_networks: &[],
+                dns_networks: &[],
+                secret_manager_networks: &[],
+                vpc_guard_networks: &["10.250.0.10/32".parse()?],
+                forwarded_ingress_networks: &[],
+                activator_namespace: "heterocloud-flash",
+                allow_activator: false,
+            },
+        )?)?;
+        assert!(policy["spec"]["ingress"].is_null());
+        let rules = policy["spec"]["egress"]
+            .as_array()
+            .ok_or("missing egress rules")?;
+        assert_eq!(
+            rules.len(),
+            2,
+            "only DNS and the configured node guard are allowed by the base policy"
+        );
+        assert_eq!(rules[1]["to"][0]["ipBlock"]["cidr"], "10.250.0.10/32");
+        assert_eq!(rules[1]["ports"][0]["port"], 18083);
+        let deployment = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "nginx:alpine",
+            1_073_741_824,
+            DeploymentOptions {
+                helper_image: Some("example.invalid/flash:checked"),
+                ..Default::default()
+            },
+        )?)?;
+        assert_eq!(
+            deployment["spec"]["template"]["metadata"]["labels"]["vpc.heterocloud.io/network"],
+            uuid::Uuid::from_u128(1).to_string()
+        );
+        let init = &deployment["spec"]["template"]["spec"]["initContainers"][0];
+        assert_eq!(init["name"], "flash-vpc-ready");
+        assert_eq!(
+            init["securityContext"]["capabilities"]["drop"],
+            json!(["ALL"])
+        );
+        assert!(init["securityContext"].get("privileged").is_none());
+        let svc = serde_json::to_value(desired_service(&flash, &owner())?)?;
+        assert_eq!(svc["spec"]["type"], "ClusterIP");
+        assert!(svc["spec"]["ports"][0].get("nodePort").is_none());
+        Ok(())
     }
 
     #[test]
@@ -2965,6 +3113,7 @@ mod tests {
             &flash,
             &owner(),
             NetworkPolicyOptions {
+                vpc_guard_networks: &[],
                 additional_protected_networks: &[],
                 dns_networks: &[],
                 secret_manager_networks: &[network],
@@ -4367,6 +4516,7 @@ mod tests {
                 additional_protected_networks: &[],
                 dns_networks: &[],
                 secret_manager_networks: &[],
+                vpc_guard_networks: &[],
                 forwarded_ingress_networks: &["10.244.2.0/32".parse()?],
                 activator_namespace: "heterocloud-flash",
                 allow_activator: false,

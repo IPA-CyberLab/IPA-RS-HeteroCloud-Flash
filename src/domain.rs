@@ -76,6 +76,8 @@ pub struct FlashSpec {
     pub exposure: FlashExposure,
     #[serde(default)]
     pub egress: FlashEgress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<crate::vpc::FlashVpcAttachment>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -220,6 +222,14 @@ impl FlashSpec {
         }
         self.exposure.effective_source_networks()?;
         self.egress.validate()?;
+        if let Some(network) = &self.network {
+            network.validate()?;
+            if self.egress.allow_same_organization {
+                return Err(ValidationError::Field(
+                    "VPC attachments require allow_same_organization=false".into(),
+                ));
+            }
+        }
         if self.env.len() > MAX_ENVIRONMENT_VARIABLES {
             return Err(ValidationError::Field(format!(
                 "env must not contain more than {MAX_ENVIRONMENT_VARIABLES} entries"
@@ -778,6 +788,7 @@ mod tests {
                 denied_source_cidrs: Vec::new(),
             },
             egress: FlashEgress::default(),
+            network: None,
             env: BTreeMap::new(),
             secret_env: BTreeMap::new(),
             secret_files: BTreeMap::new(),

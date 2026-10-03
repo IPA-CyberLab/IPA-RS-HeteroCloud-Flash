@@ -20,6 +20,12 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor|nvidia) -> Service
 
 ## Properties
 
+- `spec.network` attaches services to a HeteroCloud VPC. Private DNS, directional
+  TCP/UDP rules and optional outbound NAT are managed by
+  [HeteroCloud VPC](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-VPC).
+  Configure `networkPolicy.vpcGuardCidrs` with the private addresses of the
+  guarded worker nodes before enabling VPC attachments.
+
 - CPU workloads run with the `gvisor` Kubernetes RuntimeClass. A spec with
   `gpu_type` runs with the `nvidia` RuntimeClass on a node that passed the
   cluster GPU smoke test. The provider chooses the runtime from the requested

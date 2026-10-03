@@ -103,6 +103,7 @@ async fn run() -> Result<()> {
             additional_protected_networks,
             dns_networks,
             secret_manager_networks,
+            vpc_guard_networks: network_cidrs("FLASH_VPC_GUARD_CIDRS_JSON")?,
             public_domain,
             activator_namespace,
             activator_service,
