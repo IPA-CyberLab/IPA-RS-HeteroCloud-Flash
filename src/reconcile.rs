@@ -756,11 +756,40 @@ async fn reconcile(
         }
     };
 
-    let storage = storage_allocation(
+    let persistent_volume_claims =
+        Api::<PersistentVolumeClaim>::namespaced(context.client.clone(), &context.namespace);
+    let existing_claim = if context.persistent_storage_class.is_some() {
+        persistent_volume_claims
+            .get_opt(&format!("{name}-home"))
+            .await?
+    } else {
+        None
+    };
+    let existing_storage = existing_claim.as_ref().map(claim_storage).transpose()?;
+    let storage = match storage_allocation_retaining(
         inspection.writable_storage_bytes,
         context.persistent_storage_class.is_some(),
         flash.spec.workload.rootfs_storage_gib,
-    )?;
+        existing_storage
+            .map(|(requested, _)| requested)
+            .unwrap_or(0),
+    ) {
+        Ok(storage) => storage,
+        Err(error) => {
+            // An invalid update must leave the last working Deployment and PVC intact.
+            let mut status = FlashServiceStatus {
+                phase: FlashServicePhase::Error,
+                observed_generation: flash.spec.desired_generation,
+                desired_replicas,
+                runtime_class: runtime_class.into(),
+                message: Some(error.to_string()),
+                ..FlashServiceStatus::default()
+            };
+            apply_weekly_meter(&mut status, &weekly_meter);
+            patch_status_if_changed(&services, &flash, status).await?;
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+    };
     let persistent_volume_claim = context
         .persistent_storage_class
         .as_deref()
@@ -808,8 +837,6 @@ async fn reconcile(
     let network_services = Api::<Service>::namespaced(context.client.clone(), &context.namespace);
     let network_policies =
         Api::<NetworkPolicy>::namespaced(context.client.clone(), &context.namespace);
-    let persistent_volume_claims =
-        Api::<PersistentVolumeClaim>::namespaced(context.client.clone(), &context.namespace);
     let service_accounts =
         Api::<ServiceAccount>::namespaced(context.client.clone(), &context.namespace);
     let params = PatchParams::apply(FIELD_MANAGER).force();
@@ -836,7 +863,9 @@ async fn reconcile(
         },
     )?;
 
-    if let Some(persistent_volume_claim) = &persistent_volume_claim {
+    if let Some(persistent_volume_claim) = &persistent_volume_claim
+        && claim_needs_storage_update(existing_storage, storage.persistent_bytes)
+    {
         persistent_volume_claims
             .patch(
                 &persistent_volume_claim.name_any(),
@@ -1495,6 +1524,132 @@ fn storage_allocation(
         rootfs_bytes,
         persistent_bytes: writable_storage_bytes - rootfs_bytes,
     })
+}
+
+fn storage_allocation_retaining(
+    writable_storage_bytes: u64,
+    persistent: bool,
+    requested_rootfs_gib: Option<u32>,
+    existing_requested_bytes: u64,
+) -> Result<StorageAllocation, ReconcileError> {
+    let mut allocation =
+        storage_allocation(writable_storage_bytes, persistent, requested_rootfs_gib)?;
+    if persistent && allocation.persistent_bytes < existing_requested_bytes {
+        let available_rootfs = writable_storage_bytes.checked_sub(existing_requested_bytes);
+        if requested_rootfs_gib.is_some()
+            || available_rootfs.is_none_or(|bytes| bytes < MIN_ROOTFS_STORAGE_BYTES)
+        {
+            return Err(ReconcileError::PersistentStorageExceedsBudget);
+        }
+        allocation.persistent_bytes = existing_requested_bytes;
+        allocation.rootfs_bytes = writable_storage_bytes - existing_requested_bytes;
+    }
+    Ok(allocation)
+}
+
+fn claim_storage(claim: &PersistentVolumeClaim) -> Result<(u64, u64), ReconcileError> {
+    let requested = claim
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.resources.as_ref())
+        .and_then(|resources| resources.requests.as_ref())
+        .and_then(|requests| requests.get("storage"))
+        .ok_or(ReconcileError::InvalidStorageQuantity)?;
+    let capacity = claim
+        .status
+        .as_ref()
+        .and_then(|status| status.capacity.as_ref())
+        .and_then(|capacity| capacity.get("storage"))
+        .map(|quantity| storage_quantity_bytes(&quantity.0))
+        .transpose()?
+        .unwrap_or(0);
+    Ok((storage_quantity_bytes(&requested.0)?, capacity))
+}
+
+fn claim_needs_storage_update(existing: Option<(u64, u64)>, desired: u64) -> bool {
+    // CSI may round capacity above the request. Reapplying a smaller request than
+    // that capacity is rejected even when we only intended to update the image.
+    existing.is_none_or(|(requested, capacity)| desired > requested.max(capacity))
+}
+
+fn storage_quantity_bytes(value: &str) -> Result<u64, ReconcileError> {
+    // Kubernetes quantities are fixed point. Round fractional bytes up, without
+    // floating-point precision loss or treating an unrecognized capacity as zero.
+    let invalid = || ReconcileError::InvalidStorageQuantity;
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let boundary = value
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(boundary);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|c| c.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let mantissa = format!("{whole}{fraction}")
+        .parse::<u128>()
+        .map_err(|_| invalid())?;
+    let mut numerator = mantissa;
+    let mut denominator = 10_u128
+        .checked_pow(u32::try_from(fraction.len()).map_err(|_| invalid())?)
+        .ok_or_else(invalid)?;
+    let exponent = match suffix {
+        "Ki" | "Mi" | "Gi" | "Ti" | "Pi" | "Ei" => {
+            let power = match suffix {
+                "Ki" => 1,
+                "Mi" => 2,
+                "Gi" => 3,
+                "Ti" => 4,
+                "Pi" => 5,
+                _ => 6,
+            };
+            numerator = numerator
+                .checked_mul(1024_u128.pow(power))
+                .ok_or_else(invalid)?;
+            0
+        }
+        "n" => -9,
+        "u" => -6,
+        "m" => -3,
+        "" => 0,
+        "k" => 3,
+        "M" => 6,
+        "G" => 9,
+        "T" => 12,
+        "P" => 15,
+        "E" => 18,
+        _ => suffix
+            .strip_prefix(['e', 'E'])
+            .ok_or_else(invalid)?
+            .parse::<i32>()
+            .map_err(|_| invalid())?,
+    };
+    if exponent < 0 {
+        denominator = denominator
+            .checked_mul(
+                10_u128
+                    .checked_pow(exponent.unsigned_abs())
+                    .ok_or_else(invalid)?,
+            )
+            .ok_or_else(invalid)?;
+    } else {
+        numerator = numerator
+            .checked_mul(
+                10_u128
+                    .checked_pow(exponent.cast_unsigned())
+                    .ok_or_else(invalid)?,
+            )
+            .ok_or_else(invalid)?;
+    }
+    let bytes = numerator.div_ceil(denominator);
+    if bytes > i64::MAX as u128 {
+        return Err(invalid());
+    }
+    u64::try_from(bytes).map_err(|_| invalid())
 }
 
 fn desired_persistent_volume_claim(
@@ -2655,6 +2810,14 @@ pub enum ReconcileError {
     StorageBudgetOverflow,
     #[error("disk budget cannot provide the requested container filesystem and persistent storage")]
     InsufficientWritableStorage,
+    #[error(
+        "the updated image and container filesystem do not fit alongside the existing persistent disk; increase the disk limit or reduce the explicit container filesystem size; the running workload and persistent data were preserved"
+    )]
+    PersistentStorageExceedsBudget,
+    #[error(
+        "persistent volume storage quantity is missing, invalid, or exceeds the supported byte range"
+    )]
+    InvalidStorageQuantity,
     #[error(transparent)]
     Kubernetes(#[from] kube::Error),
     #[error(transparent)]
@@ -2676,10 +2839,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        AdminVolumeMount, DeploymentOptions, GIB_BYTES, NetworkPolicyOptions, desired_deployment,
-        desired_network_policy, desired_network_policy_with_networks,
-        desired_persistent_volume_claim, desired_secret_service_account, desired_service,
-        gpu_job_state, projected_weekly_usage, status_patch, storage_allocation,
+        AdminVolumeMount, DeploymentOptions, GIB_BYTES, NetworkPolicyOptions,
+        claim_needs_storage_update, claim_storage, desired_deployment, desired_network_policy,
+        desired_network_policy_with_networks, desired_persistent_volume_claim,
+        desired_secret_service_account, desired_service, gpu_job_state, projected_weekly_usage,
+        status_patch, storage_allocation, storage_allocation_retaining, storage_quantity_bytes,
         update_workload_status, validate_admin_volume_mounts, workload_failure_message,
         workload_restart_message,
     };
@@ -3380,6 +3544,105 @@ mod tests {
                 .pointer("/spec/template/spec/containers/0/resources/limits/ephemeral-storage"),
             Some(&json!(allocation.rootfs_bytes.to_string()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn image_update_retains_persistent_storage_and_uses_remaining_rootfs_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = 4_623_292_749;
+        let writable = 5_000_000_000;
+        let allocation = storage_allocation_retaining(writable, true, None, requested)?;
+        assert_eq!(allocation.persistent_bytes, requested);
+        assert_eq!(
+            allocation.rootfs_bytes + allocation.persistent_bytes,
+            writable
+        );
+        assert!(allocation.rootfs_bytes >= super::MIN_ROOTFS_STORAGE_BYTES);
+        assert!(matches!(
+            storage_allocation_retaining(
+                requested + super::MIN_ROOTFS_STORAGE_BYTES - 1,
+                true,
+                None,
+                requested
+            ),
+            Err(super::ReconcileError::PersistentStorageExceedsBudget)
+        ));
+        assert!(matches!(
+            storage_allocation_retaining(writable, true, Some(1), requested),
+            Err(super::ReconcileError::PersistentStorageExceedsBudget)
+        ));
+        // Existing allocations are stable; a controller upgrade alone must not
+        // change a live Deployment's rootfs limit and restart its container.
+        let original = storage_allocation(30 * GIB_BYTES - 29_754_859, true, None)?;
+        assert_eq!(
+            storage_allocation_retaining(
+                30 * GIB_BYTES - 29_754_859,
+                true,
+                None,
+                original.persistent_bytes
+            )?,
+            original
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_claim_is_only_patched_for_growth_beyond_requested_and_actual_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let claim = serde_json::from_value(json!({
+            "spec": {"resources": {"requests": {"storage": "4623292749"}}},
+            "status": {"capacity": {"storage": "4410Mi"}}
+        }))?;
+        let existing = claim_storage(&claim)?;
+        assert_eq!(existing, (4_623_292_749, 4_624_220_160));
+        assert!(!claim_needs_storage_update(Some(existing), existing.0));
+        assert!(!claim_needs_storage_update(Some(existing), existing.0 - 1));
+        assert!(!claim_needs_storage_update(Some(existing), existing.1));
+        assert!(claim_needs_storage_update(Some(existing), existing.1 + 1));
+        assert!(claim_needs_storage_update(None, existing.0));
+        // A pending expansion must never be cancelled when capacity still lags.
+        assert!(!claim_needs_storage_update(
+            Some((6 * GIB_BYTES, 5 * GIB_BYTES)),
+            5 * GIB_BYTES
+        ));
+        assert!(claim_storage(&Default::default()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn storage_quantities_preserve_exact_bytes_and_reject_invalid_capacities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (quantity, bytes) in [
+            ("4623292749", 4_623_292_749),
+            ("4410Mi", 4_624_220_160),
+            ("1.5Gi", 1_610_612_736),
+            ("2G", 2_000_000_000),
+            ("9007199254740993", 9_007_199_254_740_993),
+            ("1e3", 1000),
+            ("1E+3", 1000),
+            ("1e-3", 1),
+            ("1500m", 2),
+            ("1n", 1),
+            (".5", 1),
+            ("+1.", 1),
+            ("0", 0),
+        ] {
+            assert_eq!(storage_quantity_bytes(quantity)?, bytes, "{quantity}");
+        }
+        for invalid in [
+            "",
+            ".",
+            "-1Gi",
+            "1..2",
+            "1GB",
+            " 1Gi",
+            "1Gi ",
+            "1e9999",
+            "9223372036854775808",
+        ] {
+            assert!(storage_quantity_bytes(invalid).is_err(), "{invalid}");
+        }
         Ok(())
     }
 

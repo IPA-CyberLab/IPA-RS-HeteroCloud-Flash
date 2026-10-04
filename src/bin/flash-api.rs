@@ -701,14 +701,8 @@ fn validate_resource_access(
     if resource.spec.desired_generation != generation {
         return Err(ApiError::Forbidden);
     }
-    // Readiness is operational state, not authorization for listing or diagnostics.
-    let status = resource.status.as_ref().ok_or(ApiError::NotReady)?;
-    if status.observed_generation < generation {
-        return Err(ApiError::NotReady);
-    }
-    if status.observed_generation != generation {
-        return Err(ApiError::Forbidden);
-    }
+    // Reconciliation may fail before status observes the current command. Diagnostics
+    // still operate on the owned, running pods; status freshness is not authorization.
     Ok(())
 }
 
@@ -1266,20 +1260,33 @@ mod tests {
                         http::Method::GET,
                         "status refresh must never write"
                     );
-                    assert_eq!(
-                        request.uri().path(),
-                        format!(
-                            "/apis/flash.heterocloud.io/v1alpha1/namespaces/test/flashservices/flash-{}",
-                            Uuid::from_u128(7)
-                        )
-                    );
                     reads.fetch_add(1, Ordering::SeqCst);
-                    let (status, body) = match resource {
-                        Some(resource) => (200, serde_json::to_value(resource)?),
-                        None => (
-                            404,
-                            json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "reason": "NotFound", "message": "absent", "code": 404}),
-                        ),
+                    let (status, body) = if request.uri().path() == "/api/v1/namespaces/test/pods" {
+                        let query = request.uri().query().ok_or("pod selector missing")?;
+                        assert!(query.contains("labelSelector="));
+                        // Retain the prior generation while the desired update is blocked.
+                        let mut pod =
+                            serde_json::to_value(pod(Uuid::from_u128(7), "Running", true)?)?;
+                        pod["metadata"]["labels"]["flash.heterocloud.io/generation"] = json!("3");
+                        (
+                            200,
+                            json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": [pod]}),
+                        )
+                    } else {
+                        assert_eq!(
+                            request.uri().path(),
+                            format!(
+                                "/apis/flash.heterocloud.io/v1alpha1/namespaces/test/flashservices/flash-{}",
+                                Uuid::from_u128(7)
+                            )
+                        );
+                        match resource {
+                            Some(resource) => (200, serde_json::to_value(resource)?),
+                            None => (
+                                404,
+                                json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "reason": "NotFound", "message": "absent", "code": 404}),
+                            ),
+                        }
                     };
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
                         http::Response::builder()
@@ -1307,6 +1314,35 @@ mod tests {
             )
             .await?;
         Ok((response, reads.load(Ordering::SeqCst)))
+    }
+
+    #[tokio::test]
+    async fn signed_container_discovery_returns_retained_pods_during_failed_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (claims, mut resource) = access_fixture()?;
+        resource
+            .status
+            .as_mut()
+            .ok_or("fixture status")?
+            .observed_generation = 3;
+        let uri = format!(
+            "/internal/v1/service-instances/{}/containers?generation=4",
+            claims.service_instance_id
+        );
+        for pending in [Some(resource.clone()), {
+            resource.status = None;
+            Some(resource)
+        }] {
+            let (response, reads) =
+                signed_status_request(claims.clone(), pending, uri.clone()).await?;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(reads, 2);
+            let body = axum::body::to_bytes(response.into_body(), 65536).await?;
+            let body: Value = serde_json::from_slice(&body)?;
+            assert_eq!(body["items"][0]["ready"], true);
+            assert_eq!(body["items"][0]["name"], "flash-workload-abc123");
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1471,7 +1507,6 @@ mod tests {
             ("spec", "project_id", json!(Uuid::from_u128(8))),
             ("spec", "desired_generation", json!(3)),
             ("spec", "desired_generation", json!(5)),
-            ("status", "observed_generation", json!(5)),
             (
                 "metadata",
                 "deletionTimestamp",
@@ -1494,32 +1529,6 @@ mod tests {
                 "{section}.{field}"
             );
         }
-        let mut pending = resource.clone();
-        pending
-            .status
-            .as_mut()
-            .ok_or("fixture status")?
-            .observed_generation = claims.generation - 1;
-        assert!(matches!(
-            validate_resource_access(
-                &pending,
-                &claims,
-                claims.service_instance_id,
-                claims.generation,
-            ),
-            Err(ApiError::NotReady)
-        ));
-        let mut resource = resource;
-        resource.status = None;
-        assert!(matches!(
-            validate_resource_access(
-                &resource,
-                &claims,
-                claims.service_instance_id,
-                claims.generation,
-            ),
-            Err(ApiError::NotReady)
-        ));
         assert!(matches!(
             validate_command(&claims, Uuid::from_u128(8), claims.generation),
             Err(ApiError::Forbidden)
@@ -1530,6 +1539,33 @@ mod tests {
                 Err(ApiError::Forbidden)
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_remain_available_before_reconciliation_observes_an_update()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (claims, mut resource) = access_fixture()?;
+        for observed in [0, claims.generation - 1, claims.generation + 1] {
+            resource
+                .status
+                .as_mut()
+                .ok_or("fixture status")?
+                .observed_generation = observed;
+            validate_resource_access(
+                &resource,
+                &claims,
+                claims.service_instance_id,
+                claims.generation,
+            )?;
+        }
+        resource.status = None;
+        validate_resource_access(
+            &resource,
+            &claims,
+            claims.service_instance_id,
+            claims.generation,
+        )?;
         Ok(())
     }
 
