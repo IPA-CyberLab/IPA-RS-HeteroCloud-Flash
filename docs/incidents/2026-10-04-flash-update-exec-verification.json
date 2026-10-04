@@ -1,0 +1,276 @@
+{
+  "schema_version": 1,
+  "incident_date": "2026-10-04",
+  "timezone": "UTC",
+  "source_revision": "efdf87c53873f36d3c520299bbcf3ad205ede06e",
+  "release": "v0.1.42",
+  "image_digest": "sha256:04a873a32b794cf85e40b3be523e9a73b129403ec7a40e61f1797a3750d98757",
+  "argo": {
+    "target": "v0.1.42",
+    "revision": "efdf87c53873f36d3c520299bbcf3ad205ede06e",
+    "sync": "Synced",
+    "health": "Healthy"
+  },
+  "monitor": {
+    "generation": 4,
+    "observed_generation": 4,
+    "phase": "ready",
+    "ready_replicas": 1,
+    "pod": "flash-01a0ff77-c342-7a80-b596-85bb3c792c89-5dcf44469b-8tmbc",
+    "pod_uid": "b8c06ef9-aa21-4a4d-9075-6a7edf40f26c",
+    "requested_image": "ghcr.io/mizuamedesu/kabubot-monitor@sha256:a639ce0691346e6976f53407f991e20c305b9b36a986cab127ff3de965f2ae47",
+    "actual_pod_image": "ghcr.io/mizuamedesu/kabubot-monitor@sha256:a639ce0691346e6976f53407f991e20c305b9b36a986cab127ff3de965f2ae47",
+    "image_matches": true,
+    "image_id": "ghcr.io/mizuamedesu/kabubot-monitor@sha256:a639ce0691346e6976f53407f991e20c305b9b36a986cab127ff3de965f2ae47",
+    "ready": true,
+    "restarts": 0,
+    "started_at": "2026-10-04T10:54:09Z",
+    "rootfs_limit_bytes": "437226477",
+    "disk_budget_bytes": 5368709120,
+    "image_size_bytes": 308189894,
+    "public_state_ready_at": "2026-10-04T10:58:07.444070Z",
+    "outbox_delivered_at": "2026-10-04T10:58:07.452408Z",
+    "reconcile_attempts": 18,
+    "generation_resubmitted_during_recovery": false
+  },
+  "public_api": {
+    "started_at": "2026-10-04T11:00:18.470327+00:00",
+    "finished_at": "2026-10-04T11:01:24.208796+00:00",
+    "passed": true,
+    "test_credentials_deleted": true,
+    "exec": [
+      {
+        "service_id": "01a0ff77-c342-7a80-b596-85bb3c792c89",
+        "pod": "flash-01a0ff77-c342-7a80-b596-85bb3c792c89-5dcf44469b-8tmbc",
+        "websocket_connected": true,
+        "marker_received": true
+      },
+      {
+        "service_id": "01a0ff76-0c51-7752-b251-792c215ff47d",
+        "pod": "flash-01a0ff76-0c51-7752-b251-792c215ff47d-775b94fd7-mgw55",
+        "websocket_connected": true,
+        "marker_received": true
+      }
+    ],
+    "services": [
+      {
+        "id": "01a0ff77-c342-7a80-b596-85bb3c792c89",
+        "http_status": 200,
+        "state": "ready",
+        "generation": 4,
+        "status": {
+          "phase": "ready",
+          "observed_generation": 4,
+          "ready_replicas": 1,
+          "desired_replicas": 1,
+          "resolved_image": "ghcr.io/mizuamedesu/kabubot-monitor@sha256:a639ce0691346e6976f53407f991e20c305b9b36a986cab127ff3de965f2ae47"
+        }
+      },
+      {
+        "id": "01a0ff76-0c51-7752-b251-792c215ff47d",
+        "http_status": 200,
+        "state": "ready",
+        "generation": 2,
+        "status": {
+          "phase": "ready",
+          "observed_generation": 2,
+          "ready_replicas": 1,
+          "desired_replicas": 1,
+          "resolved_image": "ghcr.io/mizuamedesu/kabubot-runner@sha256:78be85965c959eedc871747aa632dc027e72ce6dbb1b47243b387f62969597d8"
+        }
+      }
+    ],
+    "method": "60 authenticated container-list requests over new HTTP connections, followed by harmless printf/exit via each service WebSocket; scoped temporary credentials revoked",
+    "container_list_checks": [
+      {
+        "service_id": "01a0ff76-0c51-7752-b251-792c215ff47d",
+        "requests": 30,
+        "http_status_counts": {
+          "200": 30
+        },
+        "min_seconds": 0.174,
+        "max_seconds": 8.097
+      },
+      {
+        "service_id": "01a0ff77-c342-7a80-b596-85bb3c792c89",
+        "requests": 30,
+        "http_status_counts": {
+          "200": 30
+        },
+        "min_seconds": 0.18,
+        "max_seconds": 1.369
+      }
+    ]
+  },
+  "earlier_public_api_check": {
+    "finished_at": "2026-10-04T10:55:57.203831+00:00",
+    "passed": false,
+    "reason": "Monitor API state was still updating while the existing reconcile event waited for retry; HTTP listing and exec already succeeded",
+    "container_list_status_counts": {
+      "200": 60
+    }
+  },
+  "continuity_check": {
+    "captured_at": "2026-10-04T10:55:39.035980+00:00",
+    "all_other_workloads_unchanged": false,
+    "results": [
+      {
+        "pod": "flash-01a089a3-5795-7530-b283-6ef2f84e2e82-77cb8c84bc-rfnrq",
+        "same_pod_and_container": false
+      },
+      {
+        "pod": "flash-01a0ff76-0c51-7752-b251-792c215ff47d-775b94fd7-mgw55",
+        "same_pod_and_container": true
+      },
+      {
+        "pod": "flash-01a1005f-0743-7d32-9e86-271cf23f8da7-775bb684d6-ql266",
+        "same_pod_and_container": false
+      },
+      {
+        "pod": "flash-01a101e7-5acd-78a0-b8e9-88950db3ecad-85c7cbbc5-wmdj7",
+        "same_pod_and_container": true
+      }
+    ],
+    "explanation": "nginx and whisper Pods were replaced as pending volume expansion/rounding settled and the remaining rootfs allocation changed; runner and development Pod/container identities stayed unchanged"
+  },
+  "persistent_volumes": [
+    {
+      "name": "flash-01a089a3-5795-7530-b283-6ef2f84e2e82-home",
+      "same_uid": true,
+      "request_before": "945303070",
+      "request_after": "945815552"
+    },
+    {
+      "name": "flash-01a0ff76-0c51-7752-b251-792c215ff47d-home",
+      "same_uid": true,
+      "request_before": "4458299284",
+      "request_after": "4458299284"
+    },
+    {
+      "name": "flash-01a0ff77-c342-7a80-b596-85bb3c792c89-home",
+      "same_uid": true,
+      "request_before": "4623292749",
+      "request_after": "4623292749"
+    },
+    {
+      "name": "flash-01a1005f-0743-7d32-9e86-271cf23f8da7-home",
+      "same_uid": true,
+      "request_before": "18079871244",
+      "request_after": "18081644544"
+    },
+    {
+      "name": "flash-01a101e7-5acd-78a0-b8e9-88950db3ecad-home",
+      "same_uid": true,
+      "request_before": "31108758037",
+      "request_after": "31108758037"
+    }
+  ],
+  "final_workloads": {
+    "captured_at": "2026-10-04T11:01:03.424250+00:00",
+    "all_five_ready": true,
+    "pods": [
+      {
+        "name": "flash-01a089a3-5795-7530-b283-6ef2f84e2e82-676549b95-t66g8",
+        "uid": "4804edab-7fa7-475d-b035-6fc7d06ce712",
+        "ready": true
+      },
+      {
+        "name": "flash-01a0ff76-0c51-7752-b251-792c215ff47d-775b94fd7-mgw55",
+        "uid": "694b6d0c-a2b0-4c4c-8e12-11690368d4e3",
+        "ready": true
+      },
+      {
+        "name": "flash-01a0ff77-c342-7a80-b596-85bb3c792c89-5dcf44469b-8tmbc",
+        "uid": "b8c06ef9-aa21-4a4d-9075-6a7edf40f26c",
+        "ready": true
+      },
+      {
+        "name": "flash-01a1005f-0743-7d32-9e86-271cf23f8da7-659dcbc746-52qx6",
+        "uid": "21728f4c-b521-42af-8b81-d371a5b9169e",
+        "ready": true
+      },
+      {
+        "name": "flash-01a101e7-5acd-78a0-b8e9-88950db3ecad-85c7cbbc5-wmdj7",
+        "uid": "c7b65888-9ed1-4713-9b9e-1a4535f9aef8",
+        "ready": true
+      }
+    ]
+  },
+  "database_continuity": {
+    "started_at": "2026-10-04T10:48:57.182391+00:00",
+    "proxy": "ichikawap1:25432",
+    "samples": 180,
+    "errors": [],
+    "same_session": true,
+    "postmaster_start_time": "2026-10-01T15:03:42.238246+09:00",
+    "primary": true,
+    "elapsed_seconds": 370.176,
+    "finished_at": "2026-10-04T10:55:07.383848+00:00",
+    "passed": true
+  },
+  "api_log_observation": {
+    "window_start": "2026-10-04T10:48:00Z",
+    "captured_at": "2026-10-04T11:01:03.424250+00:00",
+    "api_logs": [
+      {
+        "pod": "heterocloud-heterocloud-675d974df4-9ghtl",
+        "read_ok": true,
+        "matched_line_counts": {
+          "tls_eof": 0,
+          "database_connection_failure": 0,
+          "container_diagnostic_failure": 0
+        }
+      },
+      {
+        "pod": "heterocloud-heterocloud-675d974df4-9n2rj",
+        "read_ok": true,
+        "matched_line_counts": {
+          "tls_eof": 0,
+          "database_connection_failure": 0,
+          "container_diagnostic_failure": 0
+        }
+      },
+      {
+        "pod": "heterocloud-heterocloud-675d974df4-rvl2h",
+        "read_ok": true,
+        "matched_line_counts": {
+          "tls_eof": 0,
+          "database_connection_failure": 0,
+          "container_diagnostic_failure": 0
+        }
+      }
+    ]
+  },
+  "ci": {
+    "flash_release": {
+      "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/37196041550",
+      "source_revision": "efdf87c53873f36d3c520299bbcf3ad205ede06e",
+      "conclusion": "success",
+      "jobs": [
+        "verify",
+        "image-amd64",
+        "image-arm64",
+        "manifest"
+      ]
+    },
+    "network_acceptance": {
+      "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/37196780031",
+      "source_revision": "2960c050df19bce9127fdda2253c8305ab91fea3",
+      "conclusion": "success",
+      "jobs": [
+        "acceptance-failure-paths",
+        "live-overlay-browser-e2e"
+      ]
+    },
+    "earlier_network_acceptance": {
+      "url": "https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/37196428630",
+      "conclusion": "failure",
+      "failure": "console navigation exceeded the 3-second limit during recovery"
+    }
+  },
+  "limits": [
+    "Discord delivery was not verified or triggered by the incident probe",
+    "The originally reported runner 503 has no complete causal trace; a generation mismatch was not observed for runner",
+    "Pod readiness and retained PVC identity do not constitute an application data-integrity audit"
+  ]
+}

@@ -1,6 +1,8 @@
 # 2026-10-04 Flash: image update blocked and container diagnostics unavailable
 
-Status: incident remediation in progress. All times below are UTC.
+Status: recovered on 2026-10-04. Monitor generation 4 became `ready` at
+**10:58:07**; authenticated public list/exec verification completed at
+**11:01:24**. All times below are UTC.
 
 ## Impact and evidence
 
@@ -59,18 +61,31 @@ This coupled the recovery tool to the operation it was needed to diagnose.
 Status freshness is relevant to reporting update completion, not to authorizing
 access to an already-owned, running container.
 
-## Concurrent failure with an incomplete causal chain
+## Database transport failure: cause established during investigation
 
 At **10:11:50.403**, HeteroCloud API logs on `ichikawap1` recorded a database
 connection closing without TLS `close_notify`, then an unexpected EOF and HTTP
-500. This establishes a database transport failure; it does **not** establish
-whether a proxy, network interruption, or database event closed the connection.
-The primary's postmaster start time predates this incident (2026-10-01).
+500. At **10:11:50.396701**, the same node's HAProxy marked backend `db-e`
+DOWN and closed 18 sessions under `on-marked-down shutdown-sessions`, immediately
+preceding the API error. The primary's postmaster start time predates this
+incident (2026-10-01).
 
 The database autopilot on that node also logged `invalid database member count`
-and an invalid proxy bundle roughly every 30 seconds. A causal link between
-these messages, the EOF, and runner's intermittent 503 has not been established.
-Do not mark these failures fixed merely because requests later succeed.
+and an invalid proxy bundle roughly every 30 seconds. Two health frontends were
+bound to the same member overlay address/port: one forwarded to the current
+primary, and the other to the local replica. Requests to the replica's overlay
+health endpoint returned 7 successes and 13 HTTP 503 responses in 20 attempts.
+This ambiguous listener caused downstream failure detection and connection
+termination. The proxy reconciler additionally rejected the valid recovered
+two-database/three-DCS-voter topology, preventing automatic repair.
+
+The network repository records the [database root cause, fixes, and IaC
+recovery](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/blob/master/docs/incidents/2026-10-04-db-proxy.md).
+No complete causal trace has been established for runner's originally reported
+503. Both bots later passed authenticated public container listing and
+WebSocket exec even before the Flash rollout; monitor's observed generation
+had advanced to 4, while its old image still ran. This shows why successful
+exec alone does not establish update completion.
 
 ## Fix
 
@@ -115,14 +130,84 @@ Added regressions exercise:
    remain in the suite.
 
 Local validation: 95 Rust tests, clippy with warnings denied, 11 release-artifact
-tests, secret-launcher checks, and Helm lint passed. Release CI and live
-verification results will be appended after deployment. A passing unit suite is
-not a substitute for verifying the accepted generation, actual running image,
-retained PVC identity, and list/exec on both affected services.
+tests, secret-launcher checks, and Helm lint passed. The release workflow also
+passed verification and both architecture builds. A passing unit suite is not a
+substitute for verifying the accepted generation, actual running image,
+retained PVC identity, and list/exec on both affected services. The live rollout
+also exposed pending CSI expansion/rounding affecting other workloads, which
+the stable-allocation unit cases did not model; that impact is recorded below.
 
 ## Deployment and recovery evidence
 
-Pending: immutable release digest, GitOps revision, Argo synchronization,
-monitor generation 4 readiness and image digest, authenticated list/exec results,
-runner continuity, and PVC UID preservation. No recovery timestamp is asserted
-until those checks have completed.
+Flash source fix: [`efdf87c`](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/commit/efdf87c53873f36d3c520299bbcf3ad205ede06e).
+[Release v0.1.42](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/releases/tag/v0.1.42)
+uses immutable image index
+`sha256:04a873a32b794cf85e40b3be523e9a73b129403ec7a40e61f1797a3750d98757`.
+The [release CI](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-Flash/actions/runs/37196041550)
+passed. Network GitOps commit
+[`2960c050`](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/commit/2960c050df19bce9127fdda2253c8305ab91fea3)
+pins this image and the unchanged v0.1.41 workload helper. The targeted Terraform
+apply completed; Argo CD reported **Synced / Healthy** at the release revision.
+Live CRD validation and secret environment injection/removal acceptance passed;
+the disposable acceptance workload was cleaned up.
+
+| Time | Evidence |
+| --- | --- |
+| 10:11:06 | Monitor update accepted as generation 4. |
+| 10:11:50 | Database proxy closed 18 sessions; API logged EOF/500. |
+| 10:48:57–10:55:07 | One database session completed 180 queries over 370 seconds with no errors or session replacement after the proxy fix. |
+| 10:54:09 | New monitor workload started with the requested image digest. |
+| 10:55:39 | Monitor CRD was ready at generation 4; PVC identity and request were retained. |
+| 10:58:07 | Existing outbox retry completed and the public service state became `ready`, without resubmitting the update. |
+| 11:01:24 | Final authenticated public list/exec checks passed for monitor and runner. |
+
+Monitor's Pod image and runtime image ID both match
+`ghcr.io/mizuamedesu/kabubot-monitor@sha256:a639ce0691346e6976f53407f991e20c305b9b36a986cab127ff3de965f2ae47`.
+The PVC retained UID `3c4d0cf4-d45a-440a-847d-f7253cd26a87` and its original
+4,623,292,749-byte request. The 437,226,477-byte rootfs allocation plus that
+request and the 308,189,894-byte image equals the configured 5 GiB budget.
+Monitor required the expected Pod replacement to run its new image.
+
+The first post-rollout API check correctly failed the overall acceptance
+because the service record still said `updating`, despite successful list/exec
+and a ready new Pod. The existing reconciliation event was waiting for its
+backoff deadline, 10:58:07. Its eighteenth attempt delivered successfully; no
+generation was incremented or database state manually marked ready.
+
+Final public verification made **60/60 successful HTTP container-list requests**
+using new connections and executed a harmless `printf` through each service's
+WebSocket, checking the returned marker. Both services reported `ready` at
+their original requested generations (monitor 4, runner 2). Temporary IAM
+credentials were scoped to these two services and revoked after the probe.
+All three API replicas' logs contained no matching TLS EOF, database connection,
+or container-diagnostic failures from 10:48 through the 11:01 observation.
+
+The final [GitHub runner VPN + Chromium workflow](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/37196780031)
+passed. An [earlier run during recovery](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/actions/runs/37196428630)
+failed the console's three-second navigation limit; it is not counted as a pass.
+
+### Additional rollout impact
+
+The broad check that every other workload remained on the same Pod **failed**:
+nginx and whisper also rolled while their pending volume expansions and CSI
+rounding settled. Their application images and the whisper secret helper image
+did not change. The retained PVC requests increased to rounded allocations,
+and the controller reduced automatic rootfs allocation by the same number of
+bytes to stay within each service's disk budget:
+
+| Service | PVC request before → after (bytes) | Rootfs before → after (bytes) |
+| --- | --- | --- |
+| nginx | 945,303,070 → 945,815,552 | 105,033,674 → 104,521,192 |
+| whisper | 18,079,871,244 → 18,081,644,544 | 1,073,741,824 → 1,071,968,524 |
+
+Both workloads were ready by the final observation. All five service PVC UIDs
+were retained. Runner and the development service
+`01a101e7-5acd-78a0-b8e9-88950db3ecad` retained the same Pod UID, container ID,
+and restart count; the development container's earlier OOM restart is separate
+from this incident. There was no PostgreSQL restart. These checks establish
+observed continuity, not an application data-integrity audit or proof of zero
+interruption for the two additionally replaced Pods.
+
+The [sanitized verification record](2026-10-04-flash-update-exec-verification.json)
+includes successful recovery checks, the earlier pending-state result, the
+failed broad continuity check, and CI links. Discord delivery remains unverified.
