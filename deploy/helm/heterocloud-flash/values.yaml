@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash
-  tag: "0.1.44"
+  tag: "0.1.45"
   pullPolicy: IfNotPresent
 
 # Pin separately when a provider-only update must retain existing helper images.
@@ -104,3 +104,7 @@ serviceAccount:
 
 nodeSelector: {}
 tolerations: []
+
+# Public HTTPS HeteroCloud origin used by Pod-bound, rotating workload identity.
+workloadIdentity:
+  endpoint: ""

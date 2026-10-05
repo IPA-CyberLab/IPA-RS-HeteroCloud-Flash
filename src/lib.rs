@@ -3,6 +3,7 @@ pub mod crd;
 pub mod domain;
 pub mod gpu_scheduler;
 pub mod image;
+pub mod lb_auth;
 pub mod reconcile;
 pub mod vpc;
 mod web;

@@ -12,7 +12,7 @@ use k8s_openapi::{
     api::{
         apps::v1::Deployment,
         autoscaling::v2::HorizontalPodAutoscaler,
-        core::v1::{Node, PersistentVolumeClaim, Pod, Service, ServiceAccount},
+        core::v1::{Node, PersistentVolumeClaim, Pod, Secret, Service, ServiceAccount},
         networking::v1::NetworkPolicy,
     },
     apimachinery::pkg::apis::meta::v1::{ManagedFieldsEntry, OwnerReference},
@@ -42,6 +42,7 @@ use crate::{
     domain::{EndpointMode, ExposureType, TrafficMode, ValidationError},
     gpu_scheduler::run_gpu_scheduler,
     image::{GIB_BYTES, ImageInspection, ImageInspector},
+    lb_auth::{self, SecurityPolicy},
     web::{
         GATEWAY_NAME, GATEWAY_NAMESPACE, GATEWAY_SECTION, HTTPRoute, PROXY_NAMESPACE,
         route_is_ready,
@@ -159,6 +160,7 @@ pub struct ControllerContext {
     secret_manager_networks: Vec<IpNet>,
     vpc_guard_networks: Vec<IpNet>,
     public_domain: Option<String>,
+    workload_identity_endpoint: Option<String>,
     activator_namespace: String,
     activator_service: String,
     activator_port: u16,
@@ -175,6 +177,7 @@ pub struct ControllerConfig {
     pub secret_manager_networks: Vec<IpNet>,
     pub vpc_guard_networks: Vec<IpNet>,
     pub public_domain: Option<String>,
+    pub workload_identity_endpoint: Option<String>,
     pub activator_namespace: String,
     pub activator_service: String,
     pub activator_port: u16,
@@ -196,6 +199,7 @@ impl ControllerContext {
             secret_manager_networks: config.secret_manager_networks,
             vpc_guard_networks: config.vpc_guard_networks,
             public_domain: config.public_domain,
+            workload_identity_endpoint: config.workload_identity_endpoint,
             activator_namespace: config.activator_namespace,
             activator_service: config.activator_service,
             activator_port: config.activator_port,
@@ -220,6 +224,8 @@ pub async fn run_controller(
     let pods = Api::<Pod>::namespaced(client.clone(), &namespace);
     let autoscalers = Api::<HorizontalPodAutoscaler>::namespaced(client.clone(), &namespace);
     let http_routes = Api::<HTTPRoute>::namespaced(client.clone(), &namespace);
+    let security_policies = Api::<SecurityPolicy>::namespaced(client.clone(), &namespace);
+    let oidc_secrets = Api::<Secret>::namespaced(client.clone(), &namespace);
     let context = Arc::new(ControllerContext::new(client, image_inspector, config));
 
     info!("FlashService controller started");
@@ -230,6 +236,11 @@ pub async fn run_controller(
             .owns(deployments, watcher::Config::default())
             .owns(autoscalers, watcher::Config::default())
             .owns(http_routes, watcher::Config::default())
+            .owns(security_policies, watcher::Config::default())
+            .owns(
+                oidc_secrets,
+                watcher::Config::default().labels("flash.heterocloud.io/credential=oidc"),
+            )
             .owns(network_services, watcher::Config::default())
             .owns(service_accounts, watcher::Config::default())
             .owns(network_policies, watcher::Config::default())
@@ -603,6 +614,28 @@ async fn reconcile(
     let usage_records =
         Api::<FlashUsageRecord>::namespaced(context.client.clone(), &context.namespace);
 
+    let owner = flash
+        .controller_owner_ref(&())
+        .ok_or(ReconcileError::MissingOwnerReference)?;
+    let hostname = public_hostname(&flash, context.public_domain.as_deref())?;
+    let desired_route = desired_http_route(
+        &flash,
+        &owner,
+        hostname.as_deref(),
+        &context.activator_namespace,
+        &context.activator_service,
+        context.activator_port,
+    )?;
+    let authentication = lb_auth::prepare(
+        context.client.clone(),
+        &context.namespace,
+        &flash,
+        &owner,
+        hostname.as_deref(),
+        desired_route.as_ref(),
+    )
+    .await?;
+
     // Stopping must remain possible even when image inspection or VPC setup is
     // failing. Keep the Deployment template, PVC, endpoints and credentials;
     // only remove the HPA and drain replicas before releasing the GPU lease.
@@ -633,6 +666,10 @@ async fn reconcile(
             }
         }
         let mut status = explicit_stop_status(&flash, &pods.items, gpu_released);
+        status.oidc_callback_url = hostname
+            .as_ref()
+            .filter(|_| flash.spec.workload.exposure.endpoint_mode == EndpointMode::Web)
+            .map(|hostname| format!("https://{hostname}{}", lb_auth::CALLBACK_PATH));
         apply_weekly_meter(&mut status, &meter);
         let complete = status.stopped;
         patch_status_if_changed(&services, &flash, status).await?;
@@ -702,9 +739,6 @@ async fn reconcile(
     let cold = should_scale_to_zero(&flash, now);
     let quota_message = exhausted_quota_message(&weekly_meter);
     let suspended = cold || quota_message.is_some();
-    let owner = flash
-        .controller_owner_ref(&())
-        .ok_or(ReconcileError::MissingOwnerReference)?;
     let gpu_job_state = reconcile_gpu_job(
         &context.client,
         &context.namespace,
@@ -857,20 +891,12 @@ async fn reconcile(
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
             gpu_assignment,
+            workload_identity_endpoint: context.workload_identity_endpoint.as_deref(),
         },
     )?;
-    let hostname = public_hostname(&flash, context.public_domain.as_deref())?;
     let desired_network_service =
         desired_service_with_hostname(&flash, &owner, hostname.as_deref())?;
     let http_routes = Api::<HTTPRoute>::namespaced(context.client.clone(), &context.namespace);
-    let desired_route = desired_http_route(
-        &flash,
-        &owner,
-        hostname.as_deref(),
-        &context.activator_namespace,
-        &context.activator_service,
-        context.activator_port,
-    )?;
     if desired_route.is_none() && !delete_http_route(&http_routes, &name).await? {
         return Ok(Action::requeue(Duration::from_secs(2)));
     }
@@ -915,7 +941,10 @@ async fn reconcile(
             .await?;
     }
     let secret_account_name = flash_secret_service_account_name(&flash)?;
-    if flash.spec.workload.secret_env.is_empty() && flash.spec.workload.secret_files.is_empty() {
+    if flash.spec.workload.secret_env.is_empty()
+        && flash.spec.workload.secret_files.is_empty()
+        && flash.spec.workload.task_role.is_none()
+    {
         match service_accounts
             .delete(&secret_account_name, &DeleteParams::default())
             .await
@@ -965,6 +994,11 @@ async fn reconcile(
         None
     };
     let http_route = if let Some(route) = desired_route {
+        let route = if authentication.ready {
+            route
+        } else {
+            lb_auth::blocked_route(route)
+        };
         Some(
             http_routes
                 .patch(&name, &params, &Patch::Apply(&route))
@@ -977,7 +1011,11 @@ async fn reconcile(
         .as_ref()
         .map(|service| {
             if flash.spec.workload.exposure.endpoint_mode == EndpointMode::Web {
-                web_endpoints(&flash, service, http_route.as_ref(), hostname.as_deref())
+                if authentication.ready {
+                    web_endpoints(&flash, service, http_route.as_ref(), hostname.as_deref())
+                } else {
+                    Vec::new()
+                }
             } else {
                 service_endpoints(&flash, service, hostname.as_deref())
             }
@@ -998,6 +1036,10 @@ async fn reconcile(
         runtime_class: runtime_class.into(),
         endpoints,
         private_endpoints: private_endpoints(&flash),
+        oidc_callback_url: hostname
+            .as_ref()
+            .filter(|_| flash.spec.workload.exposure.endpoint_mode == EndpointMode::Web)
+            .map(|hostname| format!("https://{hostname}{}", lb_auth::CALLBACK_PATH)),
         resolved_image: Some(inspection.resolved_image),
         image_size_bytes: Some(inspection.image_size_bytes),
         writable_storage_bytes: Some(inspection.writable_storage_bytes),
@@ -1037,6 +1079,10 @@ async fn reconcile(
             Some(message) => format!("{message}; {note}"),
             None => note.into(),
         });
+    }
+    if let Some(message) = authentication.message {
+        status.phase = FlashServicePhase::Provisioning;
+        status.message = Some(message.into());
     }
     let phase_ready = status.phase == FlashServicePhase::Ready;
     patch_status_if_changed(&services, &flash, status).await?;
@@ -1211,6 +1257,7 @@ struct DeploymentOptions<'a> {
     registry_pull_secret: Option<&'a str>,
     admin_volume_mounts: &'a [AdminVolumeMount],
     gpu_assignment: Option<&'a FlashGpuAssignment>,
+    workload_identity_endpoint: Option<&'a str>,
 }
 
 fn flash_secret_service_account_name(flash: &FlashService) -> Result<String, ReconcileError> {
@@ -1306,11 +1353,22 @@ fn desired_deployment(
             })
         })
         .collect::<Vec<_>>();
-    let env = workload
+    let mut env = workload
         .env
         .iter()
         .map(|(name, value)| json!({"name": name, "value": value}))
         .collect::<Vec<_>>();
+    if let Some(role) = workload.task_role {
+        let endpoint = options.workload_identity_endpoint.ok_or_else(|| {
+            anyhow::anyhow!("task_role requires provider workloadIdentity.endpoint")
+        })?;
+        pod_annotations.insert("iam.heterocloud.io/task-role".into(), role.to_string());
+        env.extend([
+            json!({"name":"HETEROCLOUD_ENDPOINT","value":endpoint}),
+            json!({"name":"HETEROCLOUD_ORGANIZATION_ID","value":flash.spec.organization_id}),
+            json!({"name":"HETEROCLOUD_WORKLOAD_TOKEN_FILE","value":"/var/run/secrets/heterocloud-workload/token"}),
+        ]);
+    }
     let mut container = json!({
         "name": "workload",
         "image": resolved_image,
@@ -1377,6 +1435,9 @@ fn desired_deployment(
         container["args"] = json!(launcher_args);
     }
     let mut volume_mounts = Vec::new();
+    if workload.task_role.is_some() {
+        volume_mounts.push(json!({"name":"heterocloud-workload-identity","mountPath":"/var/run/secrets/heterocloud-workload","readOnly":true}));
+    }
     if !secret_env.is_empty() {
         volume_mounts.push(json!({
             "name": SECRET_HELPER_VOLUME,
@@ -1424,6 +1485,10 @@ fn desired_deployment(
         }],
         "containers": [container]
     });
+    if workload.task_role.is_some() {
+        pod_spec["serviceAccountName"] = json!(secret_account_name);
+        pod_spec["serviceAccount"] = json!(secret_account_name);
+    }
     if !secret_env.is_empty() {
         pod_spec["serviceAccountName"] = json!(secret_account_name);
         pod_spec["serviceAccount"] = json!(secret_account_name);
@@ -1507,6 +1572,10 @@ fn desired_deployment(
             "persistentVolumeClaim": {"claimName": mount.claim_name},
         })
     }));
+    if workload.task_role.is_some() {
+        volumes.push(json!({"name":"heterocloud-workload-identity","projected":{"defaultMode":292,
+            "sources":[{"serviceAccountToken":{"audience":"heterocloud-workload","expirationSeconds":3600,"path":"token"}}]}}));
+    }
     if !volumes.is_empty() {
         pod_spec["volumes"] = Value::Array(volumes);
     }
@@ -3061,6 +3130,7 @@ mod tests {
                     stopped: false,
                     region: "heteronet-global".into(),
                     image: "example.invalid/udp:v1".into(),
+                    task_role: None,
                     replicas: 3,
                     autoscaling: None,
                     cpu_millis: 250,
@@ -3076,6 +3146,7 @@ mod tests {
                         service_port: 7777,
                     }],
                     exposure: FlashExposure {
+                        authentication: None,
                         endpoint_mode: crate::domain::EndpointMode::Ip,
                         kind: ExposureType::Public,
                         traffic_mode: mode,
@@ -3093,6 +3164,91 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn task_iam_projects_a_bound_rotating_identity_and_oidc_does_not_change_pods()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        let options = || DeploymentOptions {
+            workload_identity_endpoint: Some("https://cloud.example.test/"),
+            ..Default::default()
+        };
+        let original = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "nginx:alpine",
+            1_073_741_824,
+            options(),
+        )?)?;
+        flash.spec.workload.exposure.authentication =
+            Some(crate::domain::FlashOidcAuthentication {
+                issuer_url: "https://identity.example.test/realms/test".into(),
+                client_id: "web".into(),
+                client_secret_ref: "oidc-secret".into(),
+                scopes: vec!["openid".into()],
+            });
+        let authenticated = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "nginx:alpine",
+            1_073_741_824,
+            options(),
+        )?)?;
+        assert_eq!(
+            original["spec"]["template"], authenticated["spec"]["template"],
+            "load balancer authentication must not restart a workload"
+        );
+        let role = uuid::Uuid::from_u128(9);
+        flash.spec.workload.task_role = Some(role);
+        assert!(
+            desired_deployment(
+                &flash,
+                &owner(),
+                "nginx:alpine",
+                1_073_741_824,
+                DeploymentOptions::default()
+            )
+            .is_err()
+        );
+        let iam = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "nginx:alpine",
+            1_073_741_824,
+            options(),
+        )?)?;
+        let pod = &iam["spec"]["template"]["spec"];
+        assert_eq!(pod["automountServiceAccountToken"], false);
+        assert_eq!(
+            iam["spec"]["template"]["metadata"]["annotations"]["iam.heterocloud.io/task-role"],
+            role.to_string()
+        );
+        let volume = pod["volumes"]
+            .as_array()
+            .ok_or("volumes")?
+            .iter()
+            .find(|v| v["name"] == "heterocloud-workload-identity")
+            .ok_or("identity volume")?;
+        assert_eq!(
+            volume["projected"]["sources"][0]["serviceAccountToken"]["audience"],
+            "heterocloud-workload"
+        );
+        assert_eq!(
+            volume["projected"]["sources"][0]["serviceAccountToken"]["expirationSeconds"],
+            3600
+        );
+        let env = pod["containers"][0]["env"].as_array().ok_or("env")?;
+        assert!(
+            env.iter().any(|v| v["name"] == "HETEROCLOUD_ENDPOINT"
+                && v["value"] == "https://cloud.example.test/")
+        );
+        assert!(
+            env.iter()
+                .any(|v| v["name"] == "HETEROCLOUD_WORKLOAD_TOKEN_FILE")
+        );
+        assert!(!env.iter().any(|v| v["name"] == "HETEROCLOUD_API_KEY"));
+        Ok(())
     }
 
     #[test]

@@ -28,9 +28,9 @@ use heterocloud_flash::{
     reconcile::{projected_weekly_usage, utc_week_start},
     workload_runtime_class,
 };
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::{
-    Api, Client,
+    Api, Client, Resource,
     api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, TerminalSize},
 };
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,8 @@ const EXEC_SHELL_SCRIPT: &str = "export TERM=xterm-256color COLORTERM=truecolor 
 
 #[derive(Clone)]
 struct AppState {
+    client: Client,
+    namespace: String,
     services: Api<FlashService>,
     usage_records: Api<FlashUsageRecord>,
     gpu_devices: Api<FlashGpuDevice>,
@@ -98,6 +100,8 @@ async fn run() -> Result<()> {
         .unwrap_or(32)
         .clamp(1, 256);
     let state = Arc::new(AppState {
+        client: client.clone(),
+        namespace: namespace.clone(),
         services: Api::namespaced(client.clone(), &namespace),
         usage_records: Api::namespaced(client.clone(), &namespace),
         gpu_devices: Api::all(client.clone()),
@@ -127,6 +131,10 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route(
             "/internal/v1/service-instances/{service_instance_id}",
             put(reconcile).delete(remove).get(get_status),
+        )
+        .route(
+            "/internal/v1/service-instances/{service_instance_id}/load-balancer/secrets/{name}",
+            put(put_load_balancer_secret).delete(delete_load_balancer_secret),
         )
         .route(
             "/internal/v1/service-instances/{service_instance_id}/containers",
@@ -543,6 +551,138 @@ async fn reconcile(
 #[serde(deny_unknown_fields)]
 struct DeleteQuery {
     generation: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoadBalancerSecretWrite {
+    value: String,
+}
+
+async fn load_balancer_secret_context(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: Uuid,
+    name: &str,
+) -> Result<(ProviderClaims, Option<FlashService>), ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(headers, heterocloud_flash::lb_auth::SECRET_ACTION)?;
+    validate_command(&claims, id, claims.generation)?;
+    let reference = heterocloud_flash::domain::FlashOidcAuthentication {
+        issuer_url: "https://issuer.example".into(),
+        client_id: "validation".into(),
+        client_secret_ref: name.into(),
+        scopes: vec![],
+    };
+    reference
+        .validate()
+        .map_err(|_| ApiError::BadRequest("Invalid client secret reference".into()))?;
+    let resource = state.services.get_opt(&resource_name(id)).await?;
+    if let Some(resource) = &resource {
+        validate_resource_identity(resource, &claims, id)?;
+        if resource.spec.desired_generation > claims.generation
+            || resource.metadata.deletion_timestamp.is_some()
+        {
+            return Err(ApiError::Conflict(
+                "generation is stale or service is deleting".into(),
+            ));
+        }
+    }
+    Ok((claims, resource))
+}
+
+async fn put_load_balancer_secret(
+    State(state): State<Arc<AppState>>,
+    Path((id, name)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+    Json(request): Json<LoadBalancerSecretWrite>,
+) -> Result<StatusCode, ApiError> {
+    if request.value.is_empty() || request.value.len() > 16_384 || request.value.contains('\0') {
+        return Err(ApiError::BadRequest(
+            "Client secret must contain 1 to 16384 bytes without NUL".into(),
+        ));
+    }
+    let (claims, resource) = load_balancer_secret_context(&state, &headers, id, &name).await?;
+    if resource.as_ref().is_some_and(|resource| {
+        resource
+            .spec
+            .workload
+            .exposure
+            .authentication
+            .as_ref()
+            .is_some_and(|auth| auth.client_secret_ref == name)
+    }) {
+        heterocloud_flash::lb_auth::block_existing_route(
+            state.client.clone(),
+            &state.namespace,
+            &resource_name(id),
+        )
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    }
+    let secrets = Api::<Secret>::namespaced(state.client.clone(), &state.namespace);
+    let secret_name = heterocloud_flash::lb_auth::secret_name(id, &name);
+    let labels = json!({"flash.heterocloud.io/credential":"oidc", "flash.heterocloud.io/instance":id.to_string(),
+        "flash.heterocloud.io/organization":claims.organization_id.to_string(), "flash.heterocloud.io/project":claims.project_id.to_string()});
+    if let Some(existing) = secrets
+        .get_opt(&secret_name)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        && serde_json::to_value(existing.metadata.labels).map_err(|_| ApiError::Internal)? != labels
+    {
+        return Err(ApiError::Forbidden);
+    }
+    let mut desired = json!({"apiVersion":"v1", "kind":"Secret", "metadata":{"name":secret_name,"labels":labels},
+        "type":"Opaque", "data":{"client-secret":k8s_openapi::ByteString(request.value.into_bytes())}});
+    if let Some(owner) = resource
+        .as_ref()
+        .and_then(|resource| resource.controller_owner_ref(&()))
+    {
+        desired["metadata"]["ownerReferences"] = json!([owner]);
+    }
+    secrets
+        .patch(
+            &secret_name,
+            &PatchParams::apply("heterocloud-flash-oidc-secret").force(),
+            &Patch::Apply(&desired),
+        )
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_load_balancer_secret(
+    State(state): State<Arc<AppState>>,
+    Path((id, name)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let (_, resource) = load_balancer_secret_context(&state, &headers, id, &name).await?;
+    if resource.as_ref().is_some_and(|resource| {
+        resource
+            .spec
+            .workload
+            .exposure
+            .authentication
+            .as_ref()
+            .is_some_and(|auth| auth.client_secret_ref == name)
+    }) {
+        return Err(ApiError::Conflict(
+            "Detach load balancer authentication before deleting its secret".into(),
+        ));
+    }
+    match Api::<Secret>::namespaced(state.client.clone(), &state.namespace)
+        .delete(
+            &heterocloud_flash::lb_auth::secret_name(id, &name),
+            &DeleteParams::default(),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(kube::Error::Api(error)) if error.code == 404 => {}
+        Err(_) => return Err(ApiError::Internal),
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn remove(
@@ -1309,6 +1449,8 @@ mod tests {
             "test",
         );
         let app = super::app_router(Arc::new(super::AppState {
+            client: client.clone(),
+            namespace: "test".into(),
             services: Api::namespaced(client.clone(), "test"),
             usage_records: Api::namespaced(client.clone(), "test"),
             gpu_devices: Api::all(client.clone()),

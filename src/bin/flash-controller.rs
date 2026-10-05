@@ -40,6 +40,18 @@ async fn run() -> Result<()> {
     if let Some(domain) = &public_domain {
         validate_public_domain(domain)?;
     }
+    if let Some(endpoint) = optional("FLASH_WORKLOAD_IDENTITY_ENDPOINT") {
+        let url = url::Url::parse(&endpoint).context("invalid workload identity endpoint")?;
+        anyhow::ensure!(
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "workload identity endpoint must be HTTPS without credentials/query/fragment"
+        );
+    }
     let admin_volume_mounts = optional("FLASH_ADMIN_VOLUME_MOUNTS_JSON")
         .map(|value| serde_json::from_str::<AdminVolumeMounts>(&value))
         .transpose()
@@ -105,6 +117,7 @@ async fn run() -> Result<()> {
             secret_manager_networks,
             vpc_guard_networks: network_cidrs("FLASH_VPC_GUARD_CIDRS_JSON")?,
             public_domain,
+            workload_identity_endpoint: optional("FLASH_WORKLOAD_IDENTITY_ENDPOINT"),
             activator_namespace,
             activator_service,
             activator_port,

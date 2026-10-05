@@ -173,6 +173,25 @@ spec:
                           type: string
                         maxItems: 64
                         type: array
+                      authentication:
+                        description: Optional browser authentication at the HTTP/HTTPS load balancer.
+                        nullable: true
+                        properties:
+                          client_id:
+                            type: string
+                          client_secret_ref:
+                            type: string
+                          issuer_url:
+                            type: string
+                          scopes:
+                            items:
+                              type: string
+                            type: array
+                        required:
+                        - client_id
+                        - client_secret_ref
+                        - issuer_url
+                        type: object
                       denied_source_cidrs:
                         default: []
                         items:
@@ -302,6 +321,11 @@ spec:
                     default: false
                     description: An explicit stop is independent of HTTP idle scaling and runtime quotas.
                     type: boolean
+                  task_role:
+                    description: IAM service account assumed only by this workload; no fixed API key.
+                    format: uuid
+                    nullable: true
+                    type: string
                 required:
                 - cpu_millis
                 - exposure
@@ -442,6 +466,9 @@ spec:
               observed_generation:
                 format: int64
                 type: integer
+              oidc_callback_url:
+                nullable: true
+                type: string
               phase:
                 enum:
                 - provisioning
