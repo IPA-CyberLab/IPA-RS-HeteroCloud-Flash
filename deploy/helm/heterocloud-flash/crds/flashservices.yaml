@@ -298,6 +298,9 @@ spec:
                       type: string
                     description: Legacy mappings are converted to environment variable names when read.
                     type: object
+                  stopped:
+                    description: An explicit stop is independent of HTTP idle scaling and runtime quotas.
+                    type: boolean
                 required:
                 - cpu_millis
                 - exposure
@@ -476,6 +479,10 @@ spec:
                 type: string
               runtime_class:
                 type: string
+              stopped:
+                default: false
+                description: True only after an explicit stop has drained every workload Pod.
+                type: boolean
               weekly_usage:
                 nullable: true
                 properties:

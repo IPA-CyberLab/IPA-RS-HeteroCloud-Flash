@@ -51,6 +51,9 @@ pub struct FlashSpec {
     pub region: String,
     pub image: String,
     pub replicas: u32,
+    /// An explicit stop is independent of HTTP idle scaling and runtime quotas.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoscaling: Option<FlashAutoscaling>,
     pub cpu_millis: u32,
@@ -764,6 +767,7 @@ mod tests {
 
     fn valid_spec() -> FlashSpec {
         FlashSpec {
+            stopped: false,
             region: "heteronet-global".into(),
             image: "ghcr.io/example/udp-server:v1".into(),
             replicas: 3,
@@ -796,6 +800,20 @@ mod tests {
             args: Vec::new(),
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn explicit_stop_defaults_to_running_and_keeps_requested_replica_configuration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = valid_spec();
+        let old = serde_json::to_value(&spec)?;
+        assert!(old.get("stopped").is_none());
+        assert!(!serde_json::from_value::<FlashSpec>(old)?.stopped);
+        spec.stopped = true;
+        spec.validate()?;
+        assert_eq!(spec.replicas, 3);
+        assert_eq!(serde_json::to_value(&spec)?["stopped"], true);
+        Ok(())
     }
 
     #[test]

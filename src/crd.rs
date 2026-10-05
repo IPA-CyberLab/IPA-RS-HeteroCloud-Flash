@@ -346,6 +346,9 @@ pub struct FlashServiceStatus {
     pub memory_quota_exhausted: bool,
     #[serde(default)]
     pub cold: bool,
+    /// True only after an explicit stop has drained every workload Pod.
+    #[serde(default)]
+    pub stopped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_scheduling: Option<FlashGpuSchedulingStatus>,
 }

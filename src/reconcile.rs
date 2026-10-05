@@ -603,6 +603,46 @@ async fn reconcile(
     let usage_records =
         Api::<FlashUsageRecord>::namespaced(context.client.clone(), &context.namespace);
 
+    // Stopping must remain possible even when image inspection or VPC setup is
+    // failing. Keep the Deployment template, PVC, endpoints and credentials;
+    // only remove the HPA and drain replicas before releasing the GPU lease.
+    if flash.spec.workload.stopped {
+        let now = Utc::now().timestamp();
+        let meter = meter_weekly_usage(&services, &usage_records, &flash, now).await?;
+        suspend_deployment(&context.client, &context.namespace, &name).await?;
+        let pods = Api::<Pod>::namespaced(context.client.clone(), &context.namespace)
+            .list(&ListParams::default().labels(&format!(
+                "flash.heterocloud.io/instance={}",
+                flash.spec.service_instance_id
+            )))
+            .await?;
+        let mut gpu_released = flash.spec.workload.effective_gpu_count() == 0;
+        if pods.items.is_empty() && flash.spec.workload.effective_gpu_count() > 0 {
+            let jobs = Api::<FlashGpuJob>::namespaced(context.client.clone(), &context.namespace);
+            if let Some(job) = jobs.get_opt(&name).await? {
+                if job.metadata.deletion_timestamp.is_none() {
+                    match jobs.delete(&name, &DeleteParams::default()).await {
+                        Ok(_) => {}
+                        Err(kube::Error::Api(response)) if response.code == 404 => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                gpu_released = false;
+            } else {
+                gpu_released = true;
+            }
+        }
+        let mut status = explicit_stop_status(&flash, &pods.items, gpu_released);
+        apply_weekly_meter(&mut status, &meter);
+        let complete = status.stopped;
+        patch_status_if_changed(&services, &flash, status).await?;
+        return Ok(Action::requeue(Duration::from_secs(if complete {
+            30
+        } else {
+            2
+        })));
+    }
+
     if let Err(error) = flash
         .spec
         .workload
@@ -1009,6 +1049,35 @@ async fn reconcile(
     } else {
         Ok(action)
     }
+}
+
+fn explicit_stop_status(
+    flash: &FlashService,
+    pods: &[Pod],
+    gpu_released: bool,
+) -> FlashServiceStatus {
+    let mut status = flash.status.clone().unwrap_or_default();
+    status.observed_generation = flash.spec.desired_generation;
+    status.desired_replicas = 0;
+    status.ready_replicas =
+        i32::try_from(pods.iter().filter(|pod| pod_is_ready(pod)).count()).unwrap_or(i32::MAX);
+    status.runtime_class = workload_runtime_class(flash.spec.workload.effective_gpu_count()).into();
+    status.cold = false;
+    status.stopped = pods.is_empty() && gpu_released;
+    status.phase = if status.stopped {
+        FlashServicePhase::Ready
+    } else {
+        FlashServicePhase::Provisioning
+    };
+    if gpu_released {
+        status.gpu_scheduling = None;
+    }
+    status.message = Some(if status.stopped {
+        "stopped; persistent home and service settings are retained".into()
+    } else {
+        "stopping; waiting for workload Pods and GPU reservation to drain".into()
+    });
+    status
 }
 
 fn update_workload_status(
@@ -2984,6 +3053,7 @@ mod tests {
                 subject_id: Some("00000000-0000-0000-0000-000000000004".into()),
                 policy: crate::crd::FlashServicePolicy::default(),
                 workload: FlashSpec {
+                    stopped: false,
                     region: "heteronet-global".into(),
                     image: "example.invalid/udp:v1".into(),
                     replicas: 3,
@@ -3018,6 +3088,42 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn explicit_stop_waits_for_all_pods_and_gpu_release_and_retains_image_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.stopped = true;
+        flash.spec.desired_generation = 2;
+        flash.status = Some(FlashServiceStatus {
+            observed_generation: 1,
+            phase: FlashServicePhase::Ready,
+            ready_replicas: 1,
+            desired_replicas: 1,
+            resolved_image: Some("example/workspace@sha256:existing".into()),
+            ..Default::default()
+        });
+        let terminating: Pod = serde_json::from_value(json!({
+            "metadata": {"name": "workspace", "deletionTimestamp": "2026-10-05T00:00:00Z"},
+            "status": {"phase": "Running"}
+        }))?;
+        let draining = super::explicit_stop_status(&flash, &[terminating], true);
+        assert!(!draining.stopped);
+        assert_eq!(draining.phase, FlashServicePhase::Provisioning);
+        assert!(!super::explicit_stop_status(&flash, &[], false).stopped);
+        let stopped = super::explicit_stop_status(&flash, &[], true);
+        assert!(stopped.stopped);
+        assert_eq!(stopped.phase, FlashServicePhase::Ready);
+        assert_eq!(stopped.observed_generation, 2);
+        assert_eq!(stopped.desired_replicas, 0);
+        assert_eq!(stopped.ready_replicas, 0);
+        assert!(!stopped.cold);
+        assert_eq!(
+            stopped.resolved_image,
+            flash.status.as_ref().and_then(|s| s.resolved_image.clone())
+        );
+        Ok(())
     }
 
     #[test]

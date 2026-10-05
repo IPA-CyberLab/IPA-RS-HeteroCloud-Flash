@@ -113,6 +113,7 @@ async fn proxy_inner(state: &AppState, request: Request) -> Result<Response, Act
     {
         return Err(ActivatorError::NotFound);
     }
+    ensure_running(&service)?;
     if service
         .status
         .as_ref()
@@ -239,6 +240,7 @@ async fn wait_until_ready(
             .get(name)
             .await
             .map_err(ActivatorError::Kubernetes)?;
+        ensure_running(&service)?;
         if service
             .status
             .as_ref()
@@ -276,6 +278,14 @@ async fn wait_until_ready(
     }
 }
 
+fn ensure_running(service: &FlashService) -> Result<(), ActivatorError> {
+    if service.spec.workload.stopped {
+        Err(ActivatorError::Stopped)
+    } else {
+        Ok(())
+    }
+}
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str().to_ascii_lowercase().as_str(),
@@ -294,6 +304,8 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 enum ActivatorError {
     #[error("service not found")]
     NotFound,
+    #[error("service is explicitly stopped")]
+    Stopped,
     #[error("weekly GPU runtime limit reached")]
     QuotaExceeded,
     #[error("cold start timed out")]
@@ -309,6 +321,12 @@ enum ActivatorError {
 impl IntoResponse for ActivatorError {
     fn into_response(self) -> Response {
         let (status, code, message, retry_after) = match self {
+            Self::Stopped => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_stopped",
+                "service is stopped; start it through the HeteroCloud API",
+                None,
+            ),
             Self::NotFound => (
                 StatusCode::NOT_FOUND,
                 "not_found",
@@ -394,6 +412,26 @@ fn install_crypto_provider() {
 mod tests {
     use super::service_id_from_hostname;
     use uuid::Uuid;
+
+    #[test]
+    fn explicitly_stopped_service_cannot_be_activated() -> Result<(), Box<dyn std::error::Error>> {
+        let mut service: super::FlashService = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "workspace"},
+            "spec": {"desired_generation": 1, "display_name": "Workspace",
+                "organization_id": Uuid::nil(), "project_id": Uuid::nil(), "service_instance_id": Uuid::nil(),
+                "workload": {"region":"test", "image":"example/workspace", "replicas":1,
+                    "cpu_millis":100, "memory_mib":128, "ports":[],
+                    "exposure":{"type":"internal", "traffic_mode":"forwarded"},
+                    "env":{}, "command":[], "args":[], "metadata":{}, "stopped":true}}
+        }))?;
+        assert!(matches!(
+            super::ensure_running(&service),
+            Err(super::ActivatorError::Stopped)
+        ));
+        service.spec.workload.stopped = false;
+        assert!(super::ensure_running(&service).is_ok());
+        Ok(())
+    }
 
     #[test]
     fn host_mapping_is_exact() {

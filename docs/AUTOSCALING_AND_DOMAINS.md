@@ -55,6 +55,27 @@ not the original seed. Workload readiness does not certify metrics availability.
 See Kubernetes documentation on [multiple metrics](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/)
 and [SSA replica ownership transfer](https://kubernetes.io/docs/reference/using-api/server-side-apply/).
 
+## Explicit stop and start
+
+`workload.stopped` defaults to false. When true, the controller removes the HPA,
+scales the existing Deployment to zero, and waits for every owned Pod to disappear
+before releasing a GPU reservation. It retains the Deployment template, persistent
+`/root` PVC, secrets, endpoints and network configuration. Stopping bypasses image
+inspection and the VPC readiness gate so that a failed update can still be stopped.
+`status.stopped` is true only after draining completes; the provider acknowledges
+that generation as Ready. Runtime accounting stops once no Ready replicas remain.
+
+Clearing the flag restores the configured replicas/autoscaling; those fields are
+not changed by stopping. HTTP requests cannot wake an explicitly stopped service.
+A resume refreshes the HTTP activity timestamp to prevent immediate idle suspension.
+Use HeteroCloud's service-scoped stop/start API or CLI to retain configuration and
+recheck quotas, GPU access and VPC ownership on start. Files outside a persistent
+mount are recreated, so workspace home/project data must use `/root`.
+
+Upgrade the FlashService CRD before using the flag. The live acceptance check must
+verify both `spec.workload.stopped` and `status.stopped` are booleans defaulting to
+false; an old schema would silently prune the flag.
+
 ## Domain endpoints
 
 Only public, forwarded exposure supports `load_balancer`. The provider Helm value

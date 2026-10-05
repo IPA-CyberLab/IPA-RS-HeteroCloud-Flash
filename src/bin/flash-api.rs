@@ -460,6 +460,7 @@ async fn reconcile(
     }
     let resource_name = resource_name(service_instance_id);
 
+    let mut resumed = false;
     if let Some(existing) = state.services.get_opt(&resource_name).await? {
         if existing.spec.desired_generation > request.generation {
             return Err(ApiError::Conflict("generation is stale".into()));
@@ -473,9 +474,11 @@ async fn reconcile(
                 "generation was already used for different desired state".into(),
             ));
         }
+        resumed = existing.spec.workload.stopped && !spec.stopped;
     }
 
-    let desired = FlashService::new(
+    let explicitly_stopped = spec.stopped;
+    let mut desired = FlashService::new(
         &resource_name,
         FlashServiceSpec {
             desired_generation: request.generation,
@@ -488,6 +491,12 @@ async fn reconcile(
             workload: spec,
         },
     );
+    if resumed {
+        desired.metadata.annotations = Some(BTreeMap::from([(
+            heterocloud_flash::reconcile::LAST_ACTIVITY_ANNOTATION.into(),
+            chrono::Utc::now().timestamp().to_string(),
+        )]));
+    }
     let resource = state
         .services
         .patch(
@@ -501,7 +510,9 @@ async fn reconcile(
         .as_ref()
         .filter(|status| status.observed_generation == request.generation);
     let ready = current_status.is_some_and(|status| {
-        status.phase == FlashServicePhase::Ready && status.runtime_class == expected_runtime_class
+        status.phase == FlashServicePhase::Ready
+            && status.runtime_class == expected_runtime_class
+            && status.stopped == explicitly_stopped
     });
     if current_status.is_some_and(|status| status.phase == FlashServicePhase::Error) {
         return Ok((
