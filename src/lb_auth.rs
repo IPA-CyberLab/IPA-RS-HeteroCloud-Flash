@@ -20,6 +20,12 @@ pub const CALLBACK_PATH: &str = "/_heterocloud/oidc/callback";
 pub const LOGOUT_PATH: &str = "/_heterocloud/oidc/logout";
 const MANAGER: &str = "heterocloud-flash-oidc";
 
+fn client_secret_reference(name: &str) -> Value {
+    // The Gateway CRD defaults group and kind. Declare their canonical values
+    // so an accepted, unchanged policy compares equal after API admission.
+    json!({"group":"", "kind":"Secret", "name":name})
+}
+
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize)]
 #[kube(
     group = "gateway.envoyproxy.io",
@@ -196,7 +202,7 @@ pub(crate) async fn prepare(
             oidc: Some(json!({
                 "provider": {"issuer": authentication.issuer_url},
                 "clientID": authentication.client_id,
-                "clientSecret": {"name": credential_name},
+                "clientSecret": client_secret_reference(&credential_name),
                 "scopes": authentication.scopes,
                 "redirectURL": format!("https://{hostname}{CALLBACK_PATH}"),
                 "logoutPath": LOGOUT_PATH,
@@ -286,5 +292,20 @@ mod tests {
         assert!(name.len() <= 63);
         assert_ne!(name, secret_name(id, "other"));
         assert_ne!(name, secret_name(Uuid::from_u128(2), "credential"));
+    }
+    #[test]
+    fn defaulting_keeps_an_unchanged_oidc_secret_reference_equal() -> Result<()> {
+        let desired = json!({"clientSecret":client_secret_reference("credential")});
+        let mut admitted = desired.clone();
+        let reference = admitted["clientSecret"]
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("SecretObjectReference must be an object"))?;
+        // The live SecurityPolicy schema supplies both defaults on admission.
+        reference.entry("group").or_insert(json!(""));
+        reference.entry("kind").or_insert(json!("Secret"));
+        assert_eq!(desired, admitted);
+        admitted["clientSecret"]["name"] = json!("rotated-credential");
+        assert_ne!(desired, admitted);
+        Ok(())
     }
 }
