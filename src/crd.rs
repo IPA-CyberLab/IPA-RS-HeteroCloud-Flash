@@ -421,6 +421,18 @@ mod tests {
         assert_eq!(generated, checked_in);
         let workload = &generated["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
             ["spec"]["properties"]["workload"];
+        assert_eq!(workload["properties"]["stopped"]["default"], false);
+        assert_eq!(
+            generated["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"]
+                ["stopped"]["default"],
+            false
+        );
+        assert!(
+            !workload["required"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("missing required fields"))?
+                .contains(&serde_json::json!("stopped"))
+        );
         assert_eq!(
             workload["properties"]["exposure"]["properties"]["endpoint_mode"]["default"],
             "ip"

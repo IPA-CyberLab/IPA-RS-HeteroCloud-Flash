@@ -1971,10 +1971,15 @@ async fn reconcile_scaling(
                 .await?
         }
     };
-    if hpa.is_none() || legacy_owns_replicas(&current) {
+    // Kubernetes leaves an HPA inactive when the target is explicitly at zero.
+    // Seed replicas when resuming an autoscaled service before handing off.
+    let wake_autoscaler = hpa.is_some()
+        && !suspended
+        && current.spec.as_ref().and_then(|spec| spec.replicas) == Some(0);
+    if hpa.is_none() || legacy_owns_replicas(&current) || wake_autoscaler {
         let replicas = if suspended {
             0
-        } else if hpa.is_none() {
+        } else if hpa.is_none() || wake_autoscaler {
             i32::try_from(flash.spec.workload.replicas)
                 .map_err(|_| ReconcileError::InvalidReplicaCount)?
         } else {

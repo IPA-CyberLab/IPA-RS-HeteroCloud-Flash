@@ -299,6 +299,7 @@ spec:
                     description: Legacy mappings are converted to environment variable names when read.
                     type: object
                   stopped:
+                    default: false
                     description: An explicit stop is independent of HTTP idle scaling and runtime quotas.
                     type: boolean
                 required:

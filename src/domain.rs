@@ -53,6 +53,7 @@ pub struct FlashSpec {
     pub replicas: u32,
     /// An explicit stop is independent of HTTP idle scaling and runtime quotas.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
     pub stopped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoscaling: Option<FlashAutoscaling>,
