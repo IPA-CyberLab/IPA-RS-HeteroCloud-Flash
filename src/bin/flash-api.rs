@@ -9,7 +9,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{delete, get, put},
 };
 use futures_util::{SinkExt, StreamExt};
 use heterocloud_flash::{
@@ -62,6 +62,7 @@ struct AppState {
     pods: Api<Pod>,
     authenticator: ProviderAuthenticator,
     exec_sessions: Arc<Semaphore>,
+    public_domain: Option<String>,
 }
 
 #[tokio::main]
@@ -108,6 +109,9 @@ async fn run() -> Result<()> {
         pods: Api::namespaced(client, &namespace),
         authenticator,
         exec_sessions: Arc::new(Semaphore::new(max_exec_sessions)),
+        public_domain: env::var("FLASH_PUBLIC_DOMAIN")
+            .ok()
+            .filter(|s| !s.is_empty()),
     });
     let app = app_router(state);
     let listener = TcpListener::bind(&bind_addr)
@@ -128,6 +132,14 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route("/internal/v1/gpus", get(list_gpu_inventory))
         .route("/internal/v1/gpus/access", put(update_gpu_access))
         .route("/internal/v1/usage", get(list_usage))
+        .route(
+            "/internal/v1/service-instances/{id}/domains",
+            get(list_custom_domains).post(add_custom_domain),
+        )
+        .route(
+            "/internal/v1/service-instances/{id}/domains/{hostname}",
+            delete(remove_custom_domain),
+        )
         .route(
             "/internal/v1/service-instances/{service_instance_id}",
             put(reconcile).delete(remove).get(get_status),
@@ -1449,6 +1461,7 @@ mod tests {
             "test",
         );
         let app = super::app_router(Arc::new(super::AppState {
+            public_domain: Some("flash.example.org".into()),
             client: client.clone(),
             namespace: "test".into(),
             services: Api::namespaced(client.clone(), "test"),
@@ -1885,4 +1898,160 @@ mod tests {
         assert!(EXEC_SHELL_SCRIPT.contains("NPM_CONFIG_PREFIX=/root/.local"));
         assert!(EXEC_SHELL_SCRIPT.contains("cd /root"));
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomDomainWrite {
+    hostname: String,
+    binding_id: Uuid,
+    verification_value: String,
+}
+
+async fn domain_service(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: Uuid,
+    action: &str,
+) -> Result<FlashService, ApiError> {
+    let claims = state.authenticator.authenticate(headers, action)?;
+    validate_command(&claims, id, claims.generation)?;
+    let service = state.services.get(&resource_name(id)).await?;
+    validate_resource_access(&service, &claims, id, claims.generation)?;
+    if service.metadata.deletion_timestamp.is_some() {
+        return Err(ApiError::Conflict("Service is deleting".into()));
+    }
+    Ok(service)
+}
+
+async fn list_custom_domains(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let service = domain_service(
+        &state,
+        &headers,
+        id,
+        heterocloud_flash::custom_domains::LIST_ACTION,
+    )
+    .await?;
+    let items = heterocloud_flash::custom_domains::status_view(
+        state.client.clone(),
+        &state.namespace,
+        &service,
+    )
+    .await
+    .map_err(|_| ApiError::NotReady)?;
+    Ok(Json(json!({"items":items})))
+}
+
+async fn add_custom_domain(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<CustomDomainWrite>,
+) -> Result<impl IntoResponse, ApiError> {
+    use heterocloud_flash::{
+        custom_domains::{self, FlashDomain, FlashDomainSpec},
+        domain::{EndpointMode, ExposureType, TrafficMode},
+    };
+    let service = domain_service(&state, &headers, id, custom_domains::WRITE_ACTION).await?;
+    custom_domains::validate_hostname(&request.hostname)
+        .map_err(|_| ApiError::BadRequest("Invalid public domain hostname".into()))?;
+    let exposure = &service.spec.workload.exposure;
+    if exposure.kind != ExposureType::Public
+        || exposure.endpoint_mode != EndpointMode::Web
+        || exposure.traffic_mode != TrafficMode::Forwarded
+    {
+        return Err(ApiError::BadRequest(
+            "Custom domains require public HTTP/HTTPS".into(),
+        ));
+    }
+    let public = state
+        .public_domain
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("Provider public domain is not configured".into()))?;
+    if request.hostname == public || request.hostname.ends_with(&format!(".{public}")) {
+        return Err(ApiError::BadRequest(
+            "Managed Flash hostnames cannot be registered as custom domains".into(),
+        ));
+    }
+    if request.verification_value.len() > 160
+        || !request
+            .verification_value
+            .starts_with("heterocloud-domain=")
+        || request.verification_value.chars().any(char::is_control)
+    {
+        return Err(ApiError::BadRequest(
+            "Invalid domain verification marker".into(),
+        ));
+    }
+    let api = Api::<FlashDomain>::namespaced(state.client.clone(), &state.namespace);
+    let name = custom_domains::resource_name(&request.hostname);
+    if let Some(existing) = api.get_opt(&name).await? {
+        if !custom_domains::owned_by(&existing, &service)
+            || existing.metadata.deletion_timestamp.is_some()
+            || existing.spec.binding_id != request.binding_id.to_string()
+        {
+            return Err(ApiError::Conflict(
+                "Domain is assigned or still being removed".into(),
+            ));
+        }
+        return Ok((StatusCode::ACCEPTED, Json(json!({"registered":true}))));
+    }
+    let owner = service
+        .controller_owner_ref(&())
+        .ok_or(ApiError::NotReady)?;
+    let mut alias = FlashDomain::new(
+        &name,
+        FlashDomainSpec {
+            hostname: request.hostname,
+            cname_target: format!("f-{id}.{public}"),
+            binding_id: request.binding_id.to_string(),
+            verification_value: request.verification_value,
+            service_instance_id: id.to_string(),
+            organization_id: service.spec.organization_id.clone(),
+            project_id: service.spec.project_id.clone(),
+            service_uid: service.metadata.uid.clone().ok_or(ApiError::NotReady)?,
+        },
+    );
+    alias.metadata.owner_references = Some(vec![owner]);
+    alias.metadata.labels = Some(BTreeMap::from([
+        ("flash.heterocloud.io/instance".into(), id.to_string()),
+        (
+            "flash.heterocloud.io/organization".into(),
+            service.spec.organization_id,
+        ),
+        (
+            "flash.heterocloud.io/project".into(),
+            service.spec.project_id,
+        ),
+    ]));
+    api.create(&kube::api::PostParams::default(), &alias)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({"registered":true}))))
+}
+
+async fn remove_custom_domain(
+    State(state): State<Arc<AppState>>,
+    Path((id, hostname)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    use heterocloud_flash::custom_domains::{self, FlashDomain};
+    let service = domain_service(&state, &headers, id, custom_domains::WRITE_ACTION).await?;
+    custom_domains::validate_hostname(&hostname)
+        .map_err(|_| ApiError::BadRequest("Invalid hostname".into()))?;
+    let api = Api::<FlashDomain>::namespaced(state.client.clone(), &state.namespace);
+    let name = custom_domains::resource_name(&hostname);
+    let Some(alias) = api.get_opt(&name).await? else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    if !custom_domains::owned_by(&alias, &service) {
+        return Err(ApiError::Forbidden);
+    }
+    if alias.metadata.deletion_timestamp.is_none() {
+        api.delete(&name, &DeleteParams::default()).await?;
+    }
+    Ok(StatusCode::ACCEPTED)
 }

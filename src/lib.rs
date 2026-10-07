@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod crd;
+pub mod custom_domains;
 pub mod domain;
 pub mod gpu_scheduler;
 pub mod image;

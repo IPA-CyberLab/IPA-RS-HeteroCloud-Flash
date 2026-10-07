@@ -6,6 +6,9 @@ metadata:
   labels:
     {{- include "flash.labels" . | nindent 4 }}
 rules:
+  - apiGroups: ["flash.heterocloud.io"]
+    resources: ["flashdomains"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["gateway.envoyproxy.io"]
     resources: ["securitypolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

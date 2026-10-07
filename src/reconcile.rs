@@ -226,6 +226,8 @@ pub async fn run_controller(
     let http_routes = Api::<HTTPRoute>::namespaced(client.clone(), &namespace);
     let security_policies = Api::<SecurityPolicy>::namespaced(client.clone(), &namespace);
     let oidc_secrets = Api::<Secret>::namespaced(client.clone(), &namespace);
+    let domains =
+        Api::<crate::custom_domains::FlashDomain>::namespaced(client.clone(), &config.namespace);
     let context = Arc::new(ControllerContext::new(client, image_inspector, config));
 
     info!("FlashService controller started");
@@ -237,6 +239,7 @@ pub async fn run_controller(
             .owns(autoscalers, watcher::Config::default())
             .owns(http_routes, watcher::Config::default())
             .owns(security_policies, watcher::Config::default())
+            .owns(domains, watcher::Config::default())
             .owns(
                 oidc_secrets,
                 watcher::Config::default().labels("flash.heterocloud.io/credential=oidc"),
@@ -626,6 +629,17 @@ async fn reconcile(
         &context.activator_service,
         context.activator_port,
     )?;
+    if let Err(error) = crate::custom_domains::reconcile_routes(
+        context.client.clone(),
+        &context.namespace,
+        &flash,
+        &owner,
+        desired_route.as_ref(),
+    )
+    .await
+    {
+        tracing::warn!(service = %name, error = %error, "custom domain route reconciliation failed");
+    }
     let authentication = lb_auth::prepare(
         context.client.clone(),
         &context.namespace,

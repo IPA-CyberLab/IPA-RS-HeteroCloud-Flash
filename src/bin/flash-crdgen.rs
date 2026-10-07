@@ -11,6 +11,10 @@ fn main() -> ExitCode {
         "gpu-device" => validated_gpu_device_crd(),
         "gpu-job" => validated_gpu_job_crd(),
         "usage-record" => validated_usage_record_crd(),
+        "domain" => serde_json::to_value(
+            <heterocloud_flash::custom_domains::FlashDomain as kube::CustomResourceExt>::crd(),
+        )
+        .map_err(Into::into),
         _ => Err(anyhow::anyhow!(
             "expected service, gpu-device, gpu-job, or usage-record"
         )),
