@@ -266,6 +266,15 @@ spec:
                     required:
                     - vpc_id
                     type: object
+                  persistent_storage_gib:
+                    description: |-
+                      Optional persistent /root size within the total disk budget.
+                      Existing volumes are expanded in place and never shrunk.
+                    format: uint32
+                    maximum: 1000000.0
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
                   ports:
                     items:
                       properties:
@@ -469,6 +478,17 @@ spec:
               oidc_callback_url:
                 nullable: true
                 type: string
+              persistent_storage_bytes:
+                description: Persistent PVC request; preserved across configuration updates.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              persistent_storage_capacity_bytes:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               phase:
                 enum:
                 - provisioning
@@ -505,11 +525,20 @@ spec:
               resolved_image:
                 nullable: true
                 type: string
+              rootfs_storage_bytes:
+                description: Configured allocation, not measured usage.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               runtime_class:
                 type: string
               stopped:
                 default: false
                 description: True only after an explicit stop has drained every workload Pod.
+                type: boolean
+              storage_resize_pending:
+                default: false
                 type: boolean
               weekly_usage:
                 nullable: true

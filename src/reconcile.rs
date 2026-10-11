@@ -858,6 +858,7 @@ async fn reconcile(
         inspection.writable_storage_bytes,
         context.persistent_storage_class.is_some(),
         flash.spec.workload.rootfs_storage_gib,
+        flash.spec.workload.persistent_storage_gib,
         existing_storage
             .map(|(requested, _)| requested)
             .unwrap_or(0),
@@ -1057,6 +1058,17 @@ async fn reconcile(
         resolved_image: Some(inspection.resolved_image),
         image_size_bytes: Some(inspection.image_size_bytes),
         writable_storage_bytes: Some(inspection.writable_storage_bytes),
+        rootfs_storage_bytes: Some(storage.rootfs_bytes),
+        persistent_storage_bytes: persistent_volume_claim
+            .as_ref()
+            .map(|_| storage.persistent_bytes),
+        persistent_storage_capacity_bytes: existing_storage.map(|(_, capacity)| capacity),
+        storage_resize_pending: persistent_volume_claim.is_some()
+            && persistent_resize_pending(
+                existing_claim.as_ref(),
+                existing_storage,
+                storage.persistent_bytes,
+            ),
         image_entrypoint: Some(inspection.image_entrypoint),
         image_cmd: Some(inspection.image_cmd),
         image_architecture: Some(inspection.architecture),
@@ -1072,6 +1084,11 @@ async fn reconcile(
         endpoint_ready,
         !flash.spec.workload.ports.is_empty(),
     );
+    if status.storage_resize_pending && status.phase == FlashServicePhase::Ready {
+        status.phase = FlashServicePhase::Provisioning;
+        status.message =
+            Some("waiting for persistent disk expansion; existing data is retained".into());
+    }
     if suspended {
         status.desired_replicas = 0;
         status.ready_replicas = 0;
@@ -1232,6 +1249,10 @@ fn status_patch(flash: &FlashService, status: &FlashServiceStatus) -> Value {
     patch["status"]["resolved_image"] = json!(status.resolved_image);
     patch["status"]["image_size_bytes"] = json!(status.image_size_bytes);
     patch["status"]["writable_storage_bytes"] = json!(status.writable_storage_bytes);
+    patch["status"]["rootfs_storage_bytes"] = json!(status.rootfs_storage_bytes);
+    patch["status"]["persistent_storage_bytes"] = json!(status.persistent_storage_bytes);
+    patch["status"]["persistent_storage_capacity_bytes"] =
+        json!(status.persistent_storage_capacity_bytes);
     patch["status"]["image_entrypoint"] = json!(status.image_entrypoint);
     patch["status"]["image_cmd"] = json!(status.image_cmd);
     patch["status"]["image_architecture"] = json!(status.image_architecture);
@@ -1638,6 +1659,7 @@ fn storage_allocation(
     writable_storage_bytes: u64,
     persistent: bool,
     requested_rootfs_gib: Option<u32>,
+    requested_persistent_gib: Option<u32>,
 ) -> Result<StorageAllocation, ReconcileError> {
     let requested_rootfs_bytes = requested_rootfs_gib
         .map(|gib| {
@@ -1646,7 +1668,17 @@ fn storage_allocation(
                 .ok_or(ReconcileError::StorageBudgetOverflow)
         })
         .transpose()?;
+    let requested_persistent_bytes = requested_persistent_gib
+        .map(|gib| {
+            u64::from(gib)
+                .checked_mul(GIB_BYTES)
+                .ok_or(ReconcileError::StorageBudgetOverflow)
+        })
+        .transpose()?;
     if !persistent {
+        if requested_persistent_bytes.is_some() {
+            return Err(ReconcileError::PersistentStorageUnavailable);
+        }
         let rootfs_bytes = requested_rootfs_bytes.unwrap_or(writable_storage_bytes);
         if rootfs_bytes > writable_storage_bytes {
             return Err(ReconcileError::InsufficientWritableStorage);
@@ -1662,19 +1694,27 @@ fn storage_allocation(
     if writable_storage_bytes < minimum {
         return Err(ReconcileError::InsufficientWritableStorage);
     }
-    let rootfs_bytes = requested_rootfs_bytes.unwrap_or_else(|| {
-        (writable_storage_bytes / 10)
-            .clamp(MIN_ROOTFS_STORAGE_BYTES, MAX_ROOTFS_STORAGE_BYTES)
-            .min(writable_storage_bytes - MIN_PERSISTENT_STORAGE_BYTES)
-    });
+    let rootfs_bytes =
+        requested_rootfs_bytes.unwrap_or_else(|| {
+            (writable_storage_bytes / 10)
+                .clamp(MIN_ROOTFS_STORAGE_BYTES, MAX_ROOTFS_STORAGE_BYTES)
+                .min(writable_storage_bytes.saturating_sub(
+                    requested_persistent_bytes.unwrap_or(MIN_PERSISTENT_STORAGE_BYTES),
+                ))
+        });
+    let persistent_bytes =
+        requested_persistent_bytes.unwrap_or(writable_storage_bytes.saturating_sub(rootfs_bytes));
     if rootfs_bytes < MIN_ROOTFS_STORAGE_BYTES
-        || rootfs_bytes > writable_storage_bytes - MIN_PERSISTENT_STORAGE_BYTES
+        || persistent_bytes < MIN_PERSISTENT_STORAGE_BYTES
+        || rootfs_bytes
+            .checked_add(persistent_bytes)
+            .is_none_or(|bytes| bytes > writable_storage_bytes)
     {
         return Err(ReconcileError::InsufficientWritableStorage);
     }
     Ok(StorageAllocation {
         rootfs_bytes,
-        persistent_bytes: writable_storage_bytes - rootfs_bytes,
+        persistent_bytes,
     })
 }
 
@@ -1682,11 +1722,19 @@ fn storage_allocation_retaining(
     writable_storage_bytes: u64,
     persistent: bool,
     requested_rootfs_gib: Option<u32>,
+    requested_persistent_gib: Option<u32>,
     existing_requested_bytes: u64,
 ) -> Result<StorageAllocation, ReconcileError> {
-    let mut allocation =
-        storage_allocation(writable_storage_bytes, persistent, requested_rootfs_gib)?;
+    let mut allocation = storage_allocation(
+        writable_storage_bytes,
+        persistent,
+        requested_rootfs_gib,
+        requested_persistent_gib,
+    )?;
     if persistent && allocation.persistent_bytes < existing_requested_bytes {
+        if requested_persistent_gib.is_some() {
+            return Err(ReconcileError::PersistentStorageCannotShrink);
+        }
         let available_rootfs = writable_storage_bytes.checked_sub(existing_requested_bytes);
         if requested_rootfs_gib.is_some()
             || available_rootfs.is_none_or(|bytes| bytes < MIN_ROOTFS_STORAGE_BYTES)
@@ -1722,6 +1770,26 @@ fn claim_needs_storage_update(existing: Option<(u64, u64)>, desired: u64) -> boo
     // CSI may round capacity above the request. Reapplying a smaller request than
     // that capacity is rejected even when we only intended to update the image.
     existing.is_none_or(|(requested, capacity)| desired > requested.max(capacity))
+}
+
+fn persistent_resize_pending(
+    claim: Option<&PersistentVolumeClaim>,
+    existing: Option<(u64, u64)>,
+    desired: u64,
+) -> bool {
+    existing.is_none_or(|(_, capacity)| capacity < desired)
+        || claim
+            .and_then(|claim| claim.status.as_ref())
+            .and_then(|status| status.conditions.as_ref())
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition.status == "True"
+                        && matches!(
+                            condition.type_.as_str(),
+                            "Resizing" | "FileSystemResizePending"
+                        )
+                })
+            })
 }
 
 fn storage_quantity_bytes(value: &str) -> Result<u64, ReconcileError> {
@@ -2965,6 +3033,12 @@ pub enum ReconcileError {
     InvalidReplicaCount,
     #[error("disk budget cannot be represented in bytes")]
     StorageBudgetOverflow,
+    #[error("persistent_storage_gib requires a configured persistent storage class")]
+    PersistentStorageUnavailable,
+    #[error(
+        "persistent disks cannot be shrunk; choose a size at least as large as the existing disk and increase the total disk budget if necessary; existing data was preserved"
+    )]
+    PersistentStorageCannotShrink,
     #[error("disk budget cannot provide the requested container filesystem and persistent storage")]
     InsufficientWritableStorage,
     #[error(
@@ -2999,10 +3073,10 @@ mod tests {
         AdminVolumeMount, DeploymentOptions, GIB_BYTES, NetworkPolicyOptions,
         claim_needs_storage_update, claim_storage, desired_deployment, desired_network_policy,
         desired_network_policy_with_networks, desired_persistent_volume_claim,
-        desired_secret_service_account, desired_service, gpu_job_state, projected_weekly_usage,
-        status_patch, storage_allocation, storage_allocation_retaining, storage_quantity_bytes,
-        update_workload_status, validate_admin_volume_mounts, workload_failure_message,
-        workload_restart_message,
+        desired_secret_service_account, desired_service, gpu_job_state, persistent_resize_pending,
+        projected_weekly_usage, status_patch, storage_allocation, storage_allocation_retaining,
+        storage_quantity_bytes, update_workload_status, validate_admin_volume_mounts,
+        workload_failure_message, workload_restart_message,
     };
     use crate::{
         GPU_READY_LABEL, GPU_RESOURCE_NAME, GPU_RUNTIME_CLASS_NAME, LOAD_BALANCER_CLASS,
@@ -3153,6 +3227,7 @@ mod tests {
                     gpu_count: 0,
                     ephemeral_storage_gib: 10,
                     rootfs_storage_gib: None,
+                    persistent_storage_gib: None,
                     ports: vec![FlashPort {
                         name: "game-udp".into(),
                         protocol: TransportProtocol::Udp,
@@ -3773,13 +3848,13 @@ mod tests {
     #[test]
     fn persistent_home_and_rootfs_share_the_writable_disk_budget()
     -> Result<(), Box<dyn std::error::Error>> {
-        let allocation = storage_allocation(10 * 1024 * 1024 * 1024, true, None)?;
+        let allocation = storage_allocation(10 * 1024 * 1024 * 1024, true, None, None)?;
         assert_eq!(allocation.rootfs_bytes, 1024 * 1024 * 1024);
         assert_eq!(allocation.persistent_bytes, 9 * 1024 * 1024 * 1024);
-        let build_allocation = storage_allocation(29 * GIB_BYTES, true, Some(20))?;
+        let build_allocation = storage_allocation(29 * GIB_BYTES, true, Some(20), None)?;
         assert_eq!(build_allocation.rootfs_bytes, 20 * GIB_BYTES);
         assert_eq!(build_allocation.persistent_bytes, 9 * GIB_BYTES);
-        assert!(storage_allocation(19 * GIB_BYTES, true, Some(20)).is_err());
+        assert!(storage_allocation(19 * GIB_BYTES, true, Some(20), None).is_err());
 
         let flash = service(TrafficMode::Forwarded);
         let claim = desired_persistent_volume_claim(
@@ -3833,7 +3908,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let requested = 4_623_292_749;
         let writable = 5_000_000_000;
-        let allocation = storage_allocation_retaining(writable, true, None, requested)?;
+        let allocation = storage_allocation_retaining(writable, true, None, None, requested)?;
         assert_eq!(allocation.persistent_bytes, requested);
         assert_eq!(
             allocation.rootfs_bytes + allocation.persistent_bytes,
@@ -3845,26 +3920,61 @@ mod tests {
                 requested + super::MIN_ROOTFS_STORAGE_BYTES - 1,
                 true,
                 None,
+                None,
                 requested
             ),
             Err(super::ReconcileError::PersistentStorageExceedsBudget)
         ));
         assert!(matches!(
-            storage_allocation_retaining(writable, true, Some(1), requested),
+            storage_allocation_retaining(writable, true, Some(1), None, requested),
             Err(super::ReconcileError::PersistentStorageExceedsBudget)
         ));
         // Existing allocations are stable; a controller upgrade alone must not
         // change a live Deployment's rootfs limit and restart its container.
-        let original = storage_allocation(30 * GIB_BYTES - 29_754_859, true, None)?;
+        let original = storage_allocation(30 * GIB_BYTES - 29_754_859, true, None, None)?;
         assert_eq!(
             storage_allocation_retaining(
                 30 * GIB_BYTES - 29_754_859,
                 true,
                 None,
+                None,
                 original.persistent_bytes
             )?,
             original
         );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_updates_keep_the_same_persistent_disk_and_validate_the_combined_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let existing = 26 * GIB_BYTES;
+        // Raising rootfs without making room must preserve the running workload.
+        assert!(matches!(
+            storage_allocation_retaining(29 * GIB_BYTES, true, Some(10), None, existing),
+            Err(super::ReconcileError::PersistentStorageExceedsBudget)
+        ));
+        let expanded =
+            storage_allocation_retaining(39 * GIB_BYTES, true, Some(10), Some(27), existing)?;
+        assert_eq!(expanded.rootfs_bytes, 10 * GIB_BYTES);
+        assert_eq!(expanded.persistent_bytes, 27 * GIB_BYTES);
+        assert!(matches!(
+            storage_allocation_retaining(39 * GIB_BYTES, true, Some(10), Some(25), existing),
+            Err(super::ReconcileError::PersistentStorageCannotShrink)
+        ));
+        assert!(storage_allocation(35 * GIB_BYTES, true, Some(10), Some(27)).is_err());
+        assert!(matches!(
+            storage_allocation(39 * GIB_BYTES, false, Some(10), Some(27)),
+            Err(super::ReconcileError::PersistentStorageUnavailable)
+        ));
+        // Removing an explicit size resumes automatic allocation and keeps data.
+        let automatic =
+            storage_allocation_retaining(39 * GIB_BYTES, true, Some(10), None, 27 * GIB_BYTES)?;
+        assert_eq!(automatic.persistent_bytes, 29 * GIB_BYTES);
+        let smaller_rootfs =
+            storage_allocation_retaining(39 * GIB_BYTES, true, Some(3), Some(27), 27 * GIB_BYTES)?;
+        assert_eq!(smaller_rootfs.rootfs_bytes, 3 * GIB_BYTES);
+        assert_eq!(smaller_rootfs.persistent_bytes, expanded.persistent_bytes);
         Ok(())
     }
 
@@ -3888,6 +3998,38 @@ mod tests {
             5 * GIB_BYTES
         ));
         assert!(claim_storage(&Default::default()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn disk_resize_waits_for_capacity_and_filesystem_completion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut claim = serde_json::from_value(json!({
+            "spec":{"resources":{"requests":{"storage":"3Gi"}}},
+            "status":{"capacity":{"storage":"2Gi"}}
+        }))?;
+        assert!(persistent_resize_pending(
+            Some(&claim),
+            Some(claim_storage(&claim)?),
+            3 * GIB_BYTES
+        ));
+        claim.status = Some(serde_json::from_value(
+            json!({"capacity":{"storage":"3Gi"},"conditions":[{"type":"FileSystemResizePending","status":"True"}]}),
+        )?);
+        assert!(persistent_resize_pending(
+            Some(&claim),
+            Some(claim_storage(&claim)?),
+            3 * GIB_BYTES
+        ));
+        claim.status = Some(serde_json::from_value(
+            json!({"capacity":{"storage":"3Gi"}}),
+        )?);
+        assert!(!persistent_resize_pending(
+            Some(&claim),
+            Some(claim_storage(&claim)?),
+            3 * GIB_BYTES
+        ));
+        assert!(persistent_resize_pending(None, None, 3 * GIB_BYTES));
         Ok(())
     }
 

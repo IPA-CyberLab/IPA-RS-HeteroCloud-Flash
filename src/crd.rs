@@ -330,6 +330,16 @@ pub struct FlashServiceStatus {
     pub image_size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writable_storage_bytes: Option<u64>,
+    /// Configured allocation, not measured usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_storage_bytes: Option<u64>,
+    /// Persistent PVC request; preserved across configuration updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_storage_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_storage_capacity_bytes: Option<u64>,
+    #[serde(default)]
+    pub storage_resize_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_entrypoint: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -482,11 +482,15 @@ async fn reconcile(
 
     let mut resumed = false;
     if let Some(existing) = state.services.get_opt(&resource_name).await? {
+        if existing.spec.organization_id != claims.organization_id.to_string() {
+            return Err(ApiError::Forbidden);
+        }
         if existing.spec.desired_generation > request.generation {
             return Err(ApiError::Conflict("generation is stale".into()));
         }
         if existing.spec.desired_generation == request.generation
             && (existing.spec.display_name != request.name
+                || existing.spec.project_id != claims.project_id.to_string()
                 || existing.spec.workload != spec
                 || existing.spec.subject_id != requester_user_id)
         {

@@ -79,6 +79,11 @@ pub struct FlashSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 1_000_000))]
     pub rootfs_storage_gib: Option<u32>,
+    /// Optional persistent /root size within the total disk budget.
+    /// Existing volumes are expanded in place and never shrunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1_000_000))]
+    pub persistent_storage_gib: Option<u32>,
     pub ports: Vec<FlashPort>,
     pub exposure: FlashExposure,
     #[serde(default)]
@@ -196,6 +201,15 @@ impl FlashSpec {
         {
             return Err(ValidationError::Field(
                 "rootfs_storage_gib must be at least 1 and less than ephemeral_storage_gib".into(),
+            ));
+        }
+        if self.persistent_storage_gib.is_some_and(|persistent| {
+            persistent == 0
+                || u64::from(persistent) + u64::from(self.rootfs_storage_gib.unwrap_or(1))
+                    >= u64::from(self.ephemeral_storage_gib)
+        }) {
+            return Err(ValidationError::Field(
+                "persistent_storage_gib must be at least 1 and leave room for the image and container filesystem within ephemeral_storage_gib".into(),
             ));
         }
         if self.ports.len() > MAX_PORTS {
@@ -885,6 +899,7 @@ mod tests {
             gpu_count: 0,
             ephemeral_storage_gib: 10,
             rootfs_storage_gib: None,
+            persistent_storage_gib: None,
             ports: vec![FlashPort {
                 name: "game-udp".into(),
                 protocol: TransportProtocol::Udp,
