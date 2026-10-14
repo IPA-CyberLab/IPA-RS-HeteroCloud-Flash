@@ -1,4 +1,13 @@
-use std::{collections::BTreeMap, env, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env,
+    process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -62,6 +71,7 @@ struct AppState {
     pods: Api<Pod>,
     authenticator: ProviderAuthenticator,
     exec_sessions: Arc<Semaphore>,
+    draining: Arc<AtomicBool>,
     public_domain: Option<String>,
 }
 
@@ -109,19 +119,31 @@ async fn run() -> Result<()> {
         pods: Api::namespaced(client, &namespace),
         authenticator,
         exec_sessions: Arc::new(Semaphore::new(max_exec_sessions)),
+        draining: Arc::new(AtomicBool::new(false)),
         public_domain: env::var("FLASH_PUBLIC_DOMAIN")
             .ok()
             .filter(|s| !s.is_empty()),
     });
-    let app = app_router(state);
+    let app = app_router(Arc::clone(&state));
     let listener = TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("bind Flash provider API to {bind_addr}"))?;
     info!(%bind_addr, %namespace, "HeteroCloud Flash provider API ready");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(Arc::clone(&state)))
         .await
-        .context("serve Flash provider API")
+        .context("serve Flash provider API")?;
+    // Upgraded WebSockets are independent tasks. Finishing the HTTP server
+    // alone would drop their Tokio runtime and disconnect live shells.
+    wait_for_exec_sessions(&state.exec_sessions, u32::try_from(max_exec_sessions)?).await
+}
+
+async fn wait_for_exec_sessions(sessions: &Arc<Semaphore>, maximum: u32) -> Result<()> {
+    let _all = Arc::clone(sessions)
+        .acquire_many_owned(maximum)
+        .await
+        .context("wait for existing exec sessions during shutdown")?;
+    Ok(())
 }
 
 fn app_router(state: Arc<AppState>) -> Router {
@@ -428,6 +450,9 @@ async fn live() -> impl IntoResponse {
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    if state.draining.load(Ordering::Acquire) {
+        return Err(ApiError::Draining);
+    }
     state.services.list(&ListParams::default().limit(1)).await?;
     Ok((StatusCode::OK, Json(json!({"status": "ready"}))))
 }
@@ -452,6 +477,9 @@ async fn reconcile(
     headers: HeaderMap,
     Json(request): Json<ReconcileRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if state.draining.load(Ordering::Acquire) {
+        return Err(ApiError::Draining);
+    }
     let claims = state
         .authenticator
         .authenticate(&headers, PROVIDER_RECONCILE_ACTION)?;
@@ -826,6 +854,9 @@ async fn exec(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, ApiError> {
+    if state.draining.load(Ordering::Acquire) {
+        return Err(ApiError::Draining);
+    }
     let claims = state
         .authenticator
         .authenticate(&headers, PROVIDER_EXEC_ACTION)?;
@@ -838,6 +869,9 @@ async fn exec(
     let permit = Arc::clone(&state.exec_sessions)
         .try_acquire_owned()
         .map_err(|_| ApiError::TooManyExecSessions)?;
+    if state.draining.load(Ordering::Acquire) {
+        return Err(ApiError::Draining);
+    }
     let pods = state.pods.clone();
     let pod_name = query.pod;
     Ok(upgrade
@@ -1081,6 +1115,8 @@ impl AcceptedOperation {
 
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
+    #[error("server is draining existing sessions")]
+    Draining,
     #[error("service instance was not found")]
     NotFound,
     #[error("{0}")]
@@ -1104,6 +1140,7 @@ enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
+            Self::Draining => (StatusCode::SERVICE_UNAVAILABLE, "server_draining"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::NotReady => (StatusCode::SERVICE_UNAVAILABLE, "operation_in_progress"),
@@ -1142,7 +1179,7 @@ fn install_crypto_provider() {
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
         let _result = tokio::signal::ctrl_c().await;
     };
@@ -1161,6 +1198,7 @@ async fn shutdown_signal() {
         () = ctrl_c => {},
         () = terminate => {},
     }
+    state.draining.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -1174,6 +1212,24 @@ mod tests {
         container_summary, pod_belongs_to_service, pod_can_exec, requester_user_id,
         validate_admin_claims, validate_command, validate_resource_access,
     };
+
+    #[tokio::test]
+    async fn shutdown_waits_for_upgraded_exec_session_tasks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sessions = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let active = std::sync::Arc::clone(&sessions).acquire_owned().await?;
+        let waiting = std::sync::Arc::clone(&sessions);
+        let mut shutdown =
+            tokio::spawn(async move { super::wait_for_exec_sessions(&waiting, 1).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err()
+        );
+        drop(active);
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown).await???;
+        Ok(())
+    }
 
     fn access_fixture() -> Result<(ProviderClaims, FlashService), serde_json::Error> {
         let claims: ProviderClaims = serde_json::from_value(json!({
@@ -1474,6 +1530,7 @@ mod tests {
             pods: Api::namespaced(client, "test"),
             authenticator,
             exec_sessions: Arc::new(tokio::sync::Semaphore::new(0)),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }));
         let response = app
             .oneshot(

@@ -2,6 +2,7 @@
 FROM rust:1.96-bookworm AS builder
 WORKDIR /src
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends musl-tools \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
@@ -10,7 +11,9 @@ RUN cargo build --locked --release --bins
 RUN musl-gcc -O2 -static -Wall -Wextra -Werror -o /usr/local/bin/flash-secret-env-launcher src/flash-secret-env-launcher.c
 
 FROM debian:bookworm-slim
+COPY --from=builder /src/Cargo.lock /usr/share/heterocloud/Cargo.lock
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin flash

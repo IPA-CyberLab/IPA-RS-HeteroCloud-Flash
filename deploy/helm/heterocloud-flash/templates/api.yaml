@@ -23,6 +23,7 @@ spec:
         app.kubernetes.io/component: api
         app.kubernetes.io/part-of: heterocloud
     spec:
+      terminationGracePeriodSeconds: 2100
       serviceAccountName: {{ include "flash.serviceAccountName" . }}
       securityContext:
         {{- include "flash.podSecurityContext" . | nindent 8 }}
