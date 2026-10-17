@@ -1536,6 +1536,10 @@ fn desired_deployment(
             "image": helper_image,
             "imagePullPolicy": "IfNotPresent",
             "command": ["/bin/cp", "/usr/local/bin/flash-secret-env-launcher", format!("{SECRET_HELPER_MOUNT}/launcher")],
+            "resources": {
+                "requests": {"cpu": "10m", "memory": "16Mi"},
+                "limits": {"cpu": "100m", "memory": "64Mi"},
+            },
             "volumeMounts": [{"name": SECRET_HELPER_VOLUME, "mountPath": SECRET_HELPER_MOUNT}],
             "securityContext": {
                 "runAsUser": 0,
@@ -3617,6 +3621,13 @@ mod tests {
         assert_eq!(
             deployment["spec"]["template"]["spec"]["initContainers"][0]["image"],
             "example.invalid/flash-helper@sha256:verified"
+        );
+        // Missing init-container limits make the effective Pod memory limit
+        // unbounded even when the workload itself has a memory limit. The
+        // sandbox kernel must remain inside the workload's declared budget.
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["initContainers"][0]["resources"]["limits"]["memory"],
+            "64Mi"
         );
         assert_eq!(
             deployment["spec"]["template"]["metadata"]["annotations"]["vault.hashicorp.com/agent-pre-populate-only"],
