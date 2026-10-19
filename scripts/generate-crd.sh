@@ -8,16 +8,17 @@ declare -A outputs=(
   [gpu-job]="flashgpujobs.yaml"
   [usage-record]="flashusagerecords.yaml"
   [domain]="flashdomains.flash.heterocloud.io.yaml"
+  [backup]="flashbackups.yaml"
 )
 temporary_directory="$(mktemp -d)"
 trap 'rm -rf -- "${temporary_directory}"' EXIT
 
-for kind in service gpu-device gpu-job usage-record domain; do
+for kind in service gpu-device gpu-job usage-record domain backup; do
   temporary="${temporary_directory}/${outputs[$kind]}"
   cargo run --quiet --manifest-path "${repo_root}/Cargo.toml" --bin flash-crdgen -- "$kind" >"${temporary}"
   test -s "${temporary}"
 done
-for kind in service gpu-device gpu-job usage-record domain; do
+for kind in service gpu-device gpu-job usage-record domain backup; do
   mv -- "${temporary_directory}/${outputs[$kind]}" \
     "${repo_root}/deploy/helm/heterocloud-flash/crds/${outputs[$kind]}"
 done

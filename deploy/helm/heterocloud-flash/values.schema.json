@@ -11,6 +11,23 @@
     "workloadHelperImage": {
       "type": "string",
       "description": "Optional separate workload helper image; empty follows the provider image."
+    },
+    "backups": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "snapshotClass": {
+          "type": "string",
+          "maxLength": 253,
+          "description": "Empty disables backups. Must identify a durable Longhorn CSI type: bak VolumeSnapshotClass, not a local snapshot class."
+        },
+        "storageNamespace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        }
+      }
     }
   }
 }

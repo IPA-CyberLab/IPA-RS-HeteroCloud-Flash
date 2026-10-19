@@ -653,6 +653,32 @@ async fn reconcile(
     // Stopping must remain possible even when image inspection or VPC setup is
     // failing. Keep the Deployment template, PVC, endpoints and credentials;
     // only remove the HPA and drain replicas before releasing the GPU lease.
+    if flash.spec.workload.restore_from_backup_id.is_some() {
+        let storage_class = context
+            .persistent_storage_class
+            .as_deref()
+            .ok_or(ReconcileError::PersistentStorageUnavailable)?;
+        if !crate::backups::ensure_restored_home(
+            context.client.clone(),
+            &context.namespace,
+            &flash,
+            storage_class,
+        )
+        .await?
+        {
+            let status = FlashServiceStatus {
+                phase: FlashServicePhase::Provisioning,
+                observed_generation: flash.spec.desired_generation,
+                runtime_class: runtime_class.into(),
+                message: Some(
+                    "restoring backup into a new persistent disk; workload remains stopped".into(),
+                ),
+                ..FlashServiceStatus::default()
+            };
+            patch_status_if_changed(&services, &flash, status).await?;
+            return Ok(Action::requeue(Duration::from_secs(3)));
+        }
+    }
     if flash.spec.workload.stopped {
         let now = Utc::now().timestamp();
         let meter = meter_weekly_usage(&services, &usage_records, &flash, now).await?;
@@ -1882,7 +1908,7 @@ fn desired_persistent_volume_claim(
     storage_class: &str,
     storage_bytes: u64,
 ) -> Result<PersistentVolumeClaim, ReconcileError> {
-    from_value(json!({
+    let mut desired = json!({
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "metadata": {
@@ -1898,7 +1924,11 @@ fn desired_persistent_volume_claim(
                 "requests": {"storage": storage_bytes.to_string()},
             },
         },
-    }))
+    });
+    if let Some(id) = flash.spec.workload.restore_from_backup_id {
+        desired["spec"]["dataSource"] = json!({"apiGroup":"snapshot.storage.k8s.io","kind":"VolumeSnapshot","name":crate::backups::backup_name(id)});
+    }
+    from_value(desired)
 }
 
 fn cached_image_inspection(
@@ -3021,6 +3051,8 @@ impl TrafficMode {
 
 #[derive(Debug, Error)]
 pub enum ReconcileError {
+    #[error(transparent)]
+    Backup(#[from] crate::backups::BackupError),
     #[error("FlashService is missing a controller owner reference")]
     MissingOwnerReference,
     #[error("FlashService has an invalid service instance ID")]
@@ -3232,6 +3264,7 @@ mod tests {
                     ephemeral_storage_gib: 10,
                     rootfs_storage_gib: None,
                     persistent_storage_gib: None,
+                    restore_from_backup_id: None,
                     ports: vec![FlashPort {
                         name: "game-udp".into(),
                         protocol: TransportProtocol::Udp,

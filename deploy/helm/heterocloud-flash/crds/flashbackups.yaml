@@ -1,0 +1,85 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+    helm.sh/resource-policy: keep
+  name: flashbackups.flash.heterocloud.io
+spec:
+  group: flash.heterocloud.io
+  names:
+    categories: []
+    kind: FlashBackup
+    plural: flashbackups
+    shortNames: []
+    singular: flashbackup
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FlashBackupSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              id:
+                format: uuid
+                type: string
+              name:
+                type: string
+              organization_id:
+                format: uuid
+                type: string
+              project_id:
+                format: uuid
+                type: string
+              service_instance_id:
+                format: uuid
+                type: string
+              snapshot_class:
+                type: string
+              source_pvc:
+                type: string
+              source_pvc_uid:
+                type: string
+              volume_size_bytes:
+                format: uint64
+                minimum: 0.0
+                type: integer
+            required:
+            - id
+            - name
+            - organization_id
+            - project_id
+            - service_instance_id
+            - snapshot_class
+            - source_pvc
+            - source_pvc_uid
+            - volume_size_bytes
+            type: object
+            x-kubernetes-validations:
+            - message: backup source and ownership are immutable
+              rule: self == oldSelf
+          status:
+            nullable: true
+            properties:
+              completed_at:
+                format: int64
+                nullable: true
+                type: integer
+              message:
+                nullable: true
+                type: string
+              phase:
+                default: ''
+                type: string
+            type: object
+        required:
+        - spec
+        title: FlashBackup
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

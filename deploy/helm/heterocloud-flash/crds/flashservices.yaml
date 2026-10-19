@@ -308,6 +308,11 @@ spec:
                     format: uint32
                     minimum: 0.0
                     type: integer
+                  restore_from_backup_id:
+                    description: Immutable source backup for a newly restored persistent home.
+                    format: uuid
+                    nullable: true
+                    type: string
                   rootfs_storage_gib:
                     description: |-
                       Optional writable container filesystem allocation. The remainder of
@@ -345,6 +350,8 @@ spec:
                 - replicas
                 type: object
                 x-kubernetes-validations:
+                - message: restore source cannot change once a disk has been restored
+                  rule: '!has(oldSelf.restore_from_backup_id) || (has(self.restore_from_backup_id) && self.restore_from_backup_id == oldSelf.restore_from_backup_id)'
                 - message: replicas must be within autoscaling bounds
                   rule: '!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)'
                 - message: min_replicas=0 requires web endpoint mode

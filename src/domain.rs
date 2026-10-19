@@ -84,6 +84,9 @@ pub struct FlashSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 1_000_000))]
     pub persistent_storage_gib: Option<u32>,
+    /// Immutable source backup for a newly restored persistent home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_from_backup_id: Option<uuid::Uuid>,
     pub ports: Vec<FlashPort>,
     pub exposure: FlashExposure,
     #[serde(default)]
@@ -900,6 +903,7 @@ mod tests {
             ephemeral_storage_gib: 10,
             rootfs_storage_gib: None,
             persistent_storage_gib: None,
+            restore_from_backup_id: None,
             ports: vec![FlashPort {
                 name: "game-udp".into(),
                 protocol: TransportProtocol::Udp,

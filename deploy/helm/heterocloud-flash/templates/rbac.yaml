@@ -7,6 +7,15 @@ metadata:
     {{- include "flash.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["flash.heterocloud.io"]
+    resources: ["flashbackups"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["flash.heterocloud.io"]
+    resources: ["flashbackups/status", "flashbackups/finalizers"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["flash.heterocloud.io"]
     resources: ["flashdomains"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["gateway.envoyproxy.io"]
@@ -86,6 +95,12 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get"]
   - apiGroups: ["flash.heterocloud.io"]
     resources: ["flashgpudevices"]
     verbs: ["get", "list", "watch", "update", "patch"]
@@ -107,3 +122,30 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ include "flash.fullname" . }}-gpu-scheduler
+
+{{- if .Values.backups.snapshotClass }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "flash.fullname" . }}-restore-observer
+  namespace: {{ .Values.backups.storageNamespace }}
+rules:
+  - apiGroups: ["longhorn.io"]
+    resources: ["volumes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-restore-observer
+  namespace: {{ .Values.backups.storageNamespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "flash.fullname" . }}-restore-observer
+{{- end }}

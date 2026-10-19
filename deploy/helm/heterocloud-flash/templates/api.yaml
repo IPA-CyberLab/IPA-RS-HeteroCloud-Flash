@@ -38,6 +38,10 @@ spec:
             - name: http
               containerPort: {{ .Values.api.port }}
           env:
+            - name: FLASH_BACKUP_STORAGE_NAMESPACE
+              value: {{ .Values.backups.storageNamespace | quote }}
+            - name: FLASH_BACKUP_SNAPSHOT_CLASS
+              value: {{ .Values.backups.snapshotClass | quote }}
             - name: FLASH_API_BIND_ADDR
               value: "0.0.0.0:{{ .Values.api.port }}"
             - name: FLASH_WORKLOAD_NAMESPACE

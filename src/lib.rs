@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backups;
 pub mod crd;
 pub mod custom_domains;
 pub mod domain;

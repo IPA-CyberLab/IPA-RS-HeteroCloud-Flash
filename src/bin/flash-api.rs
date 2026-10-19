@@ -18,7 +18,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
 };
 use futures_util::{SinkExt, StreamExt};
 use heterocloud_flash::{
@@ -73,6 +73,7 @@ struct AppState {
     exec_sessions: Arc<Semaphore>,
     draining: Arc<AtomicBool>,
     public_domain: Option<String>,
+    backup_snapshot_class: String,
 }
 
 #[tokio::main]
@@ -123,6 +124,7 @@ async fn run() -> Result<()> {
         public_domain: env::var("FLASH_PUBLIC_DOMAIN")
             .ok()
             .filter(|s| !s.is_empty()),
+        backup_snapshot_class: env::var("FLASH_BACKUP_SNAPSHOT_CLASS").unwrap_or_default(),
     });
     let app = app_router(Arc::clone(&state));
     let listener = TcpListener::bind(&bind_addr)
@@ -155,6 +157,18 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route("/internal/v1/gpus/access", put(update_gpu_access))
         .route("/internal/v1/usage", get(list_usage))
         .route(
+            "/internal/v1/service-instances/{id}/backup-source",
+            get(get_backup_source),
+        )
+        .route(
+            "/internal/v1/service-instances/{id}/backups",
+            post(create_backup),
+        )
+        .route(
+            "/internal/v1/service-instances/{id}/backups/{backup_id}",
+            get(get_backup).delete(delete_backup),
+        )
+        .route(
             "/internal/v1/service-instances/{id}/domains",
             get(list_custom_domains).post(add_custom_domain),
         )
@@ -179,6 +193,99 @@ fn app_router(state: Arc<AppState>) -> Router {
             get(exec),
         )
         .with_state(state)
+}
+
+fn backup_error(error: heterocloud_flash::backups::BackupError) -> ApiError {
+    use heterocloud_flash::backups::BackupError;
+    match error {
+        BackupError::NotFound => ApiError::NotFound,
+        BackupError::Forbidden => ApiError::Forbidden,
+        BackupError::Conflict(message) => ApiError::Conflict(message.into()),
+        BackupError::Invalid(message) => ApiError::BadRequest(message.into()),
+        BackupError::Disabled | BackupError::Storage(_) | BackupError::Decode(_) => {
+            ApiError::NotReady
+        }
+    }
+}
+
+async fn get_backup_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, "flash.backups.source")?;
+    validate_command(&claims, id, claims.generation)?;
+    if state.backup_snapshot_class.is_empty() {
+        return Err(ApiError::NotReady);
+    }
+    Ok(Json(
+        heterocloud_flash::backups::source(state.client.clone(), &state.namespace, &claims)
+            .await
+            .map_err(backup_error)?,
+    ))
+}
+
+async fn create_backup(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<heterocloud_flash::backups::BackupRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, "flash.backups.create")?;
+    validate_command(&claims, id, claims.generation)?;
+    let backup = heterocloud_flash::backups::create(
+        state.client.clone(),
+        &state.namespace,
+        &state.backup_snapshot_class,
+        &claims,
+        request,
+    )
+    .await
+    .map_err(backup_error)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(heterocloud_flash::backups::view(&backup)),
+    ))
+}
+
+async fn get_backup(
+    State(state): State<Arc<AppState>>,
+    Path((id, backup_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, "flash.backups.get")?;
+    validate_command(&claims, id, claims.generation)?;
+    let backup =
+        heterocloud_flash::backups::get(state.client.clone(), &state.namespace, backup_id, &claims)
+            .await
+            .map_err(backup_error)?;
+    Ok(Json(heterocloud_flash::backups::view(&backup)))
+}
+
+async fn delete_backup(
+    State(state): State<Arc<AppState>>,
+    Path((id, backup_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, "flash.backups.delete")?;
+    validate_command(&claims, id, claims.generation)?;
+    let deleted = heterocloud_flash::backups::delete(
+        state.client.clone(),
+        &state.namespace,
+        backup_id,
+        &claims,
+    )
+    .await
+    .map_err(backup_error)?;
+    Ok(Json(json!({"deleted":deleted})))
 }
 
 async fn list_gpu_types(
@@ -510,6 +617,11 @@ async fn reconcile(
 
     let mut resumed = false;
     if let Some(existing) = state.services.get_opt(&resource_name).await? {
+        if existing.spec.workload.restore_from_backup_id != spec.restore_from_backup_id {
+            return Err(ApiError::Conflict(
+                "the source of a persistent disk is immutable".into(),
+            ));
+        }
         if existing.spec.organization_id != claims.organization_id.to_string() {
             return Err(ApiError::Forbidden);
         }
@@ -527,6 +639,25 @@ async fn reconcile(
             ));
         }
         resumed = existing.spec.workload.stopped && !spec.stopped;
+    } else if let Some(id) = spec.restore_from_backup_id {
+        let backup = Api::<heterocloud_flash::backups::FlashBackup>::namespaced(
+            state.client.clone(),
+            &state.namespace,
+        )
+        .get_opt(&heterocloud_flash::backups::backup_name(id))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+        if backup.spec.organization_id != claims.organization_id {
+            return Err(ApiError::Forbidden);
+        }
+        if !spec.stopped
+            || backup.metadata.deletion_timestamp.is_some()
+            || backup.status.as_ref().is_none_or(|s| s.phase != "ready")
+        {
+            return Err(ApiError::Conflict(
+                "a restored service must be created stopped from a ready backup".into(),
+            ));
+        }
     }
 
     let explicitly_stopped = spec.stopped;
@@ -1522,6 +1653,7 @@ mod tests {
         );
         let app = super::app_router(Arc::new(super::AppState {
             public_domain: Some("flash.example.org".into()),
+            backup_snapshot_class: String::new(),
             client: client.clone(),
             namespace: "test".into(),
             services: Api::namespaced(client.clone(), "test"),

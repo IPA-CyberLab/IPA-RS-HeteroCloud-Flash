@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash
-  tag: "0.1.48"
+  tag: "0.1.49"
   pullPolicy: IfNotPresent
 
 # Pin separately when a provider-only update must retain existing helper images.
@@ -108,3 +108,8 @@ tolerations: []
 # Public HTTPS HeteroCloud origin used by Pod-bound, rotating workload identity.
 workloadIdentity:
   endpoint: ""
+
+# A CSI class with type=bak; an empty value disables disk backup operations.
+backups:
+  storageNamespace: longhorn-system
+  snapshotClass: ""

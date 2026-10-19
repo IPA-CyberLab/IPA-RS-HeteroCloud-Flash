@@ -103,6 +103,24 @@ async fn run() -> Result<()> {
         .context("FLASH_ACTIVATOR_PORT is required")?
         .parse::<u16>()
         .context("FLASH_ACTIVATOR_PORT must be a TCP port")?;
+    if optional("FLASH_BACKUP_SNAPSHOT_CLASS").is_some() {
+        let backup_client = client.clone();
+        let backup_namespace = namespace.clone();
+        tokio::spawn(async move {
+            loop {
+                if heterocloud_flash::backups::run_controller(
+                    backup_client.clone(),
+                    backup_namespace.clone(),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!("backup controller disconnected; retrying");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
     run_controller(
         client,
         image_inspector,

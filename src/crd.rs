@@ -16,6 +16,7 @@ pub fn validated_crd() -> anyhow::Result<serde_json::Value> {
     let workload = &mut crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
         ["properties"]["workload"];
     workload["x-kubernetes-validations"] = json!([
+        {"rule": "!has(oldSelf.restore_from_backup_id) || (has(self.restore_from_backup_id) && self.restore_from_backup_id == oldSelf.restore_from_backup_id)", "message": "restore source cannot change once a disk has been restored"},
         {"rule": "!has(self.autoscaling) || (self.replicas >= self.autoscaling.min_replicas && self.replicas <= self.autoscaling.max_replicas)", "message": "replicas must be within autoscaling bounds"},
         {"rule": "!has(self.autoscaling) || self.autoscaling.min_replicas != 0 || (has(self.exposure.endpoint_mode) && self.exposure.endpoint_mode == 'web')", "message": "min_replicas=0 requires web endpoint mode"},
         {"rule": "!has(self.gpu_type) || self.gpu_type.matches('^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$')", "message": "gpu_type must be a canonical lowercase DNS label"},
