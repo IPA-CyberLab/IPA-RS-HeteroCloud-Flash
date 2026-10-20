@@ -157,6 +157,12 @@ def step(kube, backup):
         existing.setdefault("started_at", stamp())
         result(kube, backup, existing)
     job = get(kube, job_path)
+    if job is not None and any("DAC_READ_SEARCH" in c.get("securityContext", {}).get("capabilities", {}).get("add", [])
+                               for c in job.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])):
+        # Replace only our own earlier verification Job rejected by baseline
+        # Pod security. The restored clone and original disk remain untouched.
+        delete_owned(kube, job_path, backup)
+        return
     if job is None:
         if not IMAGE or "@sha256:" not in IMAGE:
             raise RuntimeError("verification_image_must_be_pinned")
@@ -166,7 +172,7 @@ def step(kube, backup):
                                   "spec": {"runtimeClassName": "gvisor", "restartPolicy": "Never", "automountServiceAccountToken": False,
                                            "containers": [{"name": "workload", "image": IMAGE, "imagePullPolicy": "IfNotPresent", "command": ["python3", "-B", "-c", VERIFY],
                                                            "resources": {"requests": {"cpu": "50m", "memory": "64Mi", "ephemeral-storage": "64Mi"}, "limits": {"cpu": "250m", "memory": "128Mi", "ephemeral-storage": "64Mi"}},
-                                                           "securityContext": {"runAsUser": 0, "readOnlyRootFilesystem": True, "allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"], "add": ["DAC_READ_SEARCH"]}},
+                                                           "securityContext": {"runAsUser": 0, "readOnlyRootFilesystem": True, "allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"], "add": ["DAC_OVERRIDE"]}},
                                                            "volumeMounts": [{"name": "restore", "mountPath": "/data", "readOnly": True}]}],
                                            "volumes": [{"name": "restore", "persistentVolumeClaim": {"claimName": name, "readOnly": True}}]}}}})
         return
