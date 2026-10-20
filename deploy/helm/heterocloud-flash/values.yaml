@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/ipa-cyberlab/ipa-rs-heterocloud-flash
-  tag: "0.1.49"
+  tag: "0.1.50"
   pullPolicy: IfNotPresent
 
 # Pin separately when a provider-only update must retain existing helper images.
@@ -113,3 +113,24 @@ workloadIdentity:
 backups:
   storageNamespace: longhorn-system
   snapshotClass: ""
+  verification:
+    enabled: false
+    replicaCount: 2
+    storageClass: flash-backup-verification
+    storageNodeTag: ""
+  offsite:
+    enabled: false
+    schedule: "17 3 * * *"
+    sourceSecret: flash-backup-export-source
+    destinationSecret: flash-backup-offsite
+    keepCatalogs: 7
+    maxSourceGiB: 40
+    maxDestinationGiB: 512
+
+# Requires cert-manager. Admission applies only to new Flash Pods and home PVCs.
+capacity:
+  enabled: false
+  replicaCount: 2
+  minFreeGiB: 10
+  freePercent: 25
+  imageExpansionFactor: 6

@@ -1,3 +1,5 @@
 
 .git
 .security-tooling
+**/__pycache__
+**/*.pyc

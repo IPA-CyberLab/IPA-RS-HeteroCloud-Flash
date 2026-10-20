@@ -125,6 +125,7 @@ async fn run() -> Result<()> {
         client,
         image_inspector,
         ControllerConfig {
+            capacity: heterocloud_flash::capacity::CapacityClient::from_env()?,
             namespace,
             helper_image,
             registry_pull_secret,

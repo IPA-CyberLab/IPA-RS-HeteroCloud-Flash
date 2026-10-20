@@ -1,0 +1,191 @@
+{{- if .Values.backups.verification.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.backups.verification.storageClass }}
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "1"
+  fsType: ext4
+  {{- if .Values.backups.verification.storageNodeTag }}
+  nodeSelector: {{ .Values.backups.verification.storageNodeTag | quote }}
+  {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flash.fullname" . }}-backup-verifier
+spec:
+  replicas: {{ .Values.backups.verification.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "flash.name" . }}
+      app.kubernetes.io/component: backup-verifier
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "flash.name" . }}
+        app.kubernetes.io/component: backup-verifier
+        app.kubernetes.io/part-of: heterocloud
+    spec:
+      serviceAccountName: {{ include "flash.serviceAccountName" . }}-backup-verifier
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+      affinity:
+        {{- include "flash.affinity" (dict "root" . "component" "backup-verifier") | nindent 8 }}
+      containers:
+        - name: verifier
+          image: {{ include "flash.image" . }}
+          command: ["python3", "-B", "/usr/local/lib/flash-ops/backup_drill.py"]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FLASH_WORKLOAD_NAMESPACE
+              value: {{ .Values.workloadNamespace | quote }}
+            - name: FLASH_BACKUP_STORAGE_NAMESPACE
+              value: {{ .Values.backups.storageNamespace | quote }}
+            - name: FLASH_VERIFICATION_STORAGE_CLASS
+              value: {{ .Values.backups.verification.storageClass | quote }}
+            - name: FLASH_VERIFICATION_IMAGE
+              value: {{ include "flash.image" . | quote }}
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "flash.serviceAccountName" . }}-backup-verifier
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "flash.fullname" . }}-backup-verifier
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-backup-verifier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "flash.fullname" . }}-backup-verifier
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}-backup-verifier
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "flash.fullname" . }}-backup-verifier
+  namespace: {{ .Values.workloadNamespace }}
+rules:
+  - apiGroups: [flash.heterocloud.io]
+    resources: [flashbackups]
+    verbs: [get, list, update]
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshots]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, create, delete]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, create, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-backup-verifier
+  namespace: {{ .Values.workloadNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "flash.fullname" . }}-backup-verifier
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}-backup-verifier
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "flash.fullname" . }}-backup-verifier
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get]
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshotcontents]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-backup-verifier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "flash.fullname" . }}-backup-verifier
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}-backup-verifier
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-backup-verifier-storage
+  namespace: {{ .Values.backups.storageNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "flash.fullname" . }}-restore-observer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}-backup-verifier
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flash-backup-verification-isolated
+  namespace: {{ .Values.workloadNamespace }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: flash.heterocloud.io/backup-verification
+        operator: Exists
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []
+{{- end }}

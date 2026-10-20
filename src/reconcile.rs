@@ -148,6 +148,7 @@ fn valid_admin_mount_path(value: &str) -> bool {
 
 #[derive(Clone)]
 pub struct ControllerContext {
+    capacity: Option<crate::capacity::CapacityClient>,
     client: Client,
     namespace: String,
     image_inspector: ImageInspector,
@@ -167,6 +168,7 @@ pub struct ControllerContext {
 }
 
 pub struct ControllerConfig {
+    pub capacity: Option<crate::capacity::CapacityClient>,
     pub namespace: String,
     pub helper_image: String,
     pub registry_pull_secret: Option<String>,
@@ -187,6 +189,7 @@ impl ControllerContext {
     #[must_use]
     pub fn new(client: Client, image_inspector: ImageInspector, config: ControllerConfig) -> Self {
         Self {
+            capacity: config.capacity,
             client,
             image_inspector,
             helper_image: config.helper_image,
@@ -311,27 +314,34 @@ pub fn projected_weekly_usage(flash: &FlashService, now: i64) -> FlashWeeklyUsag
         u64::try_from(status.ready_replicas.max(0)).unwrap_or_default()
     });
     let elapsed = u64::try_from(now.saturating_sub(last_metered_at)).unwrap_or_default();
-    let replica_seconds = elapsed.saturating_mul(ready_replicas);
+    let cpu = status
+        .and_then(|s| s.allocated_cpu_millis)
+        .unwrap_or_else(|| {
+            ready_replicas.saturating_mul(u64::from(flash.spec.workload.cpu_millis))
+        });
+    let memory = status
+        .and_then(|s| s.allocated_memory_mib)
+        .unwrap_or_else(|| {
+            ready_replicas.saturating_mul(u64::from(flash.spec.workload.memory_mib))
+        });
+    let gpu = status
+        .and_then(|s| s.allocated_gpu_count)
+        .unwrap_or_else(|| {
+            ready_replicas.saturating_mul(u64::from(flash.spec.workload.effective_gpu_count()))
+        });
     FlashWeeklyUsage {
         week_started_at,
         cpu_millicore_seconds: previous
             .map_or(0, |usage| usage.cpu_millicore_seconds)
-            .saturating_add(
-                replica_seconds.saturating_mul(u64::from(flash.spec.workload.cpu_millis)),
-            ),
+            .saturating_add(elapsed.saturating_mul(cpu)),
         memory_mib_seconds: previous
             .map_or(0, |usage| usage.memory_mib_seconds)
-            .saturating_add(
-                replica_seconds.saturating_mul(u64::from(flash.spec.workload.memory_mib)),
-            ),
+            .saturating_add(elapsed.saturating_mul(memory)),
         gpu_seconds: previous
             .map(|usage| usage.gpu_seconds)
             .or_else(|| legacy_gpu.map(|usage| usage.used_seconds))
             .unwrap_or_default()
-            .saturating_add(
-                replica_seconds
-                    .saturating_mul(u64::from(flash.spec.workload.effective_gpu_count())),
-            ),
+            .saturating_add(elapsed.saturating_mul(gpu)),
         last_metered_at: now,
         max_cpu_millicore_seconds: flash.spec.policy.max_weekly_cpu_millicore_seconds,
         max_memory_mib_seconds: flash.spec.policy.max_weekly_memory_mib_seconds,
@@ -427,7 +437,13 @@ async fn meter_weekly_usage(
         }),
         cpu_exhausted: organization_cpu >= flash.spec.policy.max_weekly_cpu_millicore_seconds,
         memory_exhausted: organization_memory >= flash.spec.policy.max_weekly_memory_mib_seconds,
-        gpu_exhausted: flash.spec.workload.effective_gpu_count() > 0
+        gpu_exhausted: (flash.spec.workload.effective_gpu_count() > 0
+            || flash
+                .status
+                .as_ref()
+                .and_then(|s| s.allocated_gpu_count)
+                .unwrap_or_default()
+                > 0)
             && organization_gpu >= gpu_limit,
         gpu_remaining_seconds: gpu_limit.saturating_sub(organization_gpu),
         usage,
@@ -487,7 +503,14 @@ async fn reconcile_gpu_job(
     }
     let existing = jobs.get_opt(&name).await?;
     let unchanged_request = existing.as_ref().is_some_and(|job| {
-        job.spec.service_generation == flash.spec.desired_generation
+        job.spec.service_instance_id == flash.spec.service_instance_id
+            && job.spec.organization_id == flash.spec.organization_id
+            && job.spec.project_id == flash.spec.project_id
+            && job
+                .metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|owners| owners.iter().any(|o| o.uid == owner.uid))
             && job.spec.gpu_type == flash.spec.workload.gpu_type
             && job.spec.subject_id == flash.spec.subject_id.as_deref().unwrap_or_default()
     });
@@ -517,8 +540,10 @@ async fn reconcile_gpu_job(
             &Patch::Apply(&desired),
         )
         .await?;
-    // A server-side apply keeps the old status when a generation, GPU type,
-    // or owner changes. Do not let that stale assignment reach a Deployment;
+    // A generation-only update may keep its existing GPU reservation; the
+    // image/capacity checks must run before a working GPU service is stopped.
+    // A server-side apply keeps old status when a GPU type or owner changes.
+    // Do not let those stale assignments reach a Deployment;
     // the scheduler must validate it against the new request first.
     Ok(Some(gpu_job_state(&applied, unchanged_request)))
 }
@@ -614,6 +639,7 @@ async fn reconcile(
     let name = flash.name_any();
     let runtime_class = workload_runtime_class(flash.spec.workload.effective_gpu_count());
     let services = Api::<FlashService>::namespaced(context.client.clone(), &context.namespace);
+    let allocation = observe_allocation(&context, &flash).await?;
     let usage_records =
         Api::<FlashUsageRecord>::namespaced(context.client.clone(), &context.namespace);
 
@@ -675,7 +701,7 @@ async fn reconcile(
                 ),
                 ..FlashServiceStatus::default()
             };
-            patch_status_if_changed(&services, &flash, status).await?;
+            patch_observed_status(&services, &allocation, &flash, status).await?;
             return Ok(Action::requeue(Duration::from_secs(3)));
         }
     }
@@ -690,7 +716,7 @@ async fn reconcile(
             )))
             .await?;
         let mut gpu_released = flash.spec.workload.effective_gpu_count() == 0;
-        if pods.items.is_empty() && flash.spec.workload.effective_gpu_count() > 0 {
+        if !pods.items.iter().any(pod_is_active) && flash.spec.workload.effective_gpu_count() > 0 {
             let jobs = Api::<FlashGpuJob>::namespaced(context.client.clone(), &context.namespace);
             if let Some(job) = jobs.get_opt(&name).await? {
                 if job.metadata.deletion_timestamp.is_none() {
@@ -712,7 +738,7 @@ async fn reconcile(
             .map(|hostname| format!("https://{hostname}{}", lb_auth::CALLBACK_PATH));
         apply_weekly_meter(&mut status, &meter);
         let complete = status.stopped;
-        patch_status_if_changed(&services, &flash, status).await?;
+        patch_observed_status(&services, &allocation, &flash, status).await?;
         return Ok(Action::requeue(Duration::from_secs(if complete {
             30
         } else {
@@ -737,8 +763,9 @@ async fn reconcile(
                 Err(delete_error) => return Err(delete_error.into()),
             }
         }
-        patch_status_if_changed(
+        patch_observed_status(
             &services,
+            &allocation,
             &flash,
             FlashServiceStatus {
                 phase: FlashServicePhase::Error,
@@ -759,8 +786,9 @@ async fn reconcile(
             .get("vpc.heterocloud.io/applied-generation")
             != Some(&flash.spec.desired_generation.to_string())
     {
-        patch_status_if_changed(
+        patch_observed_status(
             &services,
+            &allocation,
             &flash,
             FlashServiceStatus {
                 phase: FlashServicePhase::Provisioning,
@@ -779,6 +807,11 @@ async fn reconcile(
     let cold = should_scale_to_zero(&flash, now);
     let quota_message = exhausted_quota_message(&weekly_meter);
     let suspended = cold || quota_message.is_some();
+    // Quota enforcement must remain effective even when replacement image
+    // inspection fails and the previous revision is still running.
+    if quota_message.is_some() {
+        suspend_deployment(&context.client, &context.namespace, &name).await?;
+    }
     let gpu_job_state = reconcile_gpu_job(
         &context.client,
         &context.namespace,
@@ -807,7 +840,7 @@ async fn reconcile(
             ..FlashServiceStatus::default()
         };
         apply_weekly_meter(&mut status, &weekly_meter);
-        patch_status_if_changed(&services, &flash, status).await?;
+        patch_observed_status(&services, &allocation, &flash, status).await?;
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
     let disk_budget_bytes = u64::from(flash.spec.workload.ephemeral_storage_gib)
@@ -835,11 +868,11 @@ async fn reconcile(
                     ..FlashServiceStatus::default()
                 };
                 apply_weekly_meter(&mut status, &weekly_meter);
-                patch_status_if_changed(&services, &flash, status).await?;
+                patch_observed_status(&services, &allocation, &flash, status).await?;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
             Ok(Err(error)) => {
-                suspend_deployment(&context.client, &context.namespace, &name).await?;
+                // An invalid replacement image must never stop the last healthy revision.
                 let mut status = FlashServiceStatus {
                     phase: FlashServicePhase::Error,
                     observed_generation: flash.spec.desired_generation,
@@ -849,7 +882,7 @@ async fn reconcile(
                     ..FlashServiceStatus::default()
                 };
                 apply_weekly_meter(&mut status, &weekly_meter);
-                patch_status_if_changed(&services, &flash, status).await?;
+                patch_observed_status(&services, &allocation, &flash, status).await?;
                 return Ok(Action::await_change());
             }
             Err(_) => {
@@ -864,7 +897,7 @@ async fn reconcile(
                     ..FlashServiceStatus::default()
                 };
                 apply_weekly_meter(&mut status, &weekly_meter);
-                patch_status_if_changed(&services, &flash, status).await?;
+                patch_observed_status(&services, &allocation, &flash, status).await?;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
         }
@@ -880,9 +913,17 @@ async fn reconcile(
         None
     };
     let existing_storage = existing_claim.as_ref().map(claim_storage).transpose()?;
+    let stateless = flash
+        .spec
+        .workload
+        .deployment
+        .as_ref()
+        .is_some_and(|p| p.stateless);
+    let allocate_home =
+        context.persistent_storage_class.is_some() && (!stateless || existing_claim.is_some());
     let storage = match storage_allocation_retaining(
         inspection.writable_storage_bytes,
-        context.persistent_storage_class.is_some(),
+        allocate_home,
         flash.spec.workload.rootfs_storage_gib,
         flash.spec.workload.persistent_storage_gib,
         existing_storage
@@ -901,18 +942,19 @@ async fn reconcile(
                 ..FlashServiceStatus::default()
             };
             apply_weekly_meter(&mut status, &weekly_meter);
-            patch_status_if_changed(&services, &flash, status).await?;
+            patch_observed_status(&services, &allocation, &flash, status).await?;
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
     };
     let persistent_volume_claim = context
         .persistent_storage_class
         .as_deref()
+        .filter(|_| allocate_home)
         .map(|storage_class| {
             desired_persistent_volume_claim(&flash, &owner, storage_class, storage.persistent_bytes)
         })
         .transpose()?;
-    let deployment = desired_deployment(
+    let mut deployment = desired_deployment(
         &flash,
         &owner,
         &inspection.resolved_image,
@@ -924,6 +966,7 @@ async fn reconcile(
             helper_image: Some(&context.helper_image),
             persistent_volume_claim: persistent_volume_claim
                 .as_ref()
+                .filter(|_| !stateless)
                 .and_then(|claim| claim.metadata.name.as_deref()),
             registry_pull_secret: context.registry_pull_secret.as_deref(),
             admin_volume_mounts: context
@@ -935,6 +978,78 @@ async fn reconcile(
             workload_identity_endpoint: context.workload_identity_endpoint.as_deref(),
         },
     )?;
+    let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
+    let current_deployment = deployments.get_opt(&name).await?;
+    let template_generation = flash.spec.desired_generation.to_string();
+    let current_generation = current_deployment
+        .as_ref()
+        .and_then(deployment_pod_generation);
+    let new_template =
+        current_deployment.is_none() || current_generation.as_deref() != Some(&template_generation);
+    if new_template {
+        if let Some(metadata) = deployment
+            .spec
+            .as_mut()
+            .and_then(|s| s.template.metadata.as_mut())
+        {
+            metadata.annotations.get_or_insert_default().insert(
+                "flash.heterocloud.io/image-size-bytes".into(),
+                inspection.image_size_bytes.to_string(),
+            );
+        }
+    } else if let Some(current) = &current_deployment {
+        preserve_legacy_probe_fields(current, &mut deployment);
+    }
+    if let Some(capacity) = &context.capacity {
+        let mut shortage = None;
+        if let Some(claim) = &persistent_volume_claim
+            && claim_needs_storage_update(existing_storage, storage.persistent_bytes)
+        {
+            shortage = capacity
+                .check(
+                    "PersistentVolumeClaim",
+                    serde_json::to_value(claim).map_err(anyhow::Error::from)?,
+                    false,
+                )
+                .await
+                .unwrap_or_else(|_| Some("capacity_metrics_unavailable".into()));
+        }
+        if shortage.is_none() && new_template && !suspended {
+            let template = deployment
+                .spec
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing template"))?
+                .template
+                .clone();
+            shortage = capacity
+                .check(
+                    "Pod",
+                    serde_json::to_value(template).map_err(anyhow::Error::from)?,
+                    deployment
+                        .spec
+                        .as_ref()
+                        .and_then(|s| s.strategy.as_ref())
+                        .and_then(|s| s.type_.as_deref())
+                        == Some("Recreate"),
+                )
+                .await
+                .unwrap_or_else(|_| Some("capacity_metrics_unavailable".into()));
+        }
+        if let Some(code) = shortage {
+            let mut status = flash.status.clone().unwrap_or_default();
+            status.phase = FlashServicePhase::Provisioning;
+            status.observed_generation = flash.spec.desired_generation;
+            status.desired_replicas = desired_replicas;
+            status.runtime_class = runtime_class.into();
+            status.message = Some(format!(
+                "waiting for capacity: {code}; existing revision and disk are retained"
+            ));
+            status.diagnostics = vec![crate::diagnostics::reason(&code)];
+            apply_weekly_meter(&mut status, &weekly_meter);
+            patch_observed_status(&services, &allocation, &flash, status).await?;
+            return Ok(Action::requeue(Duration::from_secs(15)));
+        }
+    }
     let desired_network_service =
         desired_service_with_hostname(&flash, &owner, hostname.as_deref())?;
     let http_routes = Api::<HTTPRoute>::namespaced(context.client.clone(), &context.namespace);
@@ -1098,6 +1213,7 @@ async fn reconcile(
         image_entrypoint: Some(inspection.image_entrypoint),
         image_cmd: Some(inspection.image_cmd),
         image_architecture: Some(inspection.architecture),
+        disk_usage: allocation.disk.clone(),
         cold,
         gpu_scheduling: gpu_scheduling_status(&flash, gpu_job_state.as_ref()),
         ..FlashServiceStatus::default()
@@ -1142,7 +1258,7 @@ async fn reconcile(
         status.message = Some(message.into());
     }
     let phase_ready = status.phase == FlashServicePhase::Ready;
-    patch_status_if_changed(&services, &flash, status).await?;
+    patch_observed_status(&services, &allocation, &flash, status).await?;
     if is_scale_to_zero(&flash) && phase_ready && activity_timestamp(&flash).is_none() {
         mark_activity(&services, &flash, now).await?;
         return Ok(Action::requeue(Duration::from_secs(30)));
@@ -1166,7 +1282,7 @@ fn explicit_stop_status(
         i32::try_from(pods.iter().filter(|pod| pod_is_ready(pod)).count()).unwrap_or(i32::MAX);
     status.runtime_class = workload_runtime_class(flash.spec.workload.effective_gpu_count()).into();
     status.cold = false;
-    status.stopped = pods.is_empty() && gpu_released;
+    status.stopped = !pods.iter().any(pod_is_active) && gpu_released;
     status.phase = if status.stopped {
         FlashServicePhase::Ready
     } else {
@@ -1183,6 +1299,46 @@ fn explicit_stop_status(
     status
 }
 
+fn pod_is_active(pod: &Pod) -> bool {
+    !matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+        Some("Failed" | "Succeeded")
+    )
+}
+
+fn preserve_legacy_probe_fields(current: &Deployment, desired: &mut Deployment) {
+    let Some(old) = current.spec.as_ref().and_then(|s| s.template.spec.as_ref()) else {
+        return;
+    };
+    let Some(new) = desired.spec.as_mut() else {
+        return;
+    };
+    if let Some(spec) = new.template.spec.as_mut() {
+        for container in &mut spec.containers {
+            if let Some(previous) = old.containers.iter().find(|c| c.name == container.name) {
+                container.readiness_probe = previous.readiness_probe.clone();
+                container.startup_probe = previous.startup_probe.clone();
+                container.lifecycle = previous.lifecycle.clone();
+            }
+        }
+    }
+    let key = "flash.heterocloud.io/image-size-bytes";
+    if let Some(value) = current
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.metadata.as_ref())
+        .and_then(|m| m.annotations.as_ref())
+        .and_then(|a| a.get(key))
+    {
+        new.template
+            .metadata
+            .get_or_insert_default()
+            .annotations
+            .get_or_insert_default()
+            .insert(key.into(), value.clone());
+    }
+}
+
 fn update_workload_status(
     status: &mut FlashServiceStatus,
     pods: &[Pod],
@@ -1193,12 +1349,33 @@ fn update_workload_status(
     let desired_replicas = status.desired_replicas;
     status.ready_replicas =
         i32::try_from(pods.iter().filter(|pod| pod_is_ready(pod)).count()).unwrap_or(i32::MAX);
-    let ready = status.ready_replicas == desired_replicas && endpoint_ready;
-    let failure = workload_failure_message(pods).or_else(|| {
-        (!ready)
-            .then(|| deployment_failure_message(deployment))
-            .flatten()
-    });
+    let ready = status.ready_replicas >= desired_replicas
+        && endpoint_ready
+        && deployment
+            .status
+            .as_ref()
+            .is_none_or(|s| s.available_replicas.unwrap_or(0) >= desired_replicas);
+    // ReplicaSets retain failed/evicted Pods. A healthy replacement must not
+    // inherit a retired Pod's failure forever, or block a scale-down drain.
+    let active = pods
+        .iter()
+        .filter(|pod| {
+            pod.metadata.deletion_timestamp.is_none()
+                && !matches!(
+                    pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+                    Some("Failed" | "Succeeded")
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let failure = (!ready)
+        .then(|| workload_failure_message(if active.is_empty() { pods } else { &active }))
+        .flatten()
+        .or_else(|| {
+            (!ready)
+                .then(|| deployment_failure_message(deployment))
+                .flatten()
+        });
     status.phase = if failure.is_some() {
         FlashServicePhase::Error
     } else if ready {
@@ -1223,6 +1400,12 @@ fn update_workload_status(
             ))
         }
     });
+    status.diagnostics = crate::diagnostics::collect(
+        pods,
+        ready,
+        status.message.as_deref(),
+        status.disk_usage.as_ref(),
+    );
     if status.phase == FlashServicePhase::Ready {
         Action::await_change()
     } else {
@@ -1271,6 +1454,12 @@ fn error_policy(
 
 fn status_patch(flash: &FlashService, status: &FlashServiceStatus) -> Value {
     let mut patch = json!({"status": status});
+    patch["status"]["diagnostics"] = json!(status.diagnostics);
+    patch["status"]["disk_usage"] = json!(status.disk_usage);
+    patch["status"]["serving_replicas"] = json!(status.serving_replicas);
+    patch["status"]["allocated_cpu_millis"] = json!(status.allocated_cpu_millis);
+    patch["status"]["allocated_memory_mib"] = json!(status.allocated_memory_mib);
+    patch["status"]["allocated_gpu_count"] = json!(status.allocated_gpu_count);
     // Merge patches must explicitly clear fields omitted by status serialization.
     patch["status"]["resolved_image"] = json!(status.resolved_image);
     patch["status"]["image_size_bytes"] = json!(status.image_size_bytes);
@@ -1289,6 +1478,119 @@ fn status_patch(flash: &FlashService, status: &FlashServiceStatus) -> Value {
         patch["metadata"] = json!({"resourceVersion": version});
     }
     patch
+}
+
+struct ObservedAllocation {
+    pods: Vec<Pod>,
+    serving: u32,
+    cpu_millis: u64,
+    memory_mib: u64,
+    gpu_count: u64,
+    disk: Option<crate::diagnostics::DiskUsage>,
+}
+
+async fn observe_allocation(
+    context: &ControllerContext,
+    flash: &FlashService,
+) -> Result<ObservedAllocation, ReconcileError> {
+    let pods = Api::<Pod>::namespaced(context.client.clone(), &context.namespace)
+        .list(&ListParams::default().labels(&format!(
+            "flash.heterocloud.io/instance={}",
+            flash.spec.service_instance_id
+        )))
+        .await?
+        .items;
+    let (cpu, memory, gpu) = running_allocation(&pods)?;
+    let serving =
+        u32::try_from(pods.iter().filter(|p| pod_is_ready(p)).count()).unwrap_or(u32::MAX);
+    let disk = if let Some(capacity) = &context.capacity {
+        capacity.disk_usage(&flash.spec.service_instance_id).await
+    } else {
+        None
+    };
+    Ok(ObservedAllocation {
+        pods,
+        serving,
+        cpu_millis: cpu,
+        memory_mib: memory,
+        gpu_count: gpu,
+        disk,
+    })
+}
+
+fn running_allocation(pods: &[Pod]) -> Result<(u64, u64, u64), ReconcileError> {
+    let (mut cpu, mut memory, mut gpu) = (0_u64, 0_u64, 0_u64);
+    for pod in pods
+        .iter()
+        .filter(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
+    {
+        let Some(container) = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.containers.iter().find(|c| c.name == "workload"))
+        else {
+            continue;
+        };
+        let Some(requests) = container
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+        else {
+            continue;
+        };
+        if let Some(value) = requests.get("cpu") {
+            let millis = if let Some(m) = value.0.strip_suffix('m') {
+                m.parse::<u64>()
+                    .map_err(|_| ReconcileError::InvalidStorageQuantity)?
+            } else {
+                value
+                    .0
+                    .parse::<u64>()
+                    .map_err(|_| ReconcileError::InvalidStorageQuantity)?
+                    .saturating_mul(1000)
+            };
+            cpu = cpu.saturating_add(millis);
+        }
+        if let Some(value) = requests.get("memory") {
+            memory = memory.saturating_add(storage_quantity_bytes(&value.0)?.div_ceil(MIB_BYTES));
+        }
+        if let Some(value) = requests.get(GPU_RESOURCE_NAME) {
+            gpu = gpu.saturating_add(
+                value
+                    .0
+                    .parse::<u64>()
+                    .map_err(|_| ReconcileError::InvalidStorageQuantity)?,
+            );
+        }
+    }
+    Ok((cpu, memory, gpu))
+}
+
+async fn patch_observed_status(
+    services: &Api<FlashService>,
+    allocation: &ObservedAllocation,
+    flash: &FlashService,
+    mut status: FlashServiceStatus,
+) -> Result<(), ReconcileError> {
+    status.serving_replicas = Some(allocation.serving);
+    status.allocated_cpu_millis = Some(allocation.cpu_millis);
+    status.allocated_memory_mib = Some(allocation.memory_mib);
+    status.allocated_gpu_count = Some(allocation.gpu_count);
+    status.disk_usage = allocation.disk.clone();
+    if status.diagnostics.is_empty() {
+        status.diagnostics = crate::diagnostics::collect(
+            &allocation.pods,
+            status.phase == FlashServicePhase::Ready,
+            status.message.as_deref(),
+            status.disk_usage.as_ref(),
+        );
+        if status.phase == FlashServicePhase::Error && status.diagnostics.is_empty() {
+            status
+                .diagnostics
+                .push(crate::diagnostics::reason("deployment_failed"));
+        }
+    }
+    patch_status_if_changed(services, flash, status).await
 }
 
 async fn patch_status_if_changed(
@@ -1434,6 +1736,7 @@ fn desired_deployment(
         "name": "workload",
         "image": resolved_image,
         "imagePullPolicy": "IfNotPresent",
+        "lifecycle": {"preStop":{"sleep":{"seconds":5}}},
         "ports": ports,
         "env": env,
         "resources": {
@@ -1456,6 +1759,40 @@ fn desired_deployment(
             "capabilities": {"drop": ["NET_RAW"]},
         }
     });
+    let deployment_policy = workload.deployment.clone().unwrap_or_default();
+    let check = deployment_policy.health_check.clone().or_else(|| {
+        workload
+            .ports
+            .iter()
+            .find(|p| p.protocol == crate::domain::TransportProtocol::Tcp)
+            .map(|p| crate::deployment::HealthCheck {
+                port: p.container_port,
+                path: None,
+            })
+    });
+    if let Some(check) = check {
+        let action = if let Some(path) = check.path {
+            json!({"httpGet":{"path":path,"port":check.port,"scheme":"HTTP"}})
+        } else {
+            json!({"tcpSocket":{"port":check.port}})
+        };
+        let mut readiness = action.clone();
+        readiness["periodSeconds"] = json!(5);
+        readiness["timeoutSeconds"] = json!(2);
+        readiness["failureThreshold"] = json!(3);
+        let mut startup = action;
+        startup["periodSeconds"] = json!(5);
+        startup["timeoutSeconds"] = json!(2);
+        startup["failureThreshold"] = json!(
+            deployment_policy
+                .deadline_seconds
+                .saturating_sub(30)
+                .max(30)
+                .div_ceil(5)
+        );
+        container["readinessProbe"] = readiness;
+        container["startupProbe"] = startup;
+    }
     if workload.effective_gpu_count() > 0 {
         let count = workload.effective_gpu_count().to_string();
         container["resources"]["requests"][GPU_RESOURCE_NAME] = json!(count);
@@ -1644,7 +1981,18 @@ fn desired_deployment(
     if !volumes.is_empty() {
         pod_spec["volumes"] = Value::Array(volumes);
     }
-    let strategy = if workload.effective_gpu_count() > 0 {
+    let policy = workload.deployment.clone().unwrap_or_default();
+    // A shared writable home must not be mounted by old and new revisions at
+    // once. An explicit rolling strategy is only valid for stateless services.
+    let stateful = options.persistent_volume_claim.is_some()
+        || !options.admin_volume_mounts.is_empty()
+        || workload.effective_gpu_count() > 0;
+    if stateful && policy.strategy == "rolling" {
+        return Err(anyhow::anyhow!("rolling updates require a stateless service; use auto or recreate for persistent disks/GPU").into());
+    }
+    let strategy = if stateful || policy.strategy == "recreate" {
+        json!({"type": "Recreate"})
+    } else if workload.effective_gpu_count() > 0 {
         json!({
             "type": "RollingUpdate",
             "rollingUpdate": {"maxUnavailable": 1, "maxSurge": 0}
@@ -1670,6 +2018,9 @@ fn desired_deployment(
         "spec": {
             "replicas": workload.replicas,
             "strategy": strategy,
+            "progressDeadlineSeconds": policy.deadline_seconds,
+            "minReadySeconds": 5,
+            "revisionHistoryLimit": 10,
             "selector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}},
             "template": {
                 "metadata": template_metadata,
@@ -3128,6 +3479,128 @@ mod tests {
         },
     };
 
+    #[test]
+    fn historical_failed_pod_does_not_poison_a_healthy_replacement() -> anyhow::Result<()> {
+        let failed: Pod = serde_json::from_value(
+            json!({"metadata":{"name":"retired"},"status":{"phase":"Failed","containerStatuses":[{"name":"workload","image":"app","imageID":"old","ready":false,"restartCount":0,"state":{"terminated":{"exitCode":137,"reason":"OOMKilled"}}}]}}),
+        )?;
+        let healthy: Pod = serde_json::from_value(
+            json!({"metadata":{"name":"replacement"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}),
+        )?;
+        let deployment: Deployment =
+            serde_json::from_value(json!({"status":{"availableReplicas":1}}))?;
+        let mut status = FlashServiceStatus {
+            desired_replicas: 1,
+            ..FlashServiceStatus::default()
+        };
+        update_workload_status(
+            &mut status,
+            &[failed.clone(), healthy],
+            &deployment,
+            true,
+            false,
+        );
+        assert_eq!(status.phase, FlashServicePhase::Ready);
+        assert!(status.diagnostics.is_empty());
+        let flash = service(TrafficMode::Forwarded);
+        assert!(super::explicit_stop_status(&flash, &[failed], true).stopped);
+        Ok(())
+    }
+
+    #[test]
+    fn actual_old_revision_allocation_remains_billable_during_a_failed_update() -> anyhow::Result<()>
+    {
+        let pod: Pod = serde_json::from_value(
+            json!({"metadata":{"name":"old"},"spec":{"containers":[{"name":"workload","resources":{"requests":{"cpu":"4","memory":"8Gi","nvidia.com/gpu":"1"}}}]},"status":{"phase":"Running"}}),
+        )?;
+        let (cpu, memory, gpu) = super::running_allocation(&[pod])?;
+        assert_eq!((cpu, memory, gpu), (4000, 8192, 1));
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.cpu_millis = 10;
+        flash.spec.workload.memory_mib = 16;
+        let now = 1_800_000_000;
+        flash.status = Some(FlashServiceStatus {
+            phase: FlashServicePhase::Error,
+            ready_replicas: 0,
+            allocated_cpu_millis: Some(cpu),
+            allocated_memory_mib: Some(memory),
+            allocated_gpu_count: Some(gpu),
+            weekly_usage: Some(FlashWeeklyUsage {
+                week_started_at: super::utc_week_start(now),
+                cpu_millicore_seconds: 0,
+                memory_mib_seconds: 0,
+                gpu_seconds: 0,
+                last_metered_at: now - 10,
+                max_cpu_millicore_seconds: 1_000_000,
+                max_memory_mib_seconds: 1_000_000,
+                max_gpu_seconds: 1000,
+            }),
+            ..FlashServiceStatus::default()
+        });
+        let usage = projected_weekly_usage(&flash, now);
+        assert_eq!(usage.cpu_millicore_seconds, 40_000);
+        assert_eq!(usage.memory_mib_seconds, 81_920);
+        assert_eq!(usage.gpu_seconds, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn stateful_updates_drain_and_stateless_updates_keep_a_healthy_old_revision()
+    -> anyhow::Result<()> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.ports[0].protocol = TransportProtocol::Tcp;
+        let persistent = desired_deployment(
+            &flash,
+            &owner(),
+            "example/app@sha256:good",
+            GIB_BYTES,
+            DeploymentOptions {
+                persistent_volume_claim: Some("home"),
+                ..Default::default()
+            },
+        )?;
+        let value = serde_json::to_value(&persistent)?;
+        assert_eq!(value["spec"]["strategy"]["type"], "Recreate");
+        assert!(value["spec"]["template"]["spec"]["containers"][0]["readinessProbe"].is_object());
+        assert_eq!(value["spec"]["minReadySeconds"], 5);
+        flash.spec.workload.deployment = Some(crate::deployment::DeploymentPolicy {
+            stateless: true,
+            strategy: "rolling".into(),
+            ..Default::default()
+        });
+        let rolling = serde_json::to_value(desired_deployment(
+            &flash,
+            &owner(),
+            "example/app@sha256:new",
+            GIB_BYTES,
+            DeploymentOptions::default(),
+        )?)?;
+        assert_eq!(
+            rolling["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"],
+            0
+        );
+        assert_eq!(rolling["spec"]["strategy"]["rollingUpdate"]["maxSurge"], 1);
+        let mut legacy = persistent.clone();
+        let spec = legacy
+            .spec
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("spec"))?
+            .template
+            .spec
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("pod"))?;
+        spec.containers[0].readiness_probe = None;
+        spec.containers[0].startup_probe = None;
+        let mut desired = persistent;
+        super::preserve_legacy_probe_fields(&legacy, &mut desired);
+        assert_eq!(
+            legacy.spec.as_ref().map(|s| &s.template),
+            desired.spec.as_ref().map(|s| &s.template),
+            "a controller upgrade must not restart existing user containers"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn status_clear_converges_and_stale_replica_cannot_restore_image_cache()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3264,6 +3737,7 @@ mod tests {
                     ephemeral_storage_gib: 10,
                     rootfs_storage_gib: None,
                     persistent_storage_gib: None,
+                    deployment: None,
                     restore_from_backup_id: None,
                     ports: vec![FlashPort {
                         name: "game-udp".into(),
@@ -3841,13 +4315,10 @@ mod tests {
             );
         }
         assert_eq!(
-            value.pointer("/spec/strategy/rollingUpdate/maxSurge"),
-            Some(&json!(0))
+            value.pointer("/spec/strategy/type"),
+            Some(&json!("Recreate"))
         );
-        assert_eq!(
-            value.pointer("/spec/strategy/rollingUpdate/maxUnavailable"),
-            Some(&json!(1))
-        );
+        assert!(value.pointer("/spec/strategy/rollingUpdate").is_none());
         Ok(())
     }
 
@@ -3907,7 +4378,7 @@ mod tests {
             "longhorn-static",
             allocation.persistent_bytes,
         )?;
-        let claim = serde_json::to_value(claim)?;
+        let claim = serde_json::to_value(claim).map_err(anyhow::Error::from)?;
         assert_eq!(
             claim.pointer("/spec/accessModes/0"),
             Some(&json!("ReadWriteMany"))
@@ -4212,6 +4683,9 @@ mod tests {
                     .unwrap_or_default()
                     .contains(message)
             );
+            if let Some(status) = deployment.status.as_mut() {
+                status.available_replicas = Some(1);
+            }
             let pod: Pod = serde_json::from_value(json!({
                 "metadata": {"name": "flash-test-ready"},
                 "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}

@@ -34,6 +34,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/flash-controller"]
           env:
+            {{- if .Values.capacity.enabled }}
+            - name: FLASH_CAPACITY_ENDPOINT
+              value: {{ printf "https://%s-capacity.%s.svc/" (include "flash.fullname" .) .Release.Namespace | quote }}
+            - name: FLASH_CAPACITY_CA_FILE
+              value: /capacity-ca/ca.crt
+            {{- end }}
             - name: FLASH_BACKUP_STORAGE_NAMESPACE
               value: {{ .Values.backups.storageNamespace | quote }}
             - name: FLASH_BACKUP_SNAPSHOT_CLASS
@@ -78,18 +84,34 @@ spec:
             - name: FLASH_REGISTRY_PULL_SECRET
               value: {{ required "registry.workloadPullSecretName is required" .Values.registry.workloadPullSecretName | quote }}
             {{- end }}
-          {{- if .Values.registry.enabled }}
+          {{- if or .Values.registry.enabled .Values.capacity.enabled }}
           volumeMounts:
+            {{- if .Values.capacity.enabled }}
+            - name: capacity-ca
+              mountPath: /capacity-ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.registry.enabled }}
             - name: registry-auth
               mountPath: /var/run/secrets/registry
               readOnly: true
           {{- end }}
+            {{- end }}
           securityContext:
             {{- include "flash.containerSecurityContext" . | nindent 12 }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
-      {{- if .Values.registry.enabled }}
+      {{- if or .Values.registry.enabled .Values.capacity.enabled }}
       volumes:
+        {{- if .Values.capacity.enabled }}
+        - name: capacity-ca
+          secret:
+            secretName: {{ include "flash.fullname" . }}-capacity-tls
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+        {{- if .Values.registry.enabled }}
         - name: registry-auth
           secret:
             secretName: {{ required "registry.authSecretName is required" .Values.registry.authSecretName }}
@@ -98,6 +120,7 @@ spec:
               - key: {{ required "registry.passwordKey is required" .Values.registry.passwordKey }}
                 path: password
       {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

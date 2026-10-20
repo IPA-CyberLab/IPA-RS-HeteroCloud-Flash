@@ -169,6 +169,10 @@ fn app_router(state: Arc<AppState>) -> Router {
             get(get_backup).delete(delete_backup),
         )
         .route(
+            "/internal/v1/service-instances/{id}/backups/{backup_id}/verify",
+            post(verify_backup),
+        )
+        .route(
             "/internal/v1/service-instances/{id}/domains",
             get(list_custom_domains).post(add_custom_domain),
         )
@@ -206,6 +210,31 @@ fn backup_error(error: heterocloud_flash::backups::BackupError) -> ApiError {
             ApiError::NotReady
         }
     }
+}
+
+async fn verify_backup(
+    State(state): State<Arc<AppState>>,
+    Path((id, backup_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, "flash.backups.verify")?;
+    if claims.service_instance_id != id {
+        return Err(ApiError::Forbidden);
+    }
+    heterocloud_flash::backups::request_verification(
+        state.client.clone(),
+        &state.namespace,
+        backup_id,
+        &claims,
+    )
+    .await
+    .map_err(backup_error)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({"id":backup_id,"verification_requested":true})),
+    ))
 }
 
 async fn get_backup_source(

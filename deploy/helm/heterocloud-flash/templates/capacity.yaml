@@ -1,0 +1,295 @@
+{{- if .Values.capacity.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity-ca
+spec:
+  isCA: true
+  commonName: flash-capacity-ca
+  secretName: {{ include "flash.fullname" . }}-capacity-ca
+  duration: 87600h
+  renewBefore: 720h
+  issuerRef:
+    name: {{ include "flash.fullname" . }}-capacity-selfsigned
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity-ca
+spec:
+  ca:
+    secretName: {{ include "flash.fullname" . }}-capacity-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+spec:
+  secretName: {{ include "flash.fullname" . }}-capacity-tls
+  duration: 2160h
+  renewBefore: 720h
+  dnsNames:
+    - {{ include "flash.fullname" . }}-capacity.{{ .Release.Namespace }}.svc
+    - {{ include "flash.fullname" . }}-capacity.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    name: {{ include "flash.fullname" . }}-capacity-ca
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flash-capacity-reservations
+  # Stateful ledger is populated by CAS, never overwritten by Helm/Argo.
+  annotations:
+    argocd.argoproj.io/ignore-differences: /data
+    helm.sh/resource-policy: keep
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "flash.name" . }}
+    app.kubernetes.io/component: capacity
+  ports:
+    - name: https
+      port: 443
+      targetPort: 9443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+spec:
+  replicas: {{ .Values.capacity.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "flash.name" . }}
+      app.kubernetes.io/component: capacity
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "flash.name" . }}
+        app.kubernetes.io/component: capacity
+        app.kubernetes.io/part-of: heterocloud
+    spec:
+      serviceAccountName: {{ include "flash.serviceAccountName" . }}-capacity
+      affinity:
+        {{- include "flash.affinity" (dict "root" . "component" "capacity") | nindent 8 }}
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: capacity
+          image: {{ include "flash.image" . }}
+          command: ["python3", "-B", "/usr/local/lib/flash-ops/capacity.py"]
+          ports:
+            - containerPort: 9443
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FLASH_WORKLOAD_NAMESPACE
+              value: {{ .Values.workloadNamespace | quote }}
+            - name: FLASH_BACKUP_STORAGE_NAMESPACE
+              value: {{ .Values.backups.storageNamespace | quote }}
+            - name: CAPACITY_MIN_FREE_GIB
+              value: {{ .Values.capacity.minFreeGiB | quote }}
+            - name: CAPACITY_FREE_PERCENT
+              value: {{ .Values.capacity.freePercent | quote }}
+            - name: CAPACITY_IMAGE_FACTOR
+              value: {{ .Values.capacity.imageExpansionFactor | quote }}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 9443, scheme: HTTPS}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 9443, scheme: HTTPS}
+            initialDelaySeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ include "flash.fullname" . }}-capacity-tls
+            defaultMode: 0440
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "flash.name" . }}
+      app.kubernetes.io/component: capacity
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "flash.serviceAccountName" . }}-capacity
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [nodes/proxy]
+    verbs: [get]
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "flash.fullname" . }}-capacity
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}-capacity
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [flash-capacity-reservations]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "flash.fullname" . }}-capacity
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}-capacity
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity-workloads
+  namespace: {{ .Values.workloadNamespace }}
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get]
+  - apiGroups: [flash.heterocloud.io]
+    resources: [flashservices]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity-workloads
+  namespace: {{ .Values.workloadNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "flash.fullname" . }}-capacity-workloads
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}-capacity
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity-storage
+  namespace: {{ .Values.backups.storageNamespace }}
+rules:
+  - apiGroups: [longhorn.io]
+    resources: [nodes]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity-storage
+  namespace: {{ .Values.backups.storageNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "flash.fullname" . }}-capacity-storage
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "flash.serviceAccountName" . }}-capacity
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "flash.fullname" . }}-capacity
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "flash.fullname" . }}-capacity
+webhooks:
+  - name: capacity.flash.heterocloud.io
+    admissionReviewVersions: [v1]
+    sideEffects: NoneOnDryRun
+    failurePolicy: Fail
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 15
+    matchConditions:
+      - name: flash-namespace
+        expression: 'request.namespace == {{ .Values.workloadNamespace | quote }}'
+      - name: flash-managed-resource
+        expression: 'has(object.metadata.labels) && ("flash.heterocloud.io/instance" in object.metadata.labels || "flash.heterocloud.io/backup-verification" in object.metadata.labels)'
+    clientConfig:
+      service:
+        name: {{ include "flash.fullname" . }}-capacity
+        namespace: {{ .Release.Namespace }}
+        path: /admit
+        port: 443
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+        scope: Namespaced
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [persistentvolumeclaims]
+        scope: Namespaced
+{{- end }}

@@ -108,10 +108,46 @@ pub fn snapshots(client: Client, namespace: &str) -> Api<DynamicObject> {
 
 pub fn view(backup: &FlashBackup) -> Value {
     let status = backup.status.clone().unwrap_or_default();
+    let verification = backup.annotations().get("flash.heterocloud.io/restore-verification").and_then(|v|serde_json::from_str::<Value>(v).ok()).map(|value| {
+        json!({"phase":value["phase"],"started_at":value["started_at"],"completed_at":value["completed_at"],"sampled_files":value["sampled_files"],"sampled_bytes":value["sampled_bytes"],"sha256":value["sha256"],"cleanup_verified":value["cleanup_verified"]})
+    });
     json!({"id":backup.spec.id,"name":backup.spec.name,
         "phase":if backup.metadata.deletion_timestamp.is_some() {"deleting"} else if status.phase.is_empty() {"pending"} else {&status.phase},
         "message":status.message,"completed_at":status.completed_at,
-        "volume_size_bytes":backup.spec.volume_size_bytes})
+        "volume_size_bytes":backup.spec.volume_size_bytes,"restore_verification":verification})
+}
+
+pub async fn request_verification(
+    client: Client,
+    namespace: &str,
+    id: Uuid,
+    claims: &ProviderClaims,
+) -> Result<(), BackupError> {
+    let backup = get(client.clone(), namespace, id, claims).await?;
+    if backup.metadata.deletion_timestamp.is_some()
+        || backup.status.as_ref().is_none_or(|s| s.phase != "ready")
+    {
+        return Err(BackupError::Conflict(
+            "backup is not ready for verification",
+        ));
+    }
+    let existing = backup
+        .annotations()
+        .get("flash.heterocloud.io/restore-verification")
+        .and_then(|v| serde_json::from_str::<Value>(v).ok());
+    if existing.as_ref().is_some_and(|v| {
+        matches!(
+            v["phase"].as_str(),
+            Some("queued" | "restoring" | "cleaning")
+        )
+    }) {
+        return Ok(());
+    }
+    let annotation =
+        json!({"phase":"queued","started_at":chrono::Utc::now().to_rfc3339()}).to_string();
+    Api::<FlashBackup>::namespaced(client,namespace).patch(&backup.name_any(),&PatchParams::default(),&Patch::Merge(json!({"metadata":{"resourceVersion":backup.resource_version(),"annotations":{
+        "flash.heterocloud.io/verify-request":Uuid::now_v7().to_string(),"flash.heterocloud.io/restore-verification":annotation}}}))).await?;
+    Ok(())
 }
 
 pub fn check_scope(backup: &FlashBackup, claims: &ProviderClaims) -> Result<(), BackupError> {
@@ -373,6 +409,11 @@ pub async fn delete(
         Err(BackupError::NotFound) => return Ok(true),
         Err(e) => return Err(e),
     };
+    if offsite_locked(&backup) {
+        return Err(BackupError::Conflict(
+            "an offsite copy is using this backup",
+        ));
+    }
     if restore_pending(client.clone(), namespace, id).await? {
         return Err(BackupError::Conflict(
             "a disk restore is still using this backup",
@@ -393,7 +434,26 @@ pub async fn delete(
     Ok(false)
 }
 
+fn offsite_locked(backup: &FlashBackup) -> bool {
+    backup
+        .annotations()
+        .get("flash.heterocloud.io/offsite-lock-until")
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .is_some_and(|until| until.timestamp() > chrono::Utc::now().timestamp())
+}
+
 async fn restore_pending(client: Client, namespace: &str, id: Uuid) -> Result<bool, BackupError> {
+    if !Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace)
+        .list(
+            &ListParams::default()
+                .labels(&format!("flash.heterocloud.io/backup-verification={id}")),
+        )
+        .await?
+        .items
+        .is_empty()
+    {
+        return Ok(true);
+    }
     let services = Api::<FlashService>::namespaced(client.clone(), namespace)
         .list(&ListParams::default())
         .await?;
@@ -538,6 +598,9 @@ async fn reconcile(
     let snapshots = snapshots(client.clone(), namespace);
     let name = backup.name_any();
     if backup.metadata.deletion_timestamp.is_some() {
+        if offsite_locked(&backup) {
+            return Ok(());
+        }
         if restore_pending(client, namespace, backup.spec.id).await? {
             return Ok(());
         }

@@ -313,6 +313,18 @@ const fn default_max_weekly_gpu_seconds() -> u64 {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlashServiceStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_replicas: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_cpu_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_memory_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocated_gpu_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_usage: Option<crate::diagnostics::DiskUsage>,
     pub phase: FlashServicePhase,
     pub observed_generation: i64,
     pub ready_replicas: i32,

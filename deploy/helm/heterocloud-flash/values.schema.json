@@ -26,6 +26,99 @@
           "minLength": 1,
           "maxLength": 63,
           "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "replicaCount": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3
+            },
+            "storageClass": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 63,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            },
+            "storageNodeTag": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            }
+          }
+        },
+        "offsite": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "schedule": {
+              "type": "string",
+              "minLength": 9,
+              "maxLength": 120
+            },
+            "sourceSecret": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 63
+            },
+            "destinationSecret": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 63
+            },
+            "keepCatalogs": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 90
+            },
+            "maxSourceGiB": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "maxDestinationGiB": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65536
+            }
+          }
+        }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 3
+        },
+        "minFreeGiB": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 1024
+        },
+        "freePercent": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 70
+        },
+        "imageExpansionFactor": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 50
         }
       }
     }

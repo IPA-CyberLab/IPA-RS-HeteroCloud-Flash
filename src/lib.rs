@@ -1,7 +1,10 @@
 pub mod auth;
 pub mod backups;
+pub mod capacity;
 pub mod crd;
 pub mod custom_domains;
+pub mod deployment;
+pub mod diagnostics;
 pub mod domain;
 pub mod gpu_scheduler;
 pub mod image;

@@ -1,0 +1,87 @@
+{{- if .Values.backups.offsite.enabled }}
+{{- if not .Values.backups.verification.enabled }}
+{{- fail "backups.offsite requires backups.verification.enabled for its restricted service account" }}
+{{- end }}
+{{- if not .Values.backups.snapshotClass }}
+{{- fail "backups.offsite requires backups.snapshotClass" }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "flash.fullname" . }}-offsite
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  schedule: {{ .Values.backups.offsite.schedule | quote }}
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 7200
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 21600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: {{ include "flash.name" . }}
+            app.kubernetes.io/component: offsite
+            app.kubernetes.io/part-of: heterocloud
+        spec:
+          serviceAccountName: {{ include "flash.serviceAccountName" . }}-backup-verifier
+          restartPolicy: Never
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+          containers:
+            - name: export
+              image: {{ include "flash.image" . }}
+              command: ["python3", "-B", "/usr/local/lib/flash-ops/offsite.py", "copy"]
+              args:
+                - --keep-catalogs
+                - {{ .Values.backups.offsite.keepCatalogs | quote }}
+                - --max-source-gib
+                - {{ .Values.backups.offsite.maxSourceGiB | quote }}
+                - --max-destination-gib
+                - {{ .Values.backups.offsite.maxDestinationGiB | quote }}
+              env:
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: FLASH_WORKLOAD_NAMESPACE
+                  value: {{ .Values.workloadNamespace | quote }}
+              resources:
+                requests: {cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi}
+                limits: {cpu: 500m, memory: 256Mi, ephemeral-storage: 64Mi}
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+              volumeMounts:
+                - name: source
+                  mountPath: /source
+                  readOnly: true
+                - name: destination
+                  mountPath: /destination
+                  readOnly: true
+          volumes:
+            - name: source
+              secret:
+                secretName: {{ .Values.backups.offsite.sourceSecret }}
+                defaultMode: 0440
+            - name: destination
+              secret:
+                secretName: {{ .Values.backups.offsite.destinationSecret }}
+                defaultMode: 0440
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

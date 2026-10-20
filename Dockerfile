@@ -14,7 +14,7 @@ FROM debian:bookworm-slim
 COPY --from=builder /src/Cargo.lock /usr/share/heterocloud/Cargo.lock
 RUN apt-get update \
     && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin flash
 COPY --from=builder /src/target/release/flash-vpc-ready /usr/local/bin/flash-vpc-ready
@@ -24,5 +24,6 @@ COPY --from=builder /src/target/release/flash-activator /usr/local/bin/flash-act
 COPY --from=builder /src/target/release/flashctl /usr/local/bin/flashctl
 COPY --from=builder /src/target/release/flash-udp-echo /usr/local/bin/flash-udp-echo
 COPY --from=builder /usr/local/bin/flash-secret-env-launcher /usr/local/bin/flash-secret-env-launcher
+COPY ops /usr/local/lib/flash-ops
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/flash-api"]

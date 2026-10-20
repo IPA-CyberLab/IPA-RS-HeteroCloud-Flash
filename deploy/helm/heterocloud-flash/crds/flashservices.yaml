@@ -124,6 +124,39 @@ spec:
                     format: uint32
                     minimum: 0.0
                     type: integer
+                  deployment:
+                    nullable: true
+                    properties:
+                      auto_rollback:
+                        default: true
+                        type: boolean
+                      deadline_seconds:
+                        default: 600
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      health_check:
+                        nullable: true
+                        properties:
+                          path:
+                            nullable: true
+                            type: string
+                          port:
+                            format: uint16
+                            maximum: 65535.0
+                            minimum: 0.0
+                            type: integer
+                        required:
+                        - port
+                        type: object
+                      stateless:
+                        default: false
+                        description: Do not mount a persistent home. Existing disks remain retained.
+                        type: boolean
+                      strategy:
+                        default: auto
+                        type: string
+                    type: object
                   egress:
                     default:
                       allow_same_organization: false
@@ -373,6 +406,21 @@ spec:
           status:
             nullable: true
             properties:
+              allocated_cpu_millis:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              allocated_gpu_count:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              allocated_memory_mib:
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               cold:
                 default: false
                 type: boolean
@@ -382,6 +430,47 @@ spec:
               desired_replicas:
                 format: int32
                 type: integer
+              diagnostics:
+                items:
+                  properties:
+                    code:
+                      type: string
+                    message:
+                      type: string
+                    resource:
+                      nullable: true
+                      type: string
+                    severity:
+                      type: string
+                  required:
+                  - code
+                  - message
+                  - severity
+                  type: object
+                type: array
+              disk_usage:
+                nullable: true
+                properties:
+                  available_bytes:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  capacity_bytes:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  measured_at:
+                    type: string
+                  used_bytes:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                required:
+                - available_bytes
+                - capacity_bytes
+                - measured_at
+                - used_bytes
+                type: object
               endpoints:
                 default: []
                 items:
@@ -540,6 +629,11 @@ spec:
                 type: integer
               runtime_class:
                 type: string
+              serving_replicas:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
               stopped:
                 default: false
                 description: True only after an explicit stop has drained every workload Pod.

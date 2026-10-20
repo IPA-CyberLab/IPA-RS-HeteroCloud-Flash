@@ -50,6 +50,8 @@ const PROTECTED_EGRESS_CIDRS: [&str; 16] = [
 pub struct FlashSpec {
     pub region: String,
     pub image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<crate::deployment::DeploymentPolicy>,
     /// IAM service account assumed only by this workload; no fixed API key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_role: Option<uuid::Uuid>,
@@ -110,6 +112,11 @@ pub struct FlashSpec {
 
 impl FlashSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(policy) = &self.deployment {
+            policy
+                .validate()
+                .map_err(|e| ValidationError::Field(e.into()))?;
+        }
         validate_text("region", &self.region, 64)?;
         if self.image.len() > 512
             || self.image.trim() != self.image
@@ -903,6 +910,7 @@ mod tests {
             ephemeral_storage_gib: 10,
             rootfs_storage_gib: None,
             persistent_storage_gib: None,
+            deployment: None,
             restore_from_backup_id: None,
             ports: vec![FlashPort {
                 name: "game-udp".into(),
