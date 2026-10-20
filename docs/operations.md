@@ -11,7 +11,8 @@ remaining writable-layer budgets. Defaults leave 25% and at least 10 GiB free;
 uncached images reserve six times compressed size, at least 1 GiB. In-flight
 reservations prevent simultaneous admissions spending the same headroom.
 Requests fail closed when metrics are unknown. Existing Pods are not evicted by
-this webhook. Controller preflight preserves the prior deployment if a new image
+this webhook. Idle scale-to-zero services remain asleep across an update; a real
+request refreshes activity and starts the new revision. Controller preflight preserves the prior deployment if a new image
 or capacity cannot be validated. Autoscaling, replacement and verification Pods
 also pass admission before image pull.
 

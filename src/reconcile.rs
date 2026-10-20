@@ -607,8 +607,11 @@ fn should_scale_to_zero(flash: &FlashService, now: i64) -> bool {
         return false;
     };
     let was_ready = flash.status.as_ref().is_some_and(|status| {
-        status.observed_generation == flash.spec.desired_generation
-            && status.phase == FlashServicePhase::Ready
+        status.phase == FlashServicePhase::Ready
+            && (status.observed_generation == flash.spec.desired_generation
+                // An update to an already sleeping service stays asleep. A real
+                // request refreshes the activity annotation and wakes it normally.
+                || (status.cold && status.desired_replicas == 0))
     });
     was_ready
         && activity_timestamp(flash)
@@ -5172,6 +5175,39 @@ mod tests {
                 .any(|key| key.starts_with("external-dns."))
         );
         Ok(())
+    }
+
+    #[test]
+    fn idle_update_keeps_sleeping_but_activity_and_initial_validation_wake_it() {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.autoscaling = Some(crate::domain::FlashAutoscaling {
+            min_replicas: 0,
+            max_replicas: 1,
+            target_cpu_utilization_percent: Some(80),
+            target_memory_utilization_percent: None,
+            idle_timeout_seconds: 60,
+        });
+        flash.spec.desired_generation = 2;
+        flash.metadata.annotations = Some(BTreeMap::from([(
+            super::LAST_ACTIVITY_ANNOTATION.into(),
+            "100".into(),
+        )]));
+        flash.status = Some(FlashServiceStatus {
+            phase: FlashServicePhase::Ready,
+            observed_generation: 1,
+            cold: true,
+            desired_replicas: 0,
+            ..FlashServiceStatus::default()
+        });
+        assert!(super::should_scale_to_zero(&flash, 200));
+        assert!(!super::should_scale_to_zero(&flash, 110));
+        if let Some(status) = flash.status.as_mut() {
+            status.cold = false;
+            status.desired_replicas = 1;
+        }
+        assert!(!super::should_scale_to_zero(&flash, 200));
+        flash.status = None;
+        assert!(!super::should_scale_to_zero(&flash, 200));
     }
 
     #[test]
