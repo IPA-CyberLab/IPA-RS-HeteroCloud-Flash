@@ -278,7 +278,7 @@ class Guard:
                                    "pods": [{k: p[k] for k in ("podRef", "ephemeral-storage", "volume") if k in p} for p in raw.get("pods", [])]}
             except (OSError, ValueError):
                 pass  # This node fails closed; other healthy nodes remain usable.
-        self.cache, self.cache_at = (nodes, pods, summaries), now
+        self.cache, self.cache_at = (nodes, pods, summaries), time.time()
         return self.cache
 
     def ledger(self, pods):
@@ -418,6 +418,9 @@ class BoundedServer(http.server.ThreadingHTTPServer):
         self.slots = threading.BoundedSemaphore(16)
         super().__init__(*args, **kwargs)
 
+    def handle_error(self, *_):
+        print(json.dumps({"event": "capacity_client_request_failed"}), flush=True)
+
     def process_request(self, request, address):
         request.settimeout(15)
         if not self.slots.acquire(blocking=False):
@@ -439,10 +442,7 @@ class BoundedServer(http.server.ThreadingHTTPServer):
             self.slots.release()
 
 
-def serve():
-    guard = Guard(Kube(), {"min_free_bytes": int(os.environ.get("CAPACITY_MIN_FREE_GIB", "10")) * GIB,
-                          "free_percent": int(os.environ.get("CAPACITY_FREE_PERCENT", "25")),
-                          "image_expansion_factor": int(os.environ.get("CAPACITY_IMAGE_FACTOR", "6"))})
+def handler(guard):
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -457,7 +457,7 @@ def serve():
             self.wfile.write(body)
 
         def do_GET(self):
-            self.send(200 if self.path == "/healthz" else 404, {"ready": True})
+            self.send(200 if urllib.parse.urlsplit(self.path).path == "/healthz" else 404, {"ready": True})
 
         def do_POST(self):
             try:
@@ -465,14 +465,15 @@ def serve():
                 if not 0 < size <= 2 * 1024**2:
                     return self.send(413, {"error": "request_size"})
                 value = json.loads(self.rfile.read(size))
-                if self.path == "/admit":
+                route = urllib.parse.urlsplit(self.path).path
+                if route == "/admit":
                     self.send(200, admission(guard, value))
-                elif self.path == "/preflight":
+                elif route == "/preflight":
                     replacing = value["object"].get("metadata", {}).get("labels", {}).get(INSTANCE) if value.get("recreate") else None
                     result = guard.evaluate(value["kind"], value["object"], "preflight", True, replacing)
                     # Physical node names and reservations are platform-private.
                     self.send(200, {"allowed": result["allowed"], "reason": result.get("reason")})
-                elif self.path == "/usage":
+                elif route == "/usage":
                     sid = str(uuid.UUID(value["service_instance_id"]))
                     _, _, summaries = guard.snapshot()
                     volumes = [v for summary in summaries.values() for pod in summary.get("pods", [])
@@ -489,7 +490,14 @@ def serve():
             except (OSError, ValueError, KeyError, decimal.InvalidOperation, Unavailable):
                 self.send(503, {"error": "capacity_metrics_unavailable"})
 
-    server = BoundedServer(("0.0.0.0", 9443), Handler)
+    return Handler
+
+
+def serve():
+    guard = Guard(Kube(), {"min_free_bytes": int(os.environ.get("CAPACITY_MIN_FREE_GIB", "10")) * GIB,
+                          "free_percent": int(os.environ.get("CAPACITY_FREE_PERCENT", "25")),
+                          "image_expansion_factor": int(os.environ.get("CAPACITY_IMAGE_FACTOR", "6"))})
+    server = BoundedServer(("0.0.0.0", 9443), handler(guard))
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain("/tls/tls.crt", "/tls/tls.key")

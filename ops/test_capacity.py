@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 spec = importlib.util.spec_from_file_location("capacity", pathlib.Path(__file__).with_name("capacity.py"))
@@ -128,6 +129,28 @@ class StorageTests(unittest.TestCase):
         claim["spec"]["resources"]["requests"]["storage"] = "5Gi"
         self.assertTrue(guard.storage(claim,{})["allowed"])
         self.assertFalse(guard.storage(claim,{"pending":{"delta":10*c.GIB,"storage_nodes":["three"]}})["allowed"])
+
+
+class HTTPTests(unittest.TestCase):
+    def test_kubernetes_timeout_query_uses_the_admission_endpoint(self):
+        class Guard:
+            def evaluate(self, *_):
+                return {"allowed": False,"reason":"insufficient_disk_capacity"}
+        server=c.BoundedServer(("127.0.0.1",0),c.handler(Guard()))
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            origin="http://127.0.0.1:"+str(server.server_port)
+            review={"request":{"uid":"real-http-query","namespace":c.NS,"kind":{"kind":"Pod"},"object":pod()}}
+            request=urllib.request.Request(origin+"/admit?timeout=15s",data=json.dumps(review).encode(),headers={"Content-Type":"application/json"})
+            with urllib.request.urlopen(request,timeout=5) as response:
+                result=json.load(response)
+            self.assertFalse(result["response"]["allowed"])
+            self.assertEqual(result["response"]["uid"],review["request"]["uid"])
+            self.assertEqual(result["response"]["status"]["reason"],"InsufficientCapacity")
+            with urllib.request.urlopen(origin+"/healthz?probe=liveness",timeout=5) as response:
+                self.assertTrue(json.load(response)["ready"])
+        finally:
+            server.shutdown();server.server_close();thread.join(timeout=5)
 
 
 class FakeKube:
