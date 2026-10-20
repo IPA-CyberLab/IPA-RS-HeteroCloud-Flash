@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 
 GIB = 1024**3
@@ -230,22 +231,51 @@ class Guard:
         self.kube = kube
         self.policy = policy or {"min_free_bytes": 10 * GIB, "free_percent": 25, "image_expansion_factor": 6}
         self.lock = threading.Lock()
+        self.snapshot_lock = threading.Lock()
         self.cache = None
         self.cache_at = 0
 
     def snapshot(self):
+        # Controllers request usage concurrently for every service. Only one
+        # refresh may retain API responses at a time; readers reuse the result.
+        with self.snapshot_lock:
+            return self._snapshot()
+
+    def _snapshot(self):
         now = time.time()
         if self.cache and now - self.cache_at < 5:
             return self.cache
         nodes = self.kube.call("/api/v1/nodes")["items"]
-        pods = self.kube.call("/api/v1/pods")["items"]
+        pods = []
+        continuation = None
+        while True:
+            query = {"limit": "100"}
+            if continuation:
+                query["continue"] = continuation
+            page = self.kube.call("/api/v1/pods?" + urllib.parse.urlencode(query))
+            for pod in page["items"]:
+                # Scheduling never needs env values, mounts, logs or managedFields.
+                # Compact each page before requesting the next one.
+                meta, spec = pod.get("metadata", {}), pod.get("spec", {})
+                compact = {"metadata": {k: meta[k] for k in ("name", "namespace", "uid", "labels", "annotations") if k in meta},
+                           "spec": {k: spec[k] for k in ("nodeName", "overhead") if k in spec},
+                           "status": {"phase": pod.get("status", {}).get("phase")}}
+                for field in ("containers", "initContainers"):
+                    compact["spec"][field] = [{k: c[k] for k in ("name", "image", "resources", "restartPolicy") if k in c} for c in spec.get(field, [])]
+                compact["metadata"]["annotations"] = {k: v for k, v in meta.get("annotations", {}).items() if k in (RESERVATION, IMAGE_BYTES)}
+                pods.append(compact)
+            continuation = page.get("metadata", {}).get("continue")
+            if not continuation:
+                break
         summaries = {}
         for node in nodes:
             name = node["metadata"]["name"]
             if node["metadata"].get("labels", {}).get("heteronetwork.io/control-plane-only") == "true":
                 continue
             try:
-                summaries[name] = self.kube.call(f"/api/v1/nodes/{name}/proxy/stats/summary")
+                raw = self.kube.call(f"/api/v1/nodes/{name}/proxy/stats/summary")
+                summaries[name] = {"node": {"fs": raw.get("node", {}).get("fs"), "runtime": {"imageFs": raw.get("node", {}).get("runtime", {}).get("imageFs")}},
+                                   "pods": [{k: p[k] for k in ("podRef", "ephemeral-storage", "volume") if k in p} for p in raw.get("pods", [])]}
             except (OSError, ValueError):
                 pass  # This node fails closed; other healthy nodes remain usable.
         self.cache, self.cache_at = (nodes, pods, summaries), now
@@ -380,6 +410,35 @@ def admission(guard, review):
     return {"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": response}
 
 
+class BoundedServer(http.server.ThreadingHTTPServer):
+    """Bound request memory, including clients waiting on a metrics refresh."""
+    request_queue_size = 64
+
+    def __init__(self, *args, **kwargs):
+        self.slots = threading.BoundedSemaphore(16)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, address):
+        request.settimeout(15)
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.slots.release()
+
+
 def serve():
     guard = Guard(Kube(), {"min_free_bytes": int(os.environ.get("CAPACITY_MIN_FREE_GIB", "10")) * GIB,
                           "free_percent": int(os.environ.get("CAPACITY_FREE_PERCENT", "25")),
@@ -430,7 +489,7 @@ def serve():
             except (OSError, ValueError, KeyError, decimal.InvalidOperation, Unavailable):
                 self.send(503, {"error": "capacity_metrics_unavailable"})
 
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", 9443), Handler)
+    server = BoundedServer(("0.0.0.0", 9443), Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain("/tls/tls.crt", "/tls/tls.key")

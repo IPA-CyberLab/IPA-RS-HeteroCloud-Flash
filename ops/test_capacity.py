@@ -5,6 +5,7 @@ import importlib.util
 import json
 import pathlib
 import threading
+import time
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -136,7 +137,7 @@ class FakeKube:
 
     def call(self, path, method="GET", value=None):
         if path == "/api/v1/nodes": return {"items": [node()]}
-        if path == "/api/v1/pods": return {"items": []}
+        if path.startswith("/api/v1/pods?"): return {"items": []}
         if "/proxy/stats/summary" in path: return summary(55*c.GIB)
         if "/configmaps/" in path:
             with self.lock:
@@ -150,6 +151,24 @@ class FakeKube:
 
 
 class ReservationTests(unittest.TestCase):
+    def test_concurrent_usage_refreshes_share_one_compact_snapshot(self):
+        class Counted(FakeKube):
+            calls = 0
+            def call(self, path, method="GET", value=None):
+                if path.startswith("/api/v1/pods?"):
+                    self.calls += 1
+                    time.sleep(.02)
+                    value = pod()
+                    value["spec"]["containers"][0]["env"] = [{"name": "TOKEN", "value": "never-retain"}]
+                    return {"items": [value]}
+                return super().call(path, method, value)
+        kube = Counted(); guard = c.Guard(kube, POLICY)
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            snapshots = list(pool.map(lambda _: guard.snapshot(), range(64)))
+        self.assertEqual(kube.calls, 1)
+        self.assertTrue(all(s is snapshots[0] for s in snapshots))
+        self.assertNotIn("never-retain", json.dumps(snapshots[0]))
+
     def test_two_replicas_cannot_spend_the_same_headroom(self):
         kube = FakeKube()
         guards = [c.Guard(kube, POLICY), c.Guard(kube, POLICY)]
