@@ -16,6 +16,20 @@ request refreshes activity and starts the new revision. Controller preflight pre
 or capacity cannot be validated. Autoscaling, replacement and verification Pods
 also pass admission before image pull.
 
+Legacy ReplicaSets may lack image-size annotations. If current inspection cannot
+budget that exact image, admission permits only a matching immutable SHA-256
+image already cached on an eligible worker and forces `imagePullPolicy: Never`.
+The normal compute/filesystem reservations still apply. A missing cache therefore
+cannot initiate an unbudgeted download. A different revision's image size is not
+used to budget an old ReplicaSet. Storage errors retain verified image metadata
+so an unchanged retained workload can still restart.
+
+New automatic persistent allocations are rounded down to MiB before writing a
+PVC. This leaves rounding slack inside the combined budget and prevents CSI's
+rounded request from making the following reconciliation reject the same size.
+Existing homes are never rounded down or shrunk; unchanged rootfs limits remain
+unchanged. An explicit whole-GiB persistent size is already aligned.
+
 Longhorn create/grow preflight accounts for the full new replica delta on each
 distinct eligible storage node. This is a physical-space guard for new changes,
 not a retroactive conversion of legacy thin provisioning to thick provisioning.

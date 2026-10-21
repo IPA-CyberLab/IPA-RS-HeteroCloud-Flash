@@ -174,6 +174,63 @@ class FakeKube:
 
 
 class ReservationTests(unittest.TestCase):
+    def test_legacy_restart_uses_only_the_cached_immutable_image(self):
+        image = "test@sha256:" + "a" * 64
+        class LegacyKube(FakeKube):
+            def call(self, path, method="GET", value=None):
+                if path == "/api/v1/nodes":
+                    n = node(); n["status"]["images"] = [{"names": [image]}]
+                    return {"items": [n]}
+                if "/flashservices/" in path:
+                    return {"status": {"phase": "error"}}
+                return super().call(path, method, value)
+        p = pod(); p["metadata"]["annotations"] = {}
+        p["spec"]["containers"][0]["image"] = image
+        p["spec"]["containers"][0]["imagePullPolicy"] = "IfNotPresent"
+        review = {"request": {"uid": "legacy", "namespace": c.NS, "kind": {"kind": "Pod"}, "object": p}}
+        result = c.admission(c.Guard(LegacyKube(), POLICY), review)["response"]
+        self.assertTrue(result["allowed"])
+        patch = json.loads(base64.b64decode(result["patch"]))
+        self.assertIn({"op": "add", "path": "/spec/containers/0/imagePullPolicy", "value": "Never"}, patch)
+        selected = patch[0]["value"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchFields"][0]["values"]
+        self.assertEqual(selected, ["worker"])
+        self.assertNotIn("imagePullPolicy", pod()["spec"]["containers"][0])
+
+    def test_unknown_size_cannot_pull_or_use_a_mutable_cache_entry(self):
+        class UnknownKube(FakeKube):
+            def call(self, path, method="GET", value=None):
+                if "/flashservices/" in path:return {"status": {"phase": "error"}}
+                if path=="/api/v1/nodes":
+                    n=node();n["status"]["images"]=[{"names":["test:latest"]}];return {"items":[n]}
+                return super().call(path, method, value)
+        for image in ["uncached@sha256:"+"a"*64,"test:latest"]:
+            p=pod();p["metadata"]["annotations"]={};p["spec"]["containers"][0]["image"]=image
+            result=c.Guard(UnknownKube(),POLICY).evaluate("Pod",p,"unknown",True)
+            self.assertFalse(result["allowed"])
+            self.assertEqual(result["reason"],"image_capacity_unknown")
+
+    def test_new_revision_image_size_cannot_budget_a_different_legacy_image(self):
+        class ChangedKube(FakeKube):
+            def call(self,path,method="GET",value=None):
+                if "/flashservices/" in path:return {"status":{"resolved_image":"other@sha256:"+"b"*64,"image_size_bytes":1}}
+                return super().call(path,method,value)
+        p=pod();p["metadata"]["annotations"]={};p["spec"]["containers"][0]["image"]="uncached@sha256:"+"a"*64
+        result=c.Guard(ChangedKube(),POLICY).evaluate("Pod",p,"changed",True)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"],"image_capacity_unknown")
+
+    def test_cached_legacy_recovery_still_requires_storage_and_compute_capacity(self):
+        image="test@sha256:"+"a"*64
+        p=pod();p["spec"]["containers"][0]["image"]=image
+        n=node();n["status"]["images"]=[{"names":[image]}]
+        result=c.select_node(p,[n],{"worker":summary(50*c.GIB)},[],{},NOW,POLICY,None)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"],"insufficient_disk_capacity")
+        p["spec"]["containers"][0]["resources"]["requests"]["memory"]="33Gi"
+        result=c.select_node(p,[n],{"worker":summary()},[],{},NOW,POLICY,None)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"],"insufficient_compute_capacity")
+
     def test_concurrent_usage_refreshes_share_one_compact_snapshot(self):
         class Counted(FakeKube):
             calls = 0

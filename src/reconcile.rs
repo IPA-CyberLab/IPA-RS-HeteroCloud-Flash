@@ -942,6 +942,11 @@ async fn reconcile(
                 desired_replicas,
                 runtime_class: runtime_class.into(),
                 message: Some(error.to_string()),
+                // A retained ReplicaSet can still need to recreate a Pod while
+                // this revision's storage update is invalid. Keep the verified
+                // image identity/budget available to admission in that case.
+                resolved_image: Some(inspection.resolved_image.clone()),
+                image_size_bytes: Some(inspection.image_size_bytes),
                 ..FlashServiceStatus::default()
             };
             apply_weekly_meter(&mut status, &weekly_meter);
@@ -2115,6 +2120,17 @@ fn storage_allocation_retaining(
         requested_rootfs_gib,
         requested_persistent_gib,
     )?;
+    if persistent
+        && requested_persistent_gib.is_none()
+        && allocation.persistent_bytes > existing_requested_bytes
+    {
+        // CSI rounds requests up to MiB. Round new automatic allocations down
+        // before reserving them so its rounded request cannot exceed the same
+        // combined budget on the following reconciliation. Existing homes are
+        // never shrunk and unchanged rootfs limits remain unchanged.
+        allocation.persistent_bytes =
+            (allocation.persistent_bytes / MIB_BYTES * MIB_BYTES).max(existing_requested_bytes);
+    }
     if persistent && allocation.persistent_bytes < existing_requested_bytes {
         if requested_persistent_gib.is_some() {
             return Err(ReconcileError::PersistentStorageCannotShrink);
@@ -4493,6 +4509,27 @@ mod tests {
             storage_allocation_retaining(39 * GIB_BYTES, true, Some(3), Some(27), 27 * GIB_BYTES)?;
         assert_eq!(smaller_rootfs.rootfs_bytes, 3 * GIB_BYTES);
         assert_eq!(smaller_rootfs.persistent_bytes, expanded.persistent_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_home_survives_csi_mib_rounding_without_exceeding_the_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let writable = 29 * GIB_BYTES + 123_456;
+        let fresh = storage_allocation_retaining(writable, true, Some(20), None, 0)?;
+        assert_eq!(fresh.rootfs_bytes, 20 * GIB_BYTES);
+        assert_eq!(fresh.persistent_bytes, 9 * GIB_BYTES);
+        let csi_request = fresh.persistent_bytes.div_ceil(super::MIB_BYTES) * super::MIB_BYTES;
+        assert_eq!(
+            storage_allocation_retaining(writable, true, Some(20), None, csi_request)?,
+            fresh
+        );
+        assert!(fresh.rootfs_bytes + csi_request <= writable);
+        let legacy = 9 * GIB_BYTES + 100_000;
+        let retained = storage_allocation_retaining(writable, true, Some(20), None, legacy)?;
+        assert_eq!(retained.persistent_bytes, legacy);
+        assert_eq!(retained.rootfs_bytes, fresh.rootfs_bytes);
+        assert!(retained.rootfs_bytes + retained.persistent_bytes <= writable);
         Ok(())
     }
 

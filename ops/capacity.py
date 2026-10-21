@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import ssl
 import threading
 import time
@@ -178,6 +179,13 @@ def select_node(pod, nodes, summaries, pods, reservations, now, policy, image_by
             reasons.add("insufficient_pod_capacity")
             continue
         cached = any(image_identity(image) == image_identity(value) for entry in node.get("status", {}).get("images", []) for value in entry.get("names",[]))
+        # Preserved legacy ReplicaSets may predate image-size annotations. If
+        # inspection is unavailable, an immutable image can still restart from
+        # this node's cache. Admission forces Never so a cache eviction cannot
+        # turn this decision into an unbudgeted pull.
+        if image_bytes is None and (not re.fullmatch(r".+@sha256:[a-f0-9]{64}", image) or not cached):
+            reasons.add("image_capacity_unknown")
+            continue
         # Keep room for writable layers already promised but not yet consumed.
         rootfs_remaining = 0
         for other in bound:
@@ -209,6 +217,7 @@ def select_node(pod, nodes, summaries, pods, reservations, now, policy, image_by
         return {"allowed": False, "reason": sorted(reasons)[0] if reasons else "no_eligible_node"}
     cached, _, name, peak = max(candidates)
     return {"allowed": True, "node": name, "peak_bytes": peak,
+            "cached_image_only": image_bytes is None,
             "disk_bytes": int(need.get("ephemeral-storage", 0)) + peak,
             "requests": {k: str(v) for k, v in need.items()}}
 
@@ -364,11 +373,14 @@ class Guard:
                     if image_bytes is None:
                         sid = obj.get("metadata", {}).get("labels", {}).get(INSTANCE)
                         flash = self.kube.call(f"/apis/flash.heterocloud.io/v1alpha1/namespaces/{NS}/flashservices/flash-{sid}")
-                        image_bytes = flash.get("status", {}).get("image_size_bytes")
-                    if image_bytes is None or not 0 < int(image_bytes) < 1024**5:
+                        status = flash.get("status", {})
+                        image = next((c["image"] for c in obj["spec"]["containers"] if c["name"] == "workload"), "")
+                        if image_identity(status.get("resolved_image") or "") == image_identity(image):
+                            image_bytes = status.get("image_size_bytes")
+                    if image_bytes is not None and not 0 < int(image_bytes) < 1024**5:
                         return {"allowed": False, "reason": "image_capacity_unknown"}
                     candidates = [p for p in pods if not (dry_run and replaces and p.get("metadata", {}).get("labels", {}).get(INSTANCE) == replaces)]
-                    result = select_node(obj, nodes, summaries, candidates, records, time.time(), self.policy, int(image_bytes))
+                    result = select_node(obj, nodes, summaries, candidates, records, time.time(), self.policy, None if image_bytes is None else int(image_bytes))
                 if not result["allowed"] or dry_run:
                     return result
                 result.update(id=identity, kind=kind, created_at=time.time(),fingerprint=fingerprint)
@@ -406,6 +418,9 @@ def admission(guard, review):
         annotations[RESERVATION] = identity
         patch = [{"op": "add", "path": "/spec/affinity", "value": affinity},
                  {"op": "add", "path": "/metadata/annotations", "value": annotations}]
+        if result.get("cached_image_only"):
+            index = next(i for i, container in enumerate(spec["containers"]) if container["name"] == "workload")
+            patch.append({"op": "add", "path": f"/spec/containers/{index}/imagePullPolicy", "value": "Never"})
         response.update(patchType="JSONPatch", patch=base64.b64encode(json.dumps(patch).encode()).decode())
     return {"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": response}
 
