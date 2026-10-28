@@ -20,6 +20,11 @@ metadata:
   name: {{ include "flash.fullname" . }}-backup-verifier
 spec:
   replicas: {{ .Values.backups.verification.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "flash.name" . }}
