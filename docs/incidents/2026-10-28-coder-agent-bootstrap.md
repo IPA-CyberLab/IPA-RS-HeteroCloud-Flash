@@ -52,9 +52,25 @@ availability versus authentication/content failures, two-worker recovery,
 single-copy rejection, native per-engine replica defaults, unavailable policy,
 pending reservations and physical-space exhaustion.
 
-## Remaining registry recovery
+## Approved registry reset
 
-Cached-image recovery is not registry disaster recovery. Fresh images and new
-workers without the image still require a healthy registry. Recovering the
-registry's latest data requires a verified surviving data copy or independent
-backup; old orphaned replicas must not silently replace newer registry data.
+The owner subsequently approved discarding the lost registry data. A new
+32 GiB registry volume was created with two healthy copies on independent
+workers. New storage defaults to two replicas and disallows initial creation
+with missing replicas. The old registry volume and its orphaned data were
+deleted; user workspace homes were retained.
+
+Lost artifact records and stale blob-descriptor cache entries were cleared.
+The cached Linux Coder platform image was verified and republished, with every
+blob read back through the public registry and checked against its digest.
+Lost attestations were not fabricated: future Standard Develop and Big builds
+use the verified platform digest in a newly validated template version.
+Other discarded images require a fresh push.
+
+The provider chart also sets an explicit one-at-a-time rollout strategy for
+capacity and verification replicas. The default percentage rounds to zero
+unavailable replicas for a two-replica deployment, which deadlocks against
+required placement on distinct hosts when only two workers exist. Production
+API replicas were aligned to the available two workers, retaining the separately
+pinned workload helper image. Full recovery evidence is recorded in the
+[infrastructure incident report](https://github.com/IPA-CyberLab/IPA-RS-HeteroNetwork/blob/master/docs/incidents/registry-reset-2026-10-28.md).
