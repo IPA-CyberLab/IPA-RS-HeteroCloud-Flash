@@ -24,6 +24,15 @@ cannot initiate an unbudgeted download. A different revision's image size is not
 used to budget an old ReplicaSet. Storage errors retain verified image metadata
 so an unchanged retained workload can still restart.
 
+During a registry 5xx, connection failure or inspection timeout, a new service
+may reuse provider-recorded image metadata from the same organization. The
+requested repository, SHA-256 digest and resolved image must all match; mutable
+tags, other tenants, authentication failures, missing manifests and invalid
+content cannot use this fallback. Entrypoint, command, architecture and image
+size must be present, and writable capacity is recalculated for the new service.
+This does not restore a registry or populate a worker's image cache: an uncached
+worker still needs the registry to pull the image.
+
 New automatic persistent allocations are rounded down to MiB before writing a
 PVC. This leaves rounding slack inside the combined budget and prevents CSI's
 rounded request from making the following reconciliation reject the same size.
@@ -33,6 +42,13 @@ unchanged. An explicit whole-GiB persistent size is already aligned.
 Longhorn create/grow preflight accounts for the full new replica delta on each
 distinct eligible storage node. This is a physical-space guard for new changes,
 not a retroactive conversion of legacy thin provisioning to thick provisioning.
+The desired replica count follows the storage class or Longhorn's per-engine
+default. If Longhorn explicitly enables degraded volume creation, admission can
+accept one missing replica, requiring at least two independent healthy storage
+nodes and the full delta plus free-space reserve on each. The desired replica
+count remains unchanged so storage can rebuild when another node returns.
+Missing/invalid policy settings fail closed. A single-copy volume is never
+admitted through this exception.
 Existing thin-provisioned volumes can still grow, caches can expand, and host
 system processes can consume space. Continue monitoring host and Longhorn free
 space; this guard does not guarantee capacity under every future write pattern.

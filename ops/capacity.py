@@ -328,7 +328,20 @@ class Guard:
         sc = self.kube.call("/apis/storage.k8s.io/v1/storageclasses/" + pvc["spec"]["storageClassName"])
         if sc.get("provisioner") != "driver.longhorn.io":
             return {"allowed": False, "reason": "unsupported_storage_capacity"}
-        replicas = int(sc.get("parameters", {}).get("numberOfReplicas", "3"))
+        parameters = sc.get("parameters", {})
+        try:
+            replica_setting = parameters.get("numberOfReplicas")
+            if not replica_setting:
+                replica_setting = self.kube.call(
+                    f"/apis/longhorn.io/v1beta2/namespaces/{STORAGE_NS}/settings/default-replica-count")["value"]
+                # Recent Longhorn versions keep one default per data engine.
+                if str(replica_setting).startswith('{'):
+                    replica_setting = json.loads(replica_setting)[parameters.get("dataEngine", "v1")]
+            replicas = int(replica_setting)
+            if replicas < 1:
+                raise ValueError("invalid replica count")
+        except (urllib.error.URLError, ValueError, TypeError, KeyError):
+            return {"allowed": False, "reason": "storage_replica_policy_unavailable"}
         node_tags = set(filter(None, sc.get("parameters", {}).get("nodeSelector", "").split(',')))
         disk_tags = set(filter(None, sc.get("parameters", {}).get("diskSelector", "").split(',')))
         eligible = []
@@ -353,8 +366,19 @@ class Guard:
                     eligible.append((free - held, name))
                     break
         selected = [name for _, name in sorted(eligible, reverse=True)[:replicas]]
-        return {"allowed": len(selected) == replicas, "reason": "insufficient_replicated_storage",
-                "storage_nodes": selected, "delta": delta}
+        allowed = len(selected) == replicas
+        if not allowed and len(selected) >= max(2, replicas - 1):
+            try:
+                degraded = self.kube.call(
+                    f"/apis/longhorn.io/v1beta2/namespaces/{STORAGE_NS}/settings/allow-volume-creation-with-degraded-availability")
+                # Honor the storage system's recovery policy without changing the
+                # desired replica count or ever admitting a single-copy volume.
+                allowed = degraded.get("value") == "true"
+            except urllib.error.URLError:
+                pass  # Missing settings permissions must not relax admission.
+        return {"allowed": allowed, "reason": "insufficient_replicated_storage",
+                "storage_nodes": selected, "delta": delta,
+                "desired_storage_replicas": replicas, "degraded_storage": allowed and len(selected) < replicas}
 
     def evaluate(self, kind, obj, identity, dry_run=False, replaces=None):
         with self.lock:

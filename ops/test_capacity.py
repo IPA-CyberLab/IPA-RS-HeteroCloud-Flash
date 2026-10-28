@@ -119,6 +119,8 @@ class StorageTests(unittest.TestCase):
                     raise urllib.error.HTTPError(path, 404, "missing", None, None)
                 if "/storageclasses/" in path:
                     return {"provisioner": "driver.longhorn.io", "parameters": {"numberOfReplicas": "3"}}
+                if "/settings/" in path:
+                    return {"value": "false"}
                 return {"items": [{"metadata": {"name": name}, "spec": {"allowScheduling": True, "disks": {"data": {"allowScheduling": True}}},
                                   "status": {"diskStatus": {"data": {"storageMaximum": 200*c.GIB, "storageAvailable": free*c.GIB,
                                       "conditions": [{"type": "Ready", "status": "True"}, {"type": "Schedulable", "status": "True"}]}}}}
@@ -129,6 +131,70 @@ class StorageTests(unittest.TestCase):
         claim["spec"]["resources"]["requests"]["storage"] = "5Gi"
         self.assertTrue(guard.storage(claim,{})["allowed"])
         self.assertFalse(guard.storage(claim,{"pending":{"delta":10*c.GIB,"storage_nodes":["three"]}})["allowed"])
+
+    def degraded_guard(self, nodes=2, enabled="true", parameters=None, default='{"v1":"3","v2":"2"}'):
+        class StorageKube:
+            def call(self, path, *args):
+                if "/persistentvolumeclaims/" in path:
+                    raise urllib.error.HTTPError(path, 404, "missing", None, None)
+                if "/storageclasses/" in path:
+                    return {"provisioner": "driver.longhorn.io", "parameters": parameters if parameters is not None else {"numberOfReplicas": "3"}}
+                if path.endswith("/settings/default-replica-count"):
+                    return {"value": default}
+                if path.endswith("/settings/allow-volume-creation-with-degraded-availability"):
+                    if enabled == "forbidden":
+                        raise urllib.error.HTTPError(path, 403, "forbidden", None, None)
+                    return {"value": enabled}
+                if path.endswith("/nodes"):
+                    return {"items": [{"metadata": {"name": f"worker-{i}"},
+                        "spec": {"allowScheduling": True, "disks": {"data": {"allowScheduling": True}}},
+                        "status": {"diskStatus": {"data": {"storageMaximum": 200*c.GIB, "storageAvailable": 100*c.GIB,
+                            "conditions": [{"type": "Ready", "status": "True"}, {"type": "Schedulable", "status": "True"}]}}}}
+                        for i in range(nodes)]}
+                raise AssertionError(path)
+        claim = {"metadata": {"name": "new"}, "spec": {"storageClassName": "longhorn-static", "resources": {"requests": {"storage": "26Gi"}}}}
+        return c.Guard(StorageKube(), POLICY), claim
+
+    def test_two_worker_recovery_respects_native_degraded_policy_and_keeps_three_desired(self):
+        guard, claim = self.degraded_guard()
+        result = guard.storage(claim, {})
+        self.assertTrue(result["allowed"])
+        self.assertTrue(result["degraded_storage"])
+        self.assertEqual(result["desired_storage_replicas"], 3)
+        self.assertEqual(len(set(result["storage_nodes"])), 2)
+        self.assertEqual(result["delta"], 26*c.GIB)
+
+    def test_degraded_creation_never_accepts_one_copy_or_ignores_policy(self):
+        for enabled in ("false", "forbidden", None, "invalid"):
+            guard, claim = self.degraded_guard(enabled=enabled)
+            self.assertFalse(guard.storage(claim, {})["allowed"])
+        guard, claim = self.degraded_guard(nodes=1)
+        self.assertFalse(guard.storage(claim, {})["allowed"])
+
+    def test_degraded_creation_still_charges_pending_storage_and_free_reserve(self):
+        guard, claim = self.degraded_guard()
+        pending = {"another": {"delta": 25*c.GIB, "storage_nodes": ["worker-0"]}}
+        self.assertFalse(guard.storage(claim, pending)["allowed"])
+        claim["spec"]["resources"]["requests"]["storage"] = "51Gi"
+        self.assertFalse(guard.storage(claim, {})["allowed"])
+
+    def test_storage_class_without_replica_count_uses_native_engine_default(self):
+        guard, claim = self.degraded_guard(parameters={})
+        result = guard.storage(claim, {})
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["desired_storage_replicas"], 3)
+        guard, claim = self.degraded_guard(parameters={"dataEngine": "v2"}, enabled="false")
+        result = guard.storage(claim, {})
+        self.assertTrue(result["allowed"])
+        self.assertFalse(result["degraded_storage"])
+        self.assertEqual(result["desired_storage_replicas"], 2)
+
+    def test_invalid_native_replica_default_fails_closed(self):
+        for default in (None, "bad", "0", '{"v2":"3"}'):
+            guard, claim = self.degraded_guard(parameters={}, default=default)
+            result = guard.storage(claim, {})
+            self.assertFalse(result["allowed"])
+            self.assertEqual(result["reason"], "storage_replica_policy_unavailable")
 
 
 class HTTPTests(unittest.TestCase):

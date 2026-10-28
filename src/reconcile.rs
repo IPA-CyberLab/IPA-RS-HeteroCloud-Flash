@@ -849,19 +849,26 @@ async fn reconcile(
     let disk_budget_bytes = u64::from(flash.spec.workload.ephemeral_storage_gib)
         .checked_mul(GIB_BYTES)
         .ok_or(ReconcileError::StorageBudgetOverflow)?;
+    let peer_cache = verified_peer_image_inspection(&services, &flash, disk_budget_bytes).await?;
     let inspection = if let Some(inspection) = cached_image_inspection(&flash, disk_budget_bytes) {
         inspection
     } else {
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            context
-                .image_inspector
-                .inspect(&flash.spec.workload.image, disk_budget_bytes),
-        )
-        .await
-        {
-            Ok(Ok(inspection)) => inspection,
-            Ok(Err(error)) if error.retryable() => {
+        match (
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                context
+                    .image_inspector
+                    .inspect(&flash.spec.workload.image, disk_budget_bytes),
+            )
+            .await,
+            peer_cache,
+        ) {
+            (Ok(Ok(inspection)), _) => inspection,
+            (Ok(Err(error)), Some(cached)) if error.allows_verified_cache() => {
+                warn!(name = %name, "registry unavailable; using same-organization digest-verified image metadata");
+                cached
+            }
+            (Ok(Err(error)), _) if error.retryable() => {
                 let mut status = FlashServiceStatus {
                     phase: FlashServicePhase::Provisioning,
                     observed_generation: flash.spec.desired_generation,
@@ -874,7 +881,7 @@ async fn reconcile(
                 patch_observed_status(&services, &allocation, &flash, status).await?;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
-            Ok(Err(error)) => {
+            (Ok(Err(error)), _) => {
                 // An invalid replacement image must never stop the last healthy revision.
                 let mut status = FlashServiceStatus {
                     phase: FlashServicePhase::Error,
@@ -888,7 +895,8 @@ async fn reconcile(
                 patch_observed_status(&services, &allocation, &flash, status).await?;
                 return Ok(Action::await_change());
             }
-            Err(_) => {
+            (Err(_), Some(cached)) => cached,
+            (Err(_), None) => {
                 let mut status = FlashServiceStatus {
                     phase: FlashServicePhase::Provisioning,
                     observed_generation: flash.spec.desired_generation,
@@ -2301,6 +2309,73 @@ fn desired_persistent_volume_claim(
     from_value(desired)
 }
 
+// A digest identifies immutable content. Reuse only metadata previously read
+// by the provider for the same organization and repository, never mutable tags
+// or metadata from another tenant. Recalculate the destination disk allowance.
+fn verified_image_from_peer(
+    flash: &FlashService,
+    peer: &FlashService,
+    disk_budget_bytes: u64,
+) -> Option<ImageInspection> {
+    if flash.spec.organization_id != peer.spec.organization_id {
+        return None;
+    }
+    let requested = oci_client::Reference::try_from(flash.spec.workload.image.clone()).ok()?;
+    let digest = requested.digest()?;
+    if !digest.strip_prefix("sha256:").is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }) {
+        return None;
+    }
+    let peer_request = oci_client::Reference::try_from(peer.spec.workload.image.clone()).ok()?;
+    if requested.to_string() != peer_request.to_string() {
+        return None;
+    }
+    let status = peer.status.as_ref()?;
+    let resolved_image = status.resolved_image.clone()?;
+    let resolved = oci_client::Reference::try_from(resolved_image.clone()).ok()?;
+    if requested.to_string() != resolved.to_string() {
+        return None;
+    }
+    let image_size_bytes = status.image_size_bytes?;
+    let writable_storage_bytes = disk_budget_bytes.checked_sub(image_size_bytes)?;
+    if image_size_bytes == 0 || writable_storage_bytes == 0 {
+        return None;
+    }
+    Some(ImageInspection {
+        resolved_image,
+        image_size_bytes,
+        writable_storage_bytes,
+        image_entrypoint: status.image_entrypoint.clone()?,
+        image_cmd: status.image_cmd.clone()?,
+        architecture: status.image_architecture.clone()?,
+    })
+}
+
+async fn verified_peer_image_inspection(
+    services: &Api<FlashService>,
+    flash: &FlashService,
+    disk_budget_bytes: u64,
+) -> Result<Option<ImageInspection>, kube::Error> {
+    // Healthy revisions already have their own cache; avoid listing on their
+    // normal reconciliation path and on mutable image references.
+    if cached_image_inspection(flash, disk_budget_bytes).is_some()
+        || !flash.spec.workload.image.contains("@sha256:")
+    {
+        return Ok(None);
+    }
+    // Older FlashService objects have no tenant labels. Verify the authoritative
+    // organization ID in each spec rather than excluding those recovery sources.
+    let peers = services.list(&ListParams::default()).await?;
+    Ok(peers
+        .items
+        .iter()
+        .find_map(|peer| verified_image_from_peer(flash, peer, disk_budget_bytes)))
+}
+
 fn cached_image_inspection(
     flash: &FlashService,
     disk_budget_bytes: u64,
@@ -3482,7 +3557,7 @@ mod tests {
         desired_secret_service_account, desired_service, gpu_job_state, persistent_resize_pending,
         projected_weekly_usage, status_patch, storage_allocation, storage_allocation_retaining,
         storage_quantity_bytes, update_workload_status, validate_admin_volume_mounts,
-        workload_failure_message, workload_restart_message,
+        verified_image_from_peer, workload_failure_message, workload_restart_message,
     };
     use crate::{
         GPU_READY_LABEL, GPU_RESOURCE_NAME, GPU_RUNTIME_CLASS_NAME, LOAD_BALANCER_CLASS,
@@ -3783,6 +3858,73 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn immutable_image_metadata_is_reused_with_a_new_disk_budget() -> anyhow::Result<()> {
+        let mut peer = service(TrafficMode::Forwarded);
+        peer.spec.workload.image =
+            format!("registry.example.test/org/app@sha256:{}", "a".repeat(64));
+        peer.status = Some(FlashServiceStatus {
+            resolved_image: Some(peer.spec.workload.image.clone()),
+            image_size_bytes: Some(GIB_BYTES),
+            image_entrypoint: Some(vec!["/entrypoint".into()]),
+            image_cmd: Some(vec!["bash".into()]),
+            image_architecture: Some("amd64".into()),
+            ..Default::default()
+        });
+        let mut destination = peer.clone();
+        destination.spec.desired_generation = 2;
+        destination.status = None;
+        let inspection = verified_image_from_peer(&destination, &peer, 4 * GIB_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("verified immutable metadata missing"))?;
+        assert_eq!(inspection.writable_storage_bytes, 3 * GIB_BYTES);
+        assert_eq!(inspection.image_entrypoint, vec!["/entrypoint"]);
+        assert_eq!(inspection.image_cmd, vec!["bash"]);
+
+        assert!(verified_image_from_peer(&destination, &peer, GIB_BYTES).is_none());
+        destination.spec.organization_id = "another-organization".into();
+        assert!(verified_image_from_peer(&destination, &peer, 4 * GIB_BYTES).is_none());
+        destination.spec.organization_id = peer.spec.organization_id.clone();
+        peer.status
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing status"))?
+            .image_cmd = None;
+        assert!(verified_image_from_peer(&destination, &peer, 4 * GIB_BYTES).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mutable_wrong_repository_and_mismatched_resolved_images_never_supply_metadata()
+    -> anyhow::Result<()> {
+        let pinned = format!("registry.example.test/org/app@sha256:{}", "a".repeat(64));
+        let mut peer = service(TrafficMode::Forwarded);
+        peer.spec.workload.image = pinned.clone();
+        peer.status = Some(FlashServiceStatus {
+            resolved_image: Some(pinned.clone()),
+            image_size_bytes: Some(GIB_BYTES),
+            image_entrypoint: Some(vec![]),
+            image_cmd: Some(vec![]),
+            image_architecture: Some("amd64".into()),
+            ..Default::default()
+        });
+        let mut destination = peer.clone();
+        for image in [
+            "registry.example.test/org/app:latest".to_owned(),
+            pinned.replace("org/app", "org/other"),
+            pinned.replace(&"a".repeat(64), &"b".repeat(64)),
+            "registry.example.test/org/app@sha256:invalid".to_owned(),
+        ] {
+            destination.spec.workload.image = image;
+            assert!(verified_image_from_peer(&destination, &peer, 4 * GIB_BYTES).is_none());
+        }
+        destination.spec.workload.image = pinned.clone();
+        peer.status
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing status"))?
+            .resolved_image = Some(pinned.replace(&"a".repeat(64), &"b".repeat(64)));
+        assert!(verified_image_from_peer(&destination, &peer, 4 * GIB_BYTES).is_none());
+        Ok(())
     }
 
     #[test]

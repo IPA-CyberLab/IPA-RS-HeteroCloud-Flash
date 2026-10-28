@@ -4,6 +4,7 @@ use oci_client::{
     Client, Reference,
     client::ClientConfig,
     config::ConfigFile,
+    errors::OciDistributionError,
     manifest::{OciImageManifest, OciManifest},
     secrets::RegistryAuth,
 };
@@ -70,14 +71,11 @@ impl ImageInspector {
             }
         })?;
         let auth = self.auth_for(&reference);
-        let (manifest, digest) =
-            self.client
-                .pull_manifest(&reference, &auth)
-                .await
-                .map_err(|error| ImageInspectionError::Registry {
-                    image: image.to_owned(),
-                    reason: error.to_string(),
-                })?;
+        let (manifest, digest) = self
+            .client
+            .pull_manifest(&reference, &auth)
+            .await
+            .map_err(|error| ImageInspectionError::registry(image, error))?;
 
         let image_size_bytes = match manifest {
             OciManifest::Image(manifest) => manifest_size_bytes(&manifest)?,
@@ -104,10 +102,7 @@ impl ImageInspector {
                         .client
                         .pull_manifest(&platform_reference, &auth)
                         .await
-                        .map_err(|error| ImageInspectionError::Registry {
-                            image: image.to_owned(),
-                            reason: error.to_string(),
-                        })?;
+                        .map_err(|error| ImageInspectionError::registry(image, error))?;
                     let OciManifest::Image(platform_manifest) = platform_manifest else {
                         return Err(ImageInspectionError::NestedImageIndex {
                             image: image.to_owned(),
@@ -124,10 +119,7 @@ impl ImageInspector {
             .client
             .pull_image_manifest(&resolved_reference, &auth)
             .await
-            .map_err(|error| ImageInspectionError::Registry {
-                image: image.to_owned(),
-                reason: error.to_string(),
-            })?;
+            .map_err(|error| ImageInspectionError::registry(image, error))?;
         if selected_manifest.config.size < 0 || selected_manifest.config.size > 1_048_576 {
             return Err(ImageInspectionError::InvalidImageConfig);
         }
@@ -139,10 +131,7 @@ impl ImageInspector {
                 &mut config_bytes,
             )
             .await
-            .map_err(|error| ImageInspectionError::Registry {
-                image: image.to_owned(),
-                reason: error.to_string(),
-            })?;
+            .map_err(|error| ImageInspectionError::registry(image, error))?;
         let config: ConfigFile = serde_json::from_slice(&config_bytes)
             .map_err(|_| ImageInspectionError::InvalidImageConfig)?;
         if !config.os.to_string().eq_ignore_ascii_case("linux") {
@@ -222,7 +211,11 @@ pub enum ImageInspectionError {
     #[error("invalid OCI image reference `{image}`: {reason}")]
     InvalidReference { image: String, reason: String },
     #[error("OCI registry inspection failed for `{image}`: {reason}")]
-    Registry { image: String, reason: String },
+    Registry {
+        image: String,
+        reason: String,
+        allow_verified_cache: bool,
+    },
     #[error("OCI image index for `{image}` has no Linux manifest")]
     NoLinuxManifest { image: String },
     #[error("OCI image index for `{image}` contains another image index")]
@@ -245,6 +238,29 @@ pub enum ImageInspectionError {
 }
 
 impl ImageInspectionError {
+    fn registry(image: &str, error: OciDistributionError) -> Self {
+        let allow_verified_cache = match &error {
+            OciDistributionError::ServerError { code, .. } => (500..=599).contains(code),
+            OciDistributionError::RequestError(error) => error.is_timeout() || error.is_connect(),
+            _ => false,
+        };
+        Self::Registry {
+            image: image.to_owned(),
+            reason: error.to_string(),
+            allow_verified_cache,
+        }
+    }
+
+    #[must_use]
+    pub const fn allows_verified_cache(&self) -> bool {
+        matches!(
+            self,
+            Self::Registry {
+                allow_verified_cache: true,
+                ..
+            }
+        )
+    }
     #[must_use]
     pub const fn retryable(&self) -> bool {
         matches!(self, Self::Registry { .. })
@@ -253,9 +269,37 @@ impl ImageInspectionError {
 
 #[cfg(test)]
 mod tests {
+    use oci_client::errors::OciDistributionError;
     use oci_client::manifest::{OciDescriptor, OciImageManifest};
 
     use super::{GIB_BYTES, ImageInspectionError, manifest_size_bytes, writable_storage_bytes};
+
+    #[test]
+    fn only_registry_availability_failures_allow_verified_metadata() {
+        for code in [500, 502, 503, 504] {
+            let error = OciDistributionError::ServerError {
+                code,
+                url: "https://registry.example.test/v2/image/manifests/digest".into(),
+                message: "unavailable".into(),
+            };
+            assert!(ImageInspectionError::registry("image", error).allows_verified_cache());
+        }
+        for error in [
+            OciDistributionError::ServerError {
+                code: 404,
+                url: "https://registry.example.test/v2/image/manifests/digest".into(),
+                message: "not found".into(),
+            },
+            OciDistributionError::UnauthorizedError {
+                url: "https://registry.example.test/v2/".into(),
+            },
+            OciDistributionError::AuthenticationFailure("denied".into()),
+            OciDistributionError::ManifestParsingError("invalid manifest".into()),
+        ] {
+            assert!(!ImageInspectionError::registry("image", error).allows_verified_cache());
+        }
+        assert!(!ImageInspectionError::InvalidImageConfig.allows_verified_cache());
+    }
 
     fn descriptor(digest: &str, size: i64) -> OciDescriptor {
         OciDescriptor {

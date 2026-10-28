@@ -241,6 +241,10 @@ rules:
   - apiGroups: [longhorn.io]
     resources: [nodes]
     verbs: [list]
+  - apiGroups: [longhorn.io]
+    resources: [settings]
+    resourceNames: [default-replica-count, allow-volume-creation-with-degraded-availability]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
