@@ -283,6 +283,103 @@ struct WeeklyMeter {
     gpu_remaining_seconds: u64,
 }
 
+#[derive(Default)]
+struct WeeklyTotals {
+    organization_cpu: u64,
+    organization_memory: u64,
+    organization_gpu: u64,
+    member_cpu: u64,
+    member_memory: u64,
+    member_gpu: u64,
+}
+
+fn weekly_totals(
+    flash: &FlashService,
+    now: i64,
+    week_started_at: i64,
+    peers: &[FlashService],
+    records: &[FlashUsageRecord],
+) -> WeeklyTotals {
+    let mut totals = WeeklyTotals::default();
+    let mut recorded_services = BTreeSet::new();
+    let owners: BTreeMap<_, _> = peers
+        .iter()
+        .map(|peer| {
+            (
+                peer.spec.service_instance_id.as_str(),
+                peer.spec.quota_user_id.as_deref(),
+            )
+        })
+        .collect();
+    for record in records {
+        if record.spec.organization_id != flash.spec.organization_id
+            || record.spec.usage.week_started_at != week_started_at
+        {
+            continue;
+        }
+        recorded_services.insert(record.spec.service_instance_id.as_str());
+        totals.organization_cpu = totals
+            .organization_cpu
+            .saturating_add(record.spec.usage.cpu_millicore_seconds);
+        totals.organization_memory = totals
+            .organization_memory
+            .saturating_add(record.spec.usage.memory_mib_seconds);
+        totals.organization_gpu = totals
+            .organization_gpu
+            .saturating_add(record.spec.usage.gpu_seconds);
+        let owner = record.spec.quota_user_id.as_deref().or_else(|| {
+            owners
+                .get(record.spec.service_instance_id.as_str())
+                .copied()
+                .flatten()
+        });
+        if flash
+            .spec
+            .quota_user_id
+            .as_deref()
+            .is_some_and(|user| owner == Some(user))
+        {
+            totals.member_cpu = totals
+                .member_cpu
+                .saturating_add(record.spec.usage.cpu_millicore_seconds);
+            totals.member_memory = totals
+                .member_memory
+                .saturating_add(record.spec.usage.memory_mib_seconds);
+            totals.member_gpu = totals
+                .member_gpu
+                .saturating_add(record.spec.usage.gpu_seconds);
+        }
+    }
+    // Legacy peers without a durable record must be counted once during a
+    // rolling upgrade; records for deleted services remain chargeable.
+    for peer in peers {
+        if peer.spec.organization_id != flash.spec.organization_id
+            || recorded_services.contains(peer.spec.service_instance_id.as_str())
+        {
+            continue;
+        }
+        let usage = projected_weekly_usage(peer, now);
+        totals.organization_cpu = totals
+            .organization_cpu
+            .saturating_add(usage.cpu_millicore_seconds);
+        totals.organization_memory = totals
+            .organization_memory
+            .saturating_add(usage.memory_mib_seconds);
+        totals.organization_gpu = totals.organization_gpu.saturating_add(usage.gpu_seconds);
+        if flash.spec.quota_user_id.is_some() && peer.spec.quota_user_id == flash.spec.quota_user_id
+        {
+            totals.member_cpu = totals
+                .member_cpu
+                .saturating_add(usage.cpu_millicore_seconds);
+            totals.member_memory = totals
+                .member_memory
+                .saturating_add(usage.memory_mib_seconds);
+            totals.member_gpu = totals.member_gpu.saturating_add(usage.gpu_seconds);
+        }
+    }
+    totals
+}
+
 #[must_use]
 pub fn utc_week_start(timestamp: i64) -> i64 {
     const WEEK_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -382,6 +479,7 @@ async fn meter_weekly_usage(
             service_instance_id: flash.spec.service_instance_id.clone(),
             organization_id: flash.spec.organization_id.clone(),
             project_id: flash.spec.project_id.clone(),
+            quota_user_id: flash.spec.quota_user_id.clone(),
             display_name: flash.spec.display_name.clone(),
             cpu_millis: flash.spec.workload.cpu_millis,
             memory_mib: flash.spec.workload.memory_mib,
@@ -397,37 +495,16 @@ async fn meter_weekly_usage(
         )
         .await?;
 
-    let mut recorded_services = BTreeSet::new();
-    let mut organization_cpu = 0_u64;
-    let mut organization_memory = 0_u64;
-    let mut organization_gpu = 0_u64;
-    for record in usage_records.list(&ListParams::default()).await?.items {
-        if record.spec.organization_id != flash.spec.organization_id
-            || record.spec.usage.week_started_at != usage.week_started_at
-        {
-            continue;
-        }
-        recorded_services.insert(record.spec.service_instance_id.clone());
-        organization_cpu = organization_cpu.saturating_add(record.spec.usage.cpu_millicore_seconds);
-        organization_memory =
-            organization_memory.saturating_add(record.spec.usage.memory_mib_seconds);
-        organization_gpu = organization_gpu.saturating_add(record.spec.usage.gpu_seconds);
-    }
-    // During the first rolling-upgrade pass, peers may not have durable records
-    // yet. Include their status projection until their controller pass creates
-    // one, without counting services that already have a record twice.
-    for peer in services.list(&ListParams::default()).await?.items {
-        if peer.spec.organization_id != flash.spec.organization_id
-            || recorded_services.contains(&peer.spec.service_instance_id)
-        {
-            continue;
-        }
-        let peer_usage = projected_weekly_usage(&peer, now);
-        organization_cpu = organization_cpu.saturating_add(peer_usage.cpu_millicore_seconds);
-        organization_memory = organization_memory.saturating_add(peer_usage.memory_mib_seconds);
-        organization_gpu = organization_gpu.saturating_add(peer_usage.gpu_seconds);
-    }
+    let peers = services.list(&ListParams::default()).await?.items;
+    let records = usage_records.list(&ListParams::default()).await?.items;
+    let totals = weekly_totals(flash, now, usage.week_started_at, &peers, &records);
     let gpu_limit = flash.spec.policy.max_weekly_gpu_seconds;
+    let member = flash.spec.policy.member.as_ref();
+    let member_gpu_remaining = member.map_or(u64::MAX, |limit| {
+        limit
+            .max_weekly_gpu_seconds
+            .saturating_sub(totals.member_gpu)
+    });
     Ok(WeeklyMeter {
         gpu_usage: (flash.spec.workload.effective_gpu_count() > 0).then_some(FlashGpuWeeklyUsage {
             week_started_at: usage.week_started_at,
@@ -435,8 +512,14 @@ async fn meter_weekly_usage(
             last_metered_at: now,
             limit_seconds: gpu_limit,
         }),
-        cpu_exhausted: organization_cpu >= flash.spec.policy.max_weekly_cpu_millicore_seconds,
-        memory_exhausted: organization_memory >= flash.spec.policy.max_weekly_memory_mib_seconds,
+        cpu_exhausted: totals.organization_cpu
+            >= flash.spec.policy.max_weekly_cpu_millicore_seconds
+            || member
+                .is_some_and(|limit| totals.member_cpu >= limit.max_weekly_cpu_millicore_seconds),
+        memory_exhausted: totals.organization_memory
+            >= flash.spec.policy.max_weekly_memory_mib_seconds
+            || member
+                .is_some_and(|limit| totals.member_memory >= limit.max_weekly_memory_mib_seconds),
         gpu_exhausted: (flash.spec.workload.effective_gpu_count() > 0
             || flash
                 .status
@@ -444,8 +527,11 @@ async fn meter_weekly_usage(
                 .and_then(|s| s.allocated_gpu_count)
                 .unwrap_or_default()
                 > 0)
-            && organization_gpu >= gpu_limit,
-        gpu_remaining_seconds: gpu_limit.saturating_sub(organization_gpu),
+            && (totals.organization_gpu >= gpu_limit
+                || member.is_some_and(|limit| totals.member_gpu >= limit.max_weekly_gpu_seconds)),
+        gpu_remaining_seconds: gpu_limit
+            .saturating_sub(totals.organization_gpu)
+            .min(member_gpu_remaining),
         usage,
     })
 }
@@ -3816,6 +3902,7 @@ mod tests {
                 project_id: "00000000-0000-0000-0000-000000000003".into(),
                 service_instance_id: "00000000-0000-0000-0000-000000000001".into(),
                 subject_id: Some("00000000-0000-0000-0000-000000000004".into()),
+                quota_user_id: None,
                 policy: crate::crd::FlashServicePolicy::default(),
                 workload: FlashSpec {
                     stopped: false,
@@ -3858,6 +3945,69 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn weekly_member_totals_include_deleted_services_without_double_counting_peers() {
+        use crate::crd::{FlashUsageRecord, FlashUsageRecordSpec};
+        let now = 1_800_000_000;
+        let week = super::utc_week_start(now);
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.quota_user_id = Some("user-a".into());
+        let mut peer = flash.clone();
+        peer.spec.service_instance_id = "peer".into();
+        let mut other = flash.clone();
+        other.spec.service_instance_id = "other".into();
+        other.spec.quota_user_id = Some("user-b".into());
+        let usage = |cpu| FlashWeeklyUsage {
+            week_started_at: week,
+            cpu_millicore_seconds: cpu,
+            memory_mib_seconds: cpu * 2,
+            gpu_seconds: cpu * 3,
+            last_metered_at: now,
+            max_cpu_millicore_seconds: 1000,
+            max_memory_mib_seconds: 1000,
+            max_gpu_seconds: 1000,
+        };
+        let record = |id: &str, user: Option<&str>, cpu| {
+            FlashUsageRecord::new(
+                id,
+                FlashUsageRecordSpec {
+                    service_instance_id: id.into(),
+                    organization_id: flash.spec.organization_id.clone(),
+                    project_id: flash.spec.project_id.clone(),
+                    quota_user_id: user.map(str::to_owned),
+                    display_name: id.into(),
+                    cpu_millis: 0,
+                    memory_mib: 0,
+                    gpu_count: 0,
+                    usage: usage(cpu),
+                },
+            )
+        };
+        // The missing owner on the first record is recovered only from a live
+        // peer; the deleted record carries its own immutable owner.
+        let records = vec![
+            record("peer", None, 10),
+            record("deleted", Some("user-a"), 20),
+            record("other", Some("user-b"), 40),
+        ];
+        let totals = super::weekly_totals(&flash, now, week, &[peer, other], &records);
+        assert_eq!(
+            (
+                totals.organization_cpu,
+                totals.organization_memory,
+                totals.organization_gpu
+            ),
+            (70, 140, 210)
+        );
+        assert_eq!(
+            (totals.member_cpu, totals.member_memory, totals.member_gpu),
+            (30, 60, 90)
+        );
+        flash.spec.quota_user_id = Some("user-b".into());
+        let totals = super::weekly_totals(&flash, now, week, &[], &records);
+        assert_eq!(totals.member_cpu, 40);
     }
 
     #[test]

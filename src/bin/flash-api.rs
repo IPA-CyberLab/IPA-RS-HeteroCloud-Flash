@@ -601,10 +601,37 @@ struct ReconcileRequest {
     spec: Value,
     #[serde(default)]
     policy: FlashServicePolicy,
+    #[serde(default)]
+    quota_user_id: Option<Uuid>,
 }
 
 fn requester_user_id(claims: &ProviderClaims) -> Option<String> {
     claims.user_id.map(|value| value.to_string())
+}
+
+fn preserve_existing_member_quota(
+    existing_user: Option<&str>,
+    existing_member: Option<&heterocloud_flash::crd::FlashMemberWeeklyLimits>,
+    quota_user_id: &mut Option<String>,
+    policy: &mut FlashServicePolicy,
+) -> Result<(), ApiError> {
+    if let Some(existing_user) = existing_user {
+        if quota_user_id
+            .as_deref()
+            .is_some_and(|user| user != existing_user)
+        {
+            return Err(ApiError::Conflict(
+                "the allocation owner cannot change".into(),
+            ));
+        }
+        if quota_user_id.is_none() {
+            // Old workers omit these fields during a rolling upgrade. They
+            // must not erase an allocation owner or a member's limits.
+            *quota_user_id = Some(existing_user.to_owned());
+            policy.member = existing_member.cloned();
+        }
+    }
+    Ok(())
 }
 
 async fn reconcile(
@@ -626,7 +653,7 @@ async fn reconcile(
     spec.validate()
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let expected_runtime_class = workload_runtime_class(spec.effective_gpu_count());
-    let requester_user_id = requester_user_id(&claims);
+    let mut subject_id = requester_user_id(&claims);
     if request.policy.max_weekly_gpu_seconds > MAX_WEEKLY_GPU_SECONDS {
         return Err(ApiError::BadRequest(
             "weekly GPU limit exceeds the provider safety maximum".into(),
@@ -642,7 +669,18 @@ async fn reconcile(
             "weekly memory limit exceeds the provider safety maximum".into(),
         ));
     }
+    if let Some(member) = &request.policy.member
+        && (request.quota_user_id.is_none()
+            || member.max_weekly_cpu_millicore_seconds
+                > request.policy.max_weekly_cpu_millicore_seconds
+            || member.max_weekly_memory_mib_seconds > request.policy.max_weekly_memory_mib_seconds
+            || member.max_weekly_gpu_seconds > request.policy.max_weekly_gpu_seconds)
+    {
+        return Err(ApiError::BadRequest("invalid member weekly quota".into()));
+    }
     let resource_name = resource_name(service_instance_id);
+    let mut quota_user_id = request.quota_user_id.map(|value| value.to_string());
+    let mut policy = request.policy;
 
     let mut resumed = false;
     if let Some(existing) = state.services.get_opt(&resource_name).await? {
@@ -654,18 +692,28 @@ async fn reconcile(
         if existing.spec.organization_id != claims.organization_id.to_string() {
             return Err(ApiError::Forbidden);
         }
+        preserve_existing_member_quota(
+            existing.spec.quota_user_id.as_deref(),
+            existing.spec.policy.member.as_ref(),
+            &mut quota_user_id,
+            &mut policy,
+        )?;
         if existing.spec.desired_generation > request.generation {
             return Err(ApiError::Conflict("generation is stale".into()));
         }
         if existing.spec.desired_generation == request.generation
             && (existing.spec.display_name != request.name
                 || existing.spec.project_id != claims.project_id.to_string()
-                || existing.spec.workload != spec
-                || existing.spec.subject_id != requester_user_id)
+                || existing.spec.workload != spec)
         {
             return Err(ApiError::Conflict(
                 "generation was already used for different desired state".into(),
             ));
+        }
+        if existing.spec.desired_generation == request.generation {
+            // A quota-only reconciliation may be issued by another principal.
+            // Preserve the GPU access subject for the existing generation.
+            subject_id = existing.spec.subject_id.clone();
         }
         resumed = existing.spec.workload.stopped && !spec.stopped;
     } else if let Some(id) = spec.restore_from_backup_id {
@@ -698,8 +746,9 @@ async fn reconcile(
             organization_id: claims.organization_id.to_string(),
             project_id: claims.project_id.to_string(),
             service_instance_id: service_instance_id.to_string(),
-            subject_id: requester_user_id,
-            policy: request.policy,
+            subject_id,
+            quota_user_id,
+            policy,
             workload: spec,
         },
     );
@@ -1372,6 +1421,39 @@ mod tests {
         container_summary, pod_belongs_to_service, pod_can_exec, requester_user_id,
         validate_admin_claims, validate_command, validate_resource_access,
     };
+
+    #[test]
+    fn legacy_reconcile_cannot_erase_or_change_member_quota() {
+        use heterocloud_flash::crd::{FlashMemberWeeklyLimits, FlashServicePolicy};
+        let member = FlashMemberWeeklyLimits {
+            max_weekly_cpu_millicore_seconds: 10,
+            max_weekly_memory_mib_seconds: 20,
+            max_weekly_gpu_seconds: 30,
+        };
+        let mut owner = None;
+        let mut policy = FlashServicePolicy::default();
+        assert!(
+            super::preserve_existing_member_quota(
+                Some("owner"),
+                Some(&member),
+                &mut owner,
+                &mut policy
+            )
+            .is_ok()
+        );
+        assert_eq!(owner.as_deref(), Some("owner"));
+        assert_eq!(policy.member, Some(member.clone()));
+        let mut attempted_change = Some("different-owner".to_owned());
+        assert!(matches!(
+            super::preserve_existing_member_quota(
+                Some("owner"),
+                Some(&member),
+                &mut attempted_change,
+                &mut policy
+            ),
+            Err(ApiError::Conflict(_))
+        ));
+    }
 
     #[tokio::test]
     async fn shutdown_waits_for_upgraded_exec_session_tasks()

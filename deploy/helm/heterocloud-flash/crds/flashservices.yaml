@@ -57,8 +57,36 @@ spec:
                     maximum: 33067892736000.0
                     minimum: 0.0
                     type: integer
+                  member:
+                    description: Optional member ceiling in addition to the organization ceiling.
+                    nullable: true
+                    properties:
+                      max_weekly_cpu_millicore_seconds:
+                        format: uint64
+                        maximum: 3153600000000000.0
+                        minimum: 0.0
+                        type: integer
+                      max_weekly_gpu_seconds:
+                        format: uint64
+                        maximum: 31536000.0
+                        minimum: 0.0
+                        type: integer
+                      max_weekly_memory_mib_seconds:
+                        format: uint64
+                        maximum: 33067892736000.0
+                        minimum: 0.0
+                        type: integer
+                    required:
+                    - max_weekly_cpu_millicore_seconds
+                    - max_weekly_gpu_seconds
+                    - max_weekly_memory_mib_seconds
+                    type: object
                 type: object
               project_id:
+                type: string
+              quota_user_id:
+                description: Stable allocation owner, independent of the last user editing the service.
+                nullable: true
                 type: string
               service_instance_id:
                 type: string

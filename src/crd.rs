@@ -99,6 +99,9 @@ pub struct FlashServiceSpec {
     /// this field and may only consume open GPU inventory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
+    /// Stable allocation owner, independent of the last user editing the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_user_id: Option<String>,
     #[serde(default)]
     pub policy: FlashServicePolicy,
     pub workload: FlashSpec,
@@ -224,6 +227,8 @@ pub struct FlashUsageRecordSpec {
     pub service_instance_id: String,
     pub organization_id: String,
     pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_user_id: Option<String>,
     pub display_name: String,
     pub cpu_millis: u32,
     pub memory_mib: u32,
@@ -286,6 +291,20 @@ pub struct FlashServicePolicy {
     #[serde(default = "default_max_weekly_gpu_seconds")]
     #[schemars(range(min = 0, max = 31_536_000))]
     pub max_weekly_gpu_seconds: u64,
+    /// Optional member ceiling in addition to the organization ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<FlashMemberWeeklyLimits>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlashMemberWeeklyLimits {
+    #[schemars(range(min = 0_u64, max = 3_153_600_000_000_000_u64))]
+    pub max_weekly_cpu_millicore_seconds: u64,
+    #[schemars(range(min = 0_u64, max = 33_067_892_736_000_u64))]
+    pub max_weekly_memory_mib_seconds: u64,
+    #[schemars(range(min = 0_u64, max = 31_536_000_u64))]
+    pub max_weekly_gpu_seconds: u64,
 }
 
 impl Default for FlashServicePolicy {
@@ -294,6 +313,7 @@ impl Default for FlashServicePolicy {
             max_weekly_cpu_millicore_seconds: MAX_WEEKLY_CPU_MILLICORE_SECONDS,
             max_weekly_memory_mib_seconds: MAX_WEEKLY_MEMORY_MIB_SECONDS,
             max_weekly_gpu_seconds: MAX_WEEKLY_GPU_SECONDS,
+            member: None,
         }
     }
 }

@@ -43,6 +43,9 @@ spec:
                 type: string
               project_id:
                 type: string
+              quota_user_id:
+                nullable: true
+                type: string
               service_instance_id:
                 type: string
               usage:
