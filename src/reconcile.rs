@@ -4098,6 +4098,107 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn weekly_meter_enforces_shared_usage_across_accounts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::crd::{
+            FlashCloudOrganizationWeeklyLimits, FlashUsageRecord, FlashUsageRecordSpec,
+        };
+        use kube::{Api, Client, client::Body};
+        let now = 1_800_000_000;
+        let week = super::utc_week_start(now);
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.gpu_count = 1;
+        let account_b = "00000000-0000-0000-0000-000000000009";
+        let record = |id: &str, account: &str, cpu| {
+            FlashUsageRecord::new(
+                id,
+                FlashUsageRecordSpec {
+                    service_instance_id: id.into(),
+                    organization_id: account.into(),
+                    project_id: flash.spec.project_id.clone(),
+                    quota_user_id: None,
+                    display_name: id.into(),
+                    cpu_millis: 0,
+                    memory_mib: 0,
+                    gpu_count: 0,
+                    usage: FlashWeeklyUsage {
+                        week_started_at: week,
+                        cpu_millicore_seconds: cpu,
+                        memory_mib_seconds: cpu * 2,
+                        gpu_seconds: cpu * 3,
+                        last_metered_at: now,
+                        max_cpu_millicore_seconds: 1000,
+                        max_memory_mib_seconds: 1000,
+                        max_gpu_seconds: 1000,
+                    },
+                },
+            )
+        };
+        let records = vec![
+            record("account-a-deleted", &flash.spec.organization_id, 70),
+            record("account-b-deleted", account_b, 50),
+        ];
+        let service_value = serde_json::to_value(&flash)?;
+        let record_values = serde_json::to_value(&records)?;
+        let client = Client::new(
+            tower::service_fn(move |request: http::Request<Body>| {
+                let service_value = service_value.clone();
+                let record_values = record_values.clone();
+                async move {
+                    let (status, body) = if request.method() == http::Method::PATCH {
+                        (
+                            200,
+                            serde_json::from_slice::<Value>(
+                                &request.into_body().collect_bytes().await?,
+                            )?,
+                        )
+                    } else if request.uri().path().ends_with("/flashservices") {
+                        (
+                            200,
+                            json!({"apiVersion":"flash.heterocloud.io/v1alpha1", "kind":"FlashServiceList", "metadata":{}, "items":[service_value]}),
+                        )
+                    } else if request.uri().path().ends_with("/flashusagerecords") {
+                        (
+                            200,
+                            json!({"apiVersion":"flash.heterocloud.io/v1alpha1", "kind":"FlashUsageRecordList", "metadata":{}, "items":record_values}),
+                        )
+                    } else {
+                        (
+                            404,
+                            json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "reason":"NotFound", "message":"not found", "code":404}),
+                        )
+                    };
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        http::Response::builder()
+                            .status(status)
+                            .body(Body::from(serde_json::to_vec(&body)?))?,
+                    )
+                }
+            }),
+            "test",
+        );
+        let services = Api::namespaced(client.clone(), "test");
+        let usage_records = Api::namespaced(client, "test");
+        let account_only =
+            super::meter_weekly_usage(&services, &usage_records, &flash, now).await?;
+        assert!(
+            !account_only.cpu_exhausted
+                && !account_only.memory_exhausted
+                && !account_only.gpu_exhausted
+        );
+        flash.spec.policy.cloud_organization = Some(FlashCloudOrganizationWeeklyLimits {
+            account_ids: vec![flash.spec.organization_id.clone(), account_b.into()],
+            max_weekly_cpu_millicore_seconds: 100,
+            max_weekly_memory_mib_seconds: 200,
+            max_weekly_gpu_seconds: 300,
+        });
+        let group = super::meter_weekly_usage(&services, &usage_records, &flash, now).await?;
+        assert!(group.cpu_exhausted && group.memory_exhausted && group.gpu_exhausted);
+        assert_eq!(group.gpu_remaining_seconds, 0);
+        Ok(())
+    }
+
     #[test]
     fn immutable_image_metadata_is_reused_with_a_new_disk_budget() -> anyhow::Result<()> {
         let mut peer = service(TrafficMode::Forwarded);
