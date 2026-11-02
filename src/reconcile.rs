@@ -288,6 +288,9 @@ struct WeeklyTotals {
     organization_cpu: u64,
     organization_memory: u64,
     organization_gpu: u64,
+    cloud_organization_cpu: u64,
+    cloud_organization_memory: u64,
+    cloud_organization_gpu: u64,
     member_cpu: u64,
     member_memory: u64,
     member_gpu: u64,
@@ -302,6 +305,13 @@ fn weekly_totals(
 ) -> WeeklyTotals {
     let mut totals = WeeklyTotals::default();
     let mut recorded_services = BTreeSet::new();
+    let cloud_accounts = flash.spec.policy.cloud_organization.as_ref().map(|cloud| {
+        cloud
+            .account_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+    });
     let owners: BTreeMap<_, _> = peers
         .iter()
         .map(|peer| {
@@ -312,12 +322,31 @@ fn weekly_totals(
         })
         .collect();
     for record in records {
-        if record.spec.organization_id != flash.spec.organization_id
-            || record.spec.usage.week_started_at != week_started_at
-        {
+        if record.spec.usage.week_started_at != week_started_at {
+            continue;
+        }
+        let account_match = record.spec.organization_id == flash.spec.organization_id;
+        let cloud_match = cloud_accounts
+            .as_ref()
+            .is_some_and(|accounts| accounts.contains(record.spec.organization_id.as_str()));
+        if !account_match && !cloud_match {
             continue;
         }
         recorded_services.insert(record.spec.service_instance_id.as_str());
+        if cloud_match {
+            totals.cloud_organization_cpu = totals
+                .cloud_organization_cpu
+                .saturating_add(record.spec.usage.cpu_millicore_seconds);
+            totals.cloud_organization_memory = totals
+                .cloud_organization_memory
+                .saturating_add(record.spec.usage.memory_mib_seconds);
+            totals.cloud_organization_gpu = totals
+                .cloud_organization_gpu
+                .saturating_add(record.spec.usage.gpu_seconds);
+        }
+        if !account_match {
+            continue;
+        }
         totals.organization_cpu = totals
             .organization_cpu
             .saturating_add(record.spec.usage.cpu_millicore_seconds);
@@ -353,12 +382,31 @@ fn weekly_totals(
     // Legacy peers without a durable record must be counted once during a
     // rolling upgrade; records for deleted services remain chargeable.
     for peer in peers {
-        if peer.spec.organization_id != flash.spec.organization_id
-            || recorded_services.contains(peer.spec.service_instance_id.as_str())
-        {
+        if recorded_services.contains(peer.spec.service_instance_id.as_str()) {
+            continue;
+        }
+        let account_match = peer.spec.organization_id == flash.spec.organization_id;
+        let cloud_match = cloud_accounts
+            .as_ref()
+            .is_some_and(|accounts| accounts.contains(peer.spec.organization_id.as_str()));
+        if !account_match && !cloud_match {
             continue;
         }
         let usage = projected_weekly_usage(peer, now);
+        if cloud_match {
+            totals.cloud_organization_cpu = totals
+                .cloud_organization_cpu
+                .saturating_add(usage.cpu_millicore_seconds);
+            totals.cloud_organization_memory = totals
+                .cloud_organization_memory
+                .saturating_add(usage.memory_mib_seconds);
+            totals.cloud_organization_gpu = totals
+                .cloud_organization_gpu
+                .saturating_add(usage.gpu_seconds);
+        }
+        if !account_match {
+            continue;
+        }
         totals.organization_cpu = totals
             .organization_cpu
             .saturating_add(usage.cpu_millicore_seconds);
@@ -500,6 +548,7 @@ async fn meter_weekly_usage(
     let totals = weekly_totals(flash, now, usage.week_started_at, &peers, &records);
     let gpu_limit = flash.spec.policy.max_weekly_gpu_seconds;
     let member = flash.spec.policy.member.as_ref();
+    let cloud = flash.spec.policy.cloud_organization.as_ref();
     let member_gpu_remaining = member.map_or(u64::MAX, |limit| {
         limit
             .max_weekly_gpu_seconds
@@ -514,10 +563,16 @@ async fn meter_weekly_usage(
         }),
         cpu_exhausted: totals.organization_cpu
             >= flash.spec.policy.max_weekly_cpu_millicore_seconds
+            || cloud.is_some_and(|limit| {
+                totals.cloud_organization_cpu >= limit.max_weekly_cpu_millicore_seconds
+            })
             || member
                 .is_some_and(|limit| totals.member_cpu >= limit.max_weekly_cpu_millicore_seconds),
         memory_exhausted: totals.organization_memory
             >= flash.spec.policy.max_weekly_memory_mib_seconds
+            || cloud.is_some_and(|limit| {
+                totals.cloud_organization_memory >= limit.max_weekly_memory_mib_seconds
+            })
             || member
                 .is_some_and(|limit| totals.member_memory >= limit.max_weekly_memory_mib_seconds),
         gpu_exhausted: (flash.spec.workload.effective_gpu_count() > 0
@@ -528,9 +583,17 @@ async fn meter_weekly_usage(
                 .unwrap_or_default()
                 > 0)
             && (totals.organization_gpu >= gpu_limit
+                || cloud.is_some_and(|limit| {
+                    totals.cloud_organization_gpu >= limit.max_weekly_gpu_seconds
+                })
                 || member.is_some_and(|limit| totals.member_gpu >= limit.max_weekly_gpu_seconds)),
         gpu_remaining_seconds: gpu_limit
             .saturating_sub(totals.organization_gpu)
+            .min(cloud.map_or(u64::MAX, |limit| {
+                limit
+                    .max_weekly_gpu_seconds
+                    .saturating_sub(totals.cloud_organization_gpu)
+            }))
             .min(member_gpu_remaining),
         usage,
     })
@@ -4008,6 +4071,31 @@ mod tests {
         flash.spec.quota_user_id = Some("user-b".into());
         let totals = super::weekly_totals(&flash, now, week, &[], &records);
         assert_eq!(totals.member_cpu, 40);
+
+        let mut deleted_from_another_account = record("other-account-deleted", Some("user-b"), 50);
+        deleted_from_another_account.spec.organization_id = "account-b".into();
+        let mut unrelated = record("unrelated", Some("user-b"), 500);
+        unrelated.spec.organization_id = "account-c".into();
+        let mut group_records = records;
+        group_records.push(deleted_from_another_account);
+        group_records.push(unrelated);
+        flash.spec.policy.cloud_organization =
+            Some(crate::crd::FlashCloudOrganizationWeeklyLimits {
+                account_ids: vec![flash.spec.organization_id.clone(), "account-b".into()],
+                max_weekly_cpu_millicore_seconds: 100,
+                max_weekly_memory_mib_seconds: 200,
+                max_weekly_gpu_seconds: 300,
+            });
+        let totals = super::weekly_totals(&flash, now, week, &[], &group_records);
+        assert_eq!((totals.organization_cpu, totals.member_cpu), (70, 40));
+        assert_eq!(
+            (
+                totals.cloud_organization_cpu,
+                totals.cloud_organization_memory,
+                totals.cloud_organization_gpu
+            ),
+            (120, 240, 360)
+        );
     }
 
     #[test]

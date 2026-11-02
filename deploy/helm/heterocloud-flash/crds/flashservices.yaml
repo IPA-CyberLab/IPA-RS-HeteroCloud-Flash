@@ -34,6 +34,38 @@ spec:
                   max_weekly_gpu_seconds: 31536000
                   max_weekly_memory_mib_seconds: 33067892736000
                 properties:
+                  cloud_organization:
+                    description: A separate ceiling shared by all accounts of a cloud organization.
+                    nullable: true
+                    properties:
+                      account_ids:
+                        description: |-
+                          Account IDs include accounts with deleted services, whose durable usage
+                          records must still count until the end of the week.
+                        items:
+                          type: string
+                        type: array
+                      max_weekly_cpu_millicore_seconds:
+                        format: uint64
+                        maximum: 3153600000000000.0
+                        minimum: 0.0
+                        type: integer
+                      max_weekly_gpu_seconds:
+                        format: uint64
+                        maximum: 31536000.0
+                        minimum: 0.0
+                        type: integer
+                      max_weekly_memory_mib_seconds:
+                        format: uint64
+                        maximum: 33067892736000.0
+                        minimum: 0.0
+                        type: integer
+                    required:
+                    - account_ids
+                    - max_weekly_cpu_millicore_seconds
+                    - max_weekly_gpu_seconds
+                    - max_weekly_memory_mib_seconds
+                    type: object
                   max_weekly_cpu_millicore_seconds:
                     default: 3153600000000000
                     description: |-

@@ -609,6 +609,41 @@ fn requester_user_id(claims: &ProviderClaims) -> Option<String> {
     claims.user_id.map(|value| value.to_string())
 }
 
+fn validate_cloud_organization_policy(
+    policy: &FlashServicePolicy,
+    account: Uuid,
+) -> Result<(), ApiError> {
+    let Some(cloud) = &policy.cloud_organization else {
+        return Ok(());
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    if cloud.account_ids.is_empty()
+        || cloud.account_ids.len() > 10_000
+        || cloud.max_weekly_cpu_millicore_seconds > MAX_WEEKLY_CPU_MILLICORE_SECONDS
+        || cloud.max_weekly_memory_mib_seconds > MAX_WEEKLY_MEMORY_MIB_SECONDS
+        || cloud.max_weekly_gpu_seconds > MAX_WEEKLY_GPU_SECONDS
+    {
+        return Err(ApiError::BadRequest(
+            "invalid cloud organization weekly quota".into(),
+        ));
+    }
+    for raw in &cloud.account_ids {
+        let id = Uuid::parse_str(raw)
+            .map_err(|_| ApiError::BadRequest("invalid cloud organization account".into()))?;
+        if id.to_string() != *raw || !ids.insert(id) {
+            return Err(ApiError::BadRequest(
+                "invalid cloud organization account".into(),
+            ));
+        }
+    }
+    if !ids.contains(&account) {
+        return Err(ApiError::BadRequest(
+            "cloud organization quota must include the service account".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn preserve_existing_member_quota(
     existing_user: Option<&str>,
     existing_member: Option<&heterocloud_flash::crd::FlashMemberWeeklyLimits>,
@@ -654,6 +689,7 @@ async fn reconcile(
         .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let expected_runtime_class = workload_runtime_class(spec.effective_gpu_count());
     let mut subject_id = requester_user_id(&claims);
+    validate_cloud_organization_policy(&request.policy, claims.organization_id)?;
     if request.policy.max_weekly_gpu_seconds > MAX_WEEKLY_GPU_SECONDS {
         return Err(ApiError::BadRequest(
             "weekly GPU limit exceeds the provider safety maximum".into(),
@@ -698,6 +734,11 @@ async fn reconcile(
             &mut quota_user_id,
             &mut policy,
         )?;
+        // An older worker may omit the new policy during a rolling upgrade.
+        // It must never erase an already-enforced cloud organization ceiling.
+        if policy.cloud_organization.is_none() {
+            policy.cloud_organization = existing.spec.policy.cloud_organization.clone();
+        }
         if existing.spec.desired_generation > request.generation {
             return Err(ApiError::Conflict("generation is stale".into()));
         }
@@ -1453,6 +1494,27 @@ mod tests {
             ),
             Err(ApiError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn cloud_weekly_policy_requires_unique_canonical_account_ids_and_current_account() {
+        use heterocloud_flash::crd::{FlashCloudOrganizationWeeklyLimits, FlashServicePolicy};
+        let account = Uuid::from_u128(1);
+        let mut policy = FlashServicePolicy {
+            cloud_organization: Some(FlashCloudOrganizationWeeklyLimits {
+                account_ids: vec![account.to_string(), Uuid::from_u128(2).to_string()],
+                max_weekly_cpu_millicore_seconds: 100,
+                max_weekly_memory_mib_seconds: 100,
+                max_weekly_gpu_seconds: 100,
+            }),
+            ..FlashServicePolicy::default()
+        };
+        assert!(super::validate_cloud_organization_policy(&policy, account).is_ok());
+        assert!(super::validate_cloud_organization_policy(&policy, Uuid::from_u128(3)).is_err());
+        if let Some(cloud) = &mut policy.cloud_organization {
+            cloud.account_ids.push(account.to_string());
+        }
+        assert!(super::validate_cloud_organization_policy(&policy, account).is_err());
     }
 
     #[tokio::test]

@@ -294,6 +294,23 @@ pub struct FlashServicePolicy {
     /// Optional member ceiling in addition to the organization ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<FlashMemberWeeklyLimits>,
+    /// A separate ceiling shared by all accounts of a cloud organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_organization: Option<FlashCloudOrganizationWeeklyLimits>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlashCloudOrganizationWeeklyLimits {
+    /// Account IDs include accounts with deleted services, whose durable usage
+    /// records must still count until the end of the week.
+    pub account_ids: Vec<String>,
+    #[schemars(range(min = 0_u64, max = 3_153_600_000_000_000_u64))]
+    pub max_weekly_cpu_millicore_seconds: u64,
+    #[schemars(range(min = 0_u64, max = 33_067_892_736_000_u64))]
+    pub max_weekly_memory_mib_seconds: u64,
+    #[schemars(range(min = 0_u64, max = 31_536_000_u64))]
+    pub max_weekly_gpu_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -314,6 +331,7 @@ impl Default for FlashServicePolicy {
             max_weekly_memory_mib_seconds: MAX_WEEKLY_MEMORY_MIB_SECONDS,
             max_weekly_gpu_seconds: MAX_WEEKLY_GPU_SECONDS,
             member: None,
+            cloud_organization: None,
         }
     }
 }
