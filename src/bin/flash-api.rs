@@ -603,6 +603,28 @@ struct ReconcileRequest {
     policy: FlashServicePolicy,
     #[serde(default)]
     quota_user_id: Option<Uuid>,
+    #[serde(default)]
+    quota_only: bool,
+}
+
+fn quota_only_patch(
+    resource_version: &str,
+    quota_user_id: Option<&str>,
+    policy: &FlashServicePolicy,
+) -> Value {
+    json!({
+        "metadata": { "resourceVersion": resource_version },
+        "spec": {
+            "quota_user_id": quota_user_id,
+            "policy": {
+                "max_weekly_cpu_millicore_seconds": policy.max_weekly_cpu_millicore_seconds,
+                "max_weekly_memory_mib_seconds": policy.max_weekly_memory_mib_seconds,
+                "max_weekly_gpu_seconds": policy.max_weekly_gpu_seconds,
+                "member": policy.member,
+                "cloud_organization": policy.cloud_organization,
+            }
+        }
+    })
 }
 
 fn requester_user_id(claims: &ProviderClaims) -> Option<String> {
@@ -717,6 +739,7 @@ async fn reconcile(
     let resource_name = resource_name(service_instance_id);
     let mut quota_user_id = request.quota_user_id.map(|value| value.to_string());
     let mut policy = request.policy;
+    let quota_only = request.quota_only;
 
     let mut resumed = false;
     if let Some(existing) = state.services.get_opt(&resource_name).await? {
@@ -756,7 +779,42 @@ async fn reconcile(
             // Preserve the GPU access subject for the existing generation.
             subject_id = existing.spec.subject_id.clone();
         }
+        if quota_only {
+            if existing.spec.desired_generation != request.generation {
+                return Err(ApiError::Conflict(
+                    "quota update requires the current generation".into(),
+                ));
+            }
+            // Only update quota fields and use a resource-version precondition.
+            // A concurrent service edit must not be reverted by a quota refresh.
+            let version = existing
+                .metadata
+                .resource_version
+                .as_deref()
+                .ok_or(ApiError::Internal)?;
+            let resource = state
+                .services
+                .patch(
+                    &resource_name,
+                    &PatchParams::default(),
+                    &Patch::Merge(quota_only_patch(version, quota_user_id.as_deref(), &policy)),
+                )
+                .await?;
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(AcceptedOperation::for_resource(
+                    service_instance_id,
+                    request.generation,
+                    PROVIDER_RECONCILE_ACTION,
+                    serde_json::to_value(resource.status).map_err(|_| ApiError::Internal)?,
+                )),
+            ));
+        }
         resumed = existing.spec.workload.stopped && !spec.stopped;
+    } else if quota_only {
+        return Err(ApiError::Conflict(
+            "quota update requires an existing service".into(),
+        ));
     } else if let Some(id) = spec.restore_from_backup_id {
         let backup = Api::<heterocloud_flash::backups::FlashBackup>::namespaced(
             state.client.clone(),
@@ -1515,6 +1573,146 @@ mod tests {
             cloud.account_ids.push(account.to_string());
         }
         assert!(super::validate_cloud_organization_policy(&policy, account).is_err());
+    }
+
+    #[tokio::test]
+    async fn quota_update_succeeds_for_unready_service_without_changing_its_workload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use kube::{Api, Client, client::Body};
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt;
+
+        let (mut claims, mut resource) = access_fixture()?;
+        claims.action = super::PROVIDER_RECONCILE_ACTION.into();
+        claims.issued_at = chrono::Utc::now().timestamp();
+        claims.not_before = claims.issued_at - 5;
+        claims.expires_at = claims.issued_at + 60;
+        resource.metadata.resource_version = Some("42".into());
+        let private_key = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEICKoEEWPLg2OazcyTWzBEw/mMPPXatNOUcEUWDHo2y0Y\n-----END PRIVATE KEY-----\n";
+        let public_key = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAcBpAFx4KtN1FYwvSN0XJMWSGiAJPjzetPXEiuMX2azg=\n-----END PUBLIC KEY-----\n";
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some("quota-test".into());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_ed_pem(private_key)?,
+        )?;
+        let authenticator = super::ProviderAuthenticator::from_public_keys_json(
+            "test",
+            "flash",
+            &json!({"quota-test": public_key}).to_string(),
+        )?;
+        let patches = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let server_patches = patches.clone();
+        let kube_resource = resource.clone();
+        let client = Client::new(
+            tower::service_fn(move |request: http::Request<Body>| {
+                let resource = kube_resource.clone();
+                let patches = server_patches.clone();
+                async move {
+                    if request.method() == http::Method::PATCH {
+                        let patch: Value =
+                            serde_json::from_slice(&request.into_body().collect_bytes().await?)?;
+                        patches
+                            .lock()
+                            .map_err(|_| "patch mutex poisoned")?
+                            .push(patch);
+                    } else {
+                        assert_eq!(request.method(), http::Method::GET);
+                    }
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        http::Response::builder()
+                            .status(200)
+                            .body(Body::from(serde_json::to_vec(&resource)?))?,
+                    )
+                }
+            }),
+            "test",
+        );
+        let app = super::app_router(Arc::new(super::AppState {
+            public_domain: Some("flash.example.org".into()),
+            backup_snapshot_class: String::new(),
+            client: client.clone(),
+            namespace: "test".into(),
+            services: Api::namespaced(client.clone(), "test"),
+            usage_records: Api::namespaced(client.clone(), "test"),
+            gpu_devices: Api::all(client.clone()),
+            pods: Api::namespaced(client, "test"),
+            authenticator,
+            exec_sessions: Arc::new(tokio::sync::Semaphore::new(0)),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }));
+        let request = json!({"generation":4, "name":"test", "spec":resource.spec.workload,
+            "quota_only":true, "policy":{"max_weekly_cpu_millicore_seconds":100,
+            "max_weekly_memory_mib_seconds":200,"max_weekly_gpu_seconds":300}});
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/internal/v1/service-instances/{}",
+                        claims.service_instance_id
+                    ))
+                    .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&request)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), http::StatusCode::ACCEPTED);
+        let body: Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 65_536).await?)?;
+        assert_eq!(body["status"]["phase"], "provisioning");
+        {
+            let patches = patches.lock().map_err(|_| "patch mutex poisoned")?;
+            assert_eq!(patches.len(), 1);
+            assert_eq!(patches[0]["metadata"]["resourceVersion"], "42");
+            assert_eq!(
+                patches[0]["spec"]["policy"]["max_weekly_cpu_millicore_seconds"],
+                100
+            );
+            assert!(patches[0]["spec"].get("workload").is_none());
+            assert!(patches[0]["spec"].get("desired_generation").is_none());
+            assert!(patches[0]["spec"]["policy"]["member"].is_null());
+        }
+        let mut changed_workload = request.clone();
+        changed_workload["spec"]["cpu_millis"] = json!(750);
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/internal/v1/service-instances/{}",
+                        claims.service_instance_id
+                    ))
+                    .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(
+                        &changed_workload,
+                    )?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), http::StatusCode::CONFLICT);
+        assert_eq!(patches.lock().map_err(|_| "patch mutex poisoned")?.len(), 1);
+
+        let mut regular = request;
+        regular["quota_only"] = json!(false);
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/internal/v1/service-instances/{}",
+                        claims.service_instance_id
+                    ))
+                    .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&regular)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
     }
 
     #[tokio::test]
