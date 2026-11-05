@@ -124,7 +124,8 @@ pub async fn put(
         .await
         .map_err(|_| DestinationError::StorageUnavailable)?
         && (!labels_match(existing.metadata.labels.as_ref(), organization, id)
-            || existing.data["spec"]["backupTargetURL"] != desired.target["spec"]["backupTargetURL"]
+            || existing.data["spec"]["backupTargetURL"]
+                != desired.target["spec"]["backupTargetURL"]
             || existing.data["spec"]["credentialSecret"] != name)
     {
         return Err(DestinationError::Conflict);

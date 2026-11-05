@@ -698,8 +698,9 @@ async fn release_target_lock(
     client: Client,
     namespace: &str,
     backup: &FlashBackup,
+    enabled: bool,
 ) -> Result<(), BackupError> {
-    if !destinations_enabled() {
+    if !enabled {
         return Ok(());
     }
     // A completed backup must remain usable after its source service/PVC has
@@ -726,8 +727,9 @@ async fn acquire_target_lock(
     client: Client,
     namespace: &str,
     backup: &FlashBackup,
+    enabled: bool,
 ) -> Result<bool, BackupError> {
-    if !destinations_enabled() {
+    if !enabled {
         if backup.spec.destination_id.is_some() {
             return Err(BackupError::Unavailable);
         }
@@ -845,7 +847,7 @@ async fn reconcile(
             }
             return Ok(());
         }
-        release_target_lock(client.clone(), namespace, &backup).await?;
+        release_target_lock(client.clone(), namespace, &backup, destinations_enabled()).await?;
         let remaining: Vec<_> = backup
             .finalizers()
             .iter()
@@ -867,7 +869,7 @@ async fn reconcile(
         && backup.status.as_ref().is_some_and(|s| s.phase == "ready");
     if !completed_missing
         && !already_ready
-        && !acquire_target_lock(client.clone(), namespace, &backup).await?
+        && !acquire_target_lock(client.clone(), namespace, &backup, destinations_enabled()).await?
     {
         let expired = backup
             .metadata
@@ -965,7 +967,7 @@ async fn reconcile(
     )
     .await?;
     if phase == "ready" {
-        release_target_lock(client, namespace, &backup).await?;
+        release_target_lock(client, namespace, &backup, destinations_enabled()).await?;
     }
     Ok(())
 }
@@ -1096,6 +1098,166 @@ mod tests {
                 assert!(matches!(result, Err(BackupError::Conflict(_))));
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn destination_switch_is_serialized_and_stale_release_cannot_redirect_backup()
+    -> anyhow::Result<()> {
+        use kube::client::Body;
+        use std::sync::{Arc, Mutex};
+
+        let claims = test_claims()?;
+        let first_id = Uuid::from_u128(11);
+        let second_id = Uuid::from_u128(12);
+        let first_destination = Uuid::from_u128(21);
+        let second_destination = Uuid::from_u128(22);
+        let make_backup = |id, destination_id| {
+            FlashBackup::new(
+                &backup_name(id),
+                FlashBackupSpec {
+                    id,
+                    name: "test".into(),
+                    organization_id: claims.organization_id,
+                    project_id: claims.project_id,
+                    service_instance_id: claims.service_instance_id,
+                    source_pvc: "home".into(),
+                    source_pvc_uid: "source-uid".into(),
+                    volume_size_bytes: 1024,
+                    snapshot_class: "test".into(),
+                    destination_id,
+                },
+            )
+        };
+        let first = make_backup(first_id, Some(first_destination));
+        let second = make_backup(second_id, Some(second_destination));
+        let state = Arc::new(Mutex::new(json!({"ready":false,"volume":{
+            "apiVersion":"longhorn.io/v1beta2","kind":"Volume","metadata":{"name":"volume","resourceVersion":"1","annotations":{}},
+            "spec":{"backupTargetName":"default"}}})));
+        let server_state = Arc::clone(&state);
+        let first_value = serde_json::to_value(&first)?;
+        let first_name = backup_name(first_id);
+        let org = claims.organization_id;
+        let client = Client::new(
+            tower::service_fn(move |request: http::Request<Body>| {
+                let state = Arc::clone(&server_state);
+                let first_value = first_value.clone();
+                let first_name = first_name.clone();
+                async move {
+                    let path = request.uri().path().to_owned();
+                    let method = request.method().clone();
+                    let body = request.into_body().collect_bytes().await?;
+                    let mut state = state
+                        .lock()
+                        .map_err(|_| std::io::Error::other("poisoned fixture"))?;
+                    let ready = state["ready"] == true;
+                    let mut code = 200;
+                    let response = if path.ends_with("/persistentvolumeclaims/home") {
+                        json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"home","uid":"source-uid"},"spec":{"volumeName":"pv"}})
+                    } else if path.ends_with("/persistentvolumes/pv") {
+                        json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"pv"},"spec":{"claimRef":{"uid":"source-uid"},"csi":{"driver":"driver.longhorn.io","volumeHandle":"volume"}}})
+                    } else if path.ends_with("/volumes/volume") {
+                        if method == http::Method::PATCH {
+                            let patch: Value = serde_json::from_slice(&body)?;
+                            if patch["metadata"]["resourceVersion"]
+                                != state["volume"]["metadata"]["resourceVersion"]
+                            {
+                                code = 409;
+                                json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Conflict","code":409})
+                            } else {
+                                let next = state["volume"]["metadata"]["resourceVersion"]
+                                    .as_str()
+                                    .unwrap_or("0")
+                                    .parse::<u64>()?
+                                    + 1;
+                                state["volume"]["metadata"]["resourceVersion"] =
+                                    json!(next.to_string());
+                                let new_lock = &patch["metadata"]["annotations"][TARGET_LOCK];
+                                if new_lock.is_null() {
+                                    if let Some(annotations) =
+                                        state["volume"]["metadata"]["annotations"].as_object_mut()
+                                    {
+                                        annotations.remove(TARGET_LOCK);
+                                    }
+                                } else {
+                                    state["volume"]["metadata"]["annotations"][TARGET_LOCK] =
+                                        new_lock.clone();
+                                }
+                                if !patch["spec"]["backupTargetName"].is_null() {
+                                    state["volume"]["spec"]["backupTargetName"] =
+                                        patch["spec"]["backupTargetName"].clone();
+                                }
+                                state["volume"].clone()
+                            }
+                        } else {
+                            state["volume"].clone()
+                        }
+                    } else if path.ends_with("/volumesnapshots") {
+                        json!({"apiVersion":"snapshot.storage.k8s.io/v1","kind":"VolumeSnapshotList","metadata":{},"items":[]})
+                    } else if path.ends_with(&format!("/volumesnapshots/{first_name}")) {
+                        json!({"apiVersion":"snapshot.storage.k8s.io/v1","kind":"VolumeSnapshot","metadata":{"name":first_name},"status":{"readyToUse":ready}})
+                    } else if path.ends_with(&format!("/flashbackups/{first_name}")) {
+                        let mut value = first_value;
+                        value["status"] = json!({"phase":if ready {"ready"} else {"creating"}});
+                        value
+                    } else if path.contains("/backuptargets/hc-backup-") {
+                        let name = path.rsplit('/').next().unwrap_or_default();
+                        let destination =
+                            if name == crate::backup_destinations::target_name(first_destination) {
+                                first_destination
+                            } else {
+                                second_destination
+                            };
+                        json!({"apiVersion":"longhorn.io/v1beta2","kind":"BackupTarget","metadata":{"name":name,"labels":{
+                        "flash.heterocloud.io/organization":org.to_string(),"flash.heterocloud.io/backup-destination":destination.to_string()}},"status":{"available":true}})
+                    } else {
+                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                            std::io::Error::other(format!(
+                                "unexpected fixture request {method} {path}"
+                            )),
+                        ));
+                    };
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                        http::Response::builder()
+                            .status(code)
+                            .body(Body::from(serde_json::to_vec(&response)?))?,
+                    )
+                }
+            }),
+            "test",
+        );
+        assert!(acquire_target_lock(client.clone(), "test", &first, true).await?);
+        assert!(!acquire_target_lock(client.clone(), "test", &second, true).await?);
+        {
+            state
+                .lock()
+                .map_err(|_| std::io::Error::other("poisoned fixture"))?["ready"] = json!(true);
+        }
+        assert!(acquire_target_lock(client.clone(), "test", &second, true).await?);
+        release_target_lock(client.clone(), "test", &first, true).await?;
+        {
+            let value = state
+                .lock()
+                .map_err(|_| std::io::Error::other("poisoned fixture"))?;
+            assert_eq!(
+                value["volume"]["spec"]["backupTargetName"],
+                crate::backup_destinations::target_name(second_destination)
+            );
+            assert_eq!(
+                value["volume"]["metadata"]["annotations"][TARGET_LOCK],
+                second_id.to_string()
+            );
+        }
+        release_target_lock(client.clone(), "test", &second, true).await?;
+        let value = state
+            .lock()
+            .map_err(|_| std::io::Error::other("poisoned fixture"))?;
+        assert_eq!(value["volume"]["spec"]["backupTargetName"], "default");
+        assert!(
+            value["volume"]["metadata"]["annotations"]
+                .get(TARGET_LOCK)
+                .is_none()
+        );
         Ok(())
     }
     #[test]

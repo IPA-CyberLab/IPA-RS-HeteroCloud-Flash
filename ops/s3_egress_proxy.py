@@ -11,6 +11,8 @@ import hashlib
 import hmac
 import http.server
 import ipaddress
+import json
+import os
 from pathlib import Path
 import re
 import select
@@ -51,13 +53,14 @@ def token_for(key, identity, host, port):
     return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 
-def public_ip(value):
+def public_ip(value, blocked_networks=()):
     try:
         address = ipaddress.ip_address(value)
         if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
             address = address.ipv4_mapped
         return address.is_global and not any((address.is_multicast, address.is_unspecified,
-                                              address.is_loopback, address.is_link_local, address.is_reserved))
+                                              address.is_loopback, address.is_link_local, address.is_reserved)) and not any(
+            address.version == network.version and address in network for network in blocked_networks)
     except ValueError:
         return False
 
@@ -100,7 +103,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not separator or not hmac.compare_digest(provided, expected):
                     raise ValueError('invalid credential')
                 addresses = self.server.resolver(host, port)
-                if not addresses or any(not public_ip(address) for address in addresses):
+                if not addresses or any(not public_ip(address, self.server.blocked_networks) for address in addresses):
                     raise ValueError('destination is not public')
             except (ValueError, UnicodeError, OSError):
                 self.send_error(403)
@@ -143,10 +146,11 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, key, resolver=system_resolver, connector=system_connector,
-                 max_connections=32, idle_timeout=60):
+                 max_connections=32, idle_timeout=60, blocked_networks=()):
         if len(key) < 32 or max_connections < 1:
             raise ValueError('invalid proxy server configuration')
         self.key, self.resolver, self.connector = key, resolver, connector
+        self.blocked_networks = tuple(ipaddress.ip_network(network, strict=True) for network in blocked_networks)
         self.slots, self.idle_timeout = threading.BoundedSemaphore(max_connections), idle_timeout
         super().__init__(address, Handler)
 
@@ -158,7 +162,10 @@ def main():
     parser.add_argument('--port', type=int, default=8080)
     args = parser.parse_args()
     key = args.key_file.read_bytes()
-    with Server((args.listen, args.port), key) as server:
+    blocked = json.loads(os.environ.get('FLASH_BACKUP_S3_DENY_CIDRS', '[]'))
+    if not isinstance(blocked, list) or not all(isinstance(network, str) for network in blocked):
+        raise ValueError('invalid protected networks')
+    with Server((args.listen, args.port), key, blocked_networks=blocked) as server:
         server.serve_forever(poll_interval=.5)
 
 

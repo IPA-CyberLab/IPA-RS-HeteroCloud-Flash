@@ -32,6 +32,9 @@ spec:
           image: {{ include "flash.image" . }}
           command: ["python3", "-B", "/usr/local/lib/flash-ops/s3_egress_proxy.py"]
           args: ["--key-file", "/var/run/flash-backup-s3-proxy/hmac-key", "--port", {{ .Values.backups.destinations.proxyPort | quote }}]
+          env:
+            - name: FLASH_BACKUP_S3_DENY_CIDRS
+              value: {{ concat .Values.networkPolicy.vpcGuardCidrs .Values.networkPolicy.additionalProtectedCidrs | toJson | quote }}
           ports:
             - name: proxy
               containerPort: {{ .Values.backups.destinations.proxyPort }}
@@ -97,10 +100,33 @@ spec:
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
-            except: ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"]
+            except:
+              - "0.0.0.0/8"
+              - "10.0.0.0/8"
+              - "100.64.0.0/10"
+              - "127.0.0.0/8"
+              - "169.254.0.0/16"
+              - "172.16.0.0/12"
+              - "192.168.0.0/16"
+              - "224.0.0.0/4"
+              - "240.0.0.0/4"
+              {{- range concat .Values.networkPolicy.vpcGuardCidrs .Values.networkPolicy.additionalProtectedCidrs }}
+              {{- if not (contains ":" .) }}
+              - {{ . | quote }}
+              {{- end }}
+              {{- end }}
         - ipBlock:
             cidr: ::/0
-            except: ["::1/128", "fc00::/7", "fe80::/10", "ff00::/8"]
+            except:
+              - "::1/128"
+              - "fc00::/7"
+              - "fe80::/10"
+              - "ff00::/8"
+              {{- range concat .Values.networkPolicy.vpcGuardCidrs .Values.networkPolicy.additionalProtectedCidrs }}
+              {{- if contains ":" . }}
+              - {{ . | quote }}
+              {{- end }}
+              {{- end }}
       ports:
         - protocol: TCP
     {{- range .Values.networkPolicy.dnsCidrs }}

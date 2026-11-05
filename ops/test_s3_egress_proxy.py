@@ -1,4 +1,5 @@
 import base64
+import ipaddress
 import socket
 import socketserver
 import threading
@@ -87,6 +88,13 @@ class ProxyTests(unittest.TestCase):
                         '224.0.0.1', '::1', '::ffff:127.0.0.1', 'fc00::1'):
             with self.subTest(address=address): self.assertFalse(proxy.public_ip(address))
         self.assertTrue(proxy.public_ip('1.1.1.1'))
+
+    def test_public_cluster_addresses_are_blocked_after_dns_resolution(self):
+        self.server.blocked_networks = (ipaddress.ip_network('93.184.216.0/24'),)
+        client, status = self.request('storage.example:443', self.credential('storage.example'))
+        client.close()
+        self.assertIn(b' 403 ', status)
+        self.assertEqual(self.connections, [])
 
     def test_authority_rejects_credentials_and_missing_ports(self):
         for value in ('localhost:443', 'foo.localhost:443', 'user@host:443', 'host',
