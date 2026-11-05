@@ -34,6 +34,8 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/flash-controller"]
           env:
+            - name: FLASH_BACKUP_DESTINATIONS_ENABLED
+              value: {{ .Values.backups.destinations.enabled | quote }}
             {{- if .Values.capacity.enabled }}
             - name: FLASH_CAPACITY_ENDPOINT
               value: {{ printf "https://%s-capacity.%s.svc/" (include "flash.fullname" .) .Release.Namespace | quote }}

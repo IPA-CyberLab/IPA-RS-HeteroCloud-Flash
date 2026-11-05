@@ -23,6 +23,10 @@ spec:
         properties:
           spec:
             properties:
+              destination_id:
+                format: uuid
+                nullable: true
+                type: string
               id:
                 format: uuid
                 type: string

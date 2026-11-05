@@ -27,6 +27,55 @@ class MemoryS3:
 
 
 class OffsiteTests(unittest.TestCase):
+    def test_s3_prefix_and_temporary_credentials_are_scoped_and_signed(self):
+        class Response:
+            def __init__(self, url, body): self.url, self.body = url, body
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def geturl(self): return self.url
+            def read(self, _): return self.body
+        class Opener:
+            def __init__(self): self.requests, self.body = [], b''
+            def open(self, request, timeout):
+                self.requests.append(request)
+                return Response(request.full_url, self.body)
+        opener = Opener()
+        client = o.S3({'endpoint': 'https://s3.example.test:9443', 'bucket': 'bucket-one',
+                       'access_key': 'access', 'secret_key': 'secret', 'region': 'us-east-1',
+                       'prefix': 'tenant/backups', 'session_token': 'temporary-token',
+                       'addressing_style': 'virtual'}, opener)
+        client.request('PUT', 'objects/abcdef', b'content')
+        request = opener.requests[-1]
+        self.assertEqual(request.full_url, 'https://bucket-one.s3.example.test:9443/tenant/backups/objects/abcdef')
+        self.assertEqual(request.get_header('X-amz-security-token'), 'temporary-token')
+        self.assertIn('x-amz-security-token', request.get_header('Authorization').split('SignedHeaders=')[1].split(',')[0])
+        opener.body = (b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                       b'<Contents><Key>tenant/backups/objects/abcdef</Key><Size>7</Size></Contents>'
+                       b'<IsTruncated>false</IsTruncated></ListBucketResult>')
+        self.assertEqual([x['key'] for x in client.listing('objects/')], ['objects/abcdef'])
+        self.assertIn('prefix=tenant%2Fbackups%2Fobjects%2F', opener.requests[-1].full_url)
+        opener.body = opener.body.replace(b'tenant/backups/objects/abcdef', b'other/objects/abcdef')
+        with self.assertRaisesRegex(RuntimeError, 'outside'):
+            list(client.listing('objects/'))
+
+    def test_unsafe_prefix_or_key_cannot_escape_a_destination(self):
+        base = {'endpoint': 'https://s3.example.test', 'bucket': 'bucket-one',
+                'access_key': 'access', 'secret_key': 'secret'}
+        for prefix in ('/escape', 'safe/../escape', 'safe/./escape', 'safe\nother'):
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                o.S3(dict(base, prefix=prefix))
+        client = o.S3(dict(base, prefix='tenant/backup'))
+        for key in ('/escape', '../escape', 'objects/../escape', 'bad\nkey'):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                client.request('GET', key)
+
+    def test_external_s3_requires_https_and_no_url_credentials(self):
+        base = {'bucket': 'bucket-one', 'access_key': 'access', 'secret_key': 'secret'}
+        for endpoint in ('http://s3.example.test', 'https://user:password@s3.example.test',
+                         'https:///missing-host', 'https://s3.example.test/path'):
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                o.S3(dict(base, endpoint=endpoint))
+
     def test_real_source_deletion_and_mutation_do_not_change_a_committed_generation(self):
         source=MemoryS3({"backupstore/volume/backup.cfg":b"original snapshot metadata","backupstore/blocks/ab":b"original encrypted disk block"})
         saved=copy.deepcopy(source.objects);destination=MemoryS3()

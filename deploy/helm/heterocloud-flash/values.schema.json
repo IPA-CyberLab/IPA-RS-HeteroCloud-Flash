@@ -27,6 +27,17 @@
           "maxLength": 63,
           "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
         },
+        "destinations": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "proxySecret": {"type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"},
+            "proxySecretKey": {"type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[A-Za-z0-9._-]+$"},
+            "proxyReplicas": {"type": "integer", "minimum": 1, "maximum": 5},
+            "proxyPort": {"type": "integer", "minimum": 1024, "maximum": 65535}
+          }
+        },
         "verification": {
           "type": "object",
           "additionalProperties": false,

@@ -32,4 +32,6 @@ jobs:
           --set backups.snapshotClass=flash-disk-backup
           --set backups.verification.enabled=true
           --set backups.offsite.enabled=true
+          --set backups.destinations.enabled=true
+          --set persistence.storageClass=longhorn-static
           > /tmp/flash-operations.yaml

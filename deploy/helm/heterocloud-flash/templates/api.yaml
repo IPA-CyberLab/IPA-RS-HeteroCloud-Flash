@@ -38,6 +38,18 @@ spec:
             - name: http
               containerPort: {{ .Values.api.port }}
           env:
+            - name: FLASH_BACKUP_DESTINATIONS_ENABLED
+              value: {{ .Values.backups.destinations.enabled | quote }}
+            {{- if .Values.backups.destinations.enabled }}
+            - name: FLASH_BACKUP_S3_PROXY_KEY_FILE
+              value: /var/run/flash-backup-s3-proxy/hmac-key
+            - name: FLASH_BACKUP_S3_PROXY_URL
+              value: {{ printf "http://%s-backup-s3-proxy.%s.svc.cluster.local:%v" (include "flash.fullname" .) .Release.Namespace .Values.backups.destinations.proxyPort | quote }}
+            - name: FLASH_BACKUP_RESTORE_STORAGE_CLASS
+              value: {{ .Values.persistence.storageClass | quote }}
+            - name: FLASH_BACKUP_VERIFY_STORAGE_CLASS
+              value: {{ .Values.backups.verification.storageClass | quote }}
+            {{- end }}
             - name: FLASH_BACKUP_STORAGE_NAMESPACE
               value: {{ .Values.backups.storageNamespace | quote }}
             - name: FLASH_BACKUP_SNAPSHOT_CLASS
@@ -73,6 +85,22 @@ spec:
             {{- include "flash.containerSecurityContext" . | nindent 12 }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
+          {{- if .Values.backups.destinations.enabled }}
+          volumeMounts:
+            - name: backup-s3-proxy-key
+              mountPath: /var/run/flash-backup-s3-proxy
+              readOnly: true
+          {{- end }}
+      {{- if .Values.backups.destinations.enabled }}
+      volumes:
+        - name: backup-s3-proxy-key
+          secret:
+            secretName: {{ .Values.backups.destinations.proxySecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.backups.destinations.proxySecretKey | quote }}
+                path: hmac-key
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

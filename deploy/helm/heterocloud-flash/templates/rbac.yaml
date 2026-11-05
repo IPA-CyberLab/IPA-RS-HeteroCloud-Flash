@@ -101,6 +101,11 @@ rules:
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotclasses"]
     verbs: ["get"]
+  {{- if .Values.backups.destinations.enabled }}
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "create", "patch"]
+  {{- end }}
   - apiGroups: ["flash.heterocloud.io"]
     resources: ["flashgpudevices"]
     verbs: ["get", "list", "watch", "update", "patch"]
@@ -133,7 +138,15 @@ metadata:
 rules:
   - apiGroups: ["longhorn.io"]
     resources: ["volumes"]
-    verbs: ["get"]
+    verbs: ["get"{{ if .Values.backups.destinations.enabled }}, "patch"{{ end }}]
+  {{- if .Values.backups.destinations.enabled }}
+  - apiGroups: ["longhorn.io"]
+    resources: ["backuptargets"]
+    verbs: ["get", "create", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

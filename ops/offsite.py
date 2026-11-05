@@ -42,24 +42,53 @@ class S3:
     def __init__(self, config, opener=None):
         self.config = config
         origin = urllib.parse.urlsplit(config["endpoint"])
-        if origin.username or origin.password or origin.query or origin.fragment or origin.path not in ("","/"):
+        if (origin.scheme not in ("http", "https") or not origin.hostname or origin.username or origin.password
+                or origin.query or origin.fragment or origin.path not in ("","/")):
             raise ValueError("S3 endpoint must be an origin without credentials or a path")
         if origin.scheme != "https" and not config.get("private_source"):
             raise ValueError("off-cluster S3 transport requires HTTPS")
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", config["bucket"]):
             raise ValueError("invalid private bucket name")
+        prefix = config.get("prefix", "")
+        if (not isinstance(prefix, str) or len(prefix.encode()) > 1024 or prefix.startswith("/")
+                or any(part in (".", "..") for part in prefix.split("/"))
+                or any(ord(char) < 32 or ord(char) == 127 for char in prefix)):
+            raise ValueError("invalid S3 object prefix")
+        self.prefix = prefix.rstrip("/") + "/" if prefix else ""
+        style = config.get("addressing_style", "path")
+        if style not in ("path", "virtual"):
+            raise ValueError("invalid S3 addressing style")
+        if style == "virtual":
+            if ":" in origin.hostname:
+                raise ValueError("virtual-hosted S3 requires a DNS endpoint")
+            host = config["bucket"] + "." + origin.hostname
+            if origin.port is not None:
+                host += ":" + str(origin.port)
+            origin = origin._replace(netloc=host)
+        self.style = style
+        session_token = config.get("session_token")
+        if session_token is not None and (not isinstance(session_token, str) or not session_token
+                                          or len(session_token) > 8192 or "\r" in session_token or "\n" in session_token):
+            raise ValueError("invalid temporary S3 session token")
         self.origin = origin
         self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def request(self, method, key="", data=b"", query=None, optional=False):
         query = query or {}
+        if (not isinstance(key, str) or key.startswith("/") or any(part in (".", "..") for part in key.split("/"))
+                or any(ord(char) < 32 or ord(char) == 127 for char in key)):
+            raise ValueError("invalid S3 object key")
         now = dt.datetime.now(dt.timezone.utc)
         date, timestamp = now.strftime("%Y%m%d"), now.strftime("%Y%m%dT%H%M%SZ")
-        path = "/"+self.config["bucket"]+("/"+urllib.parse.quote(key,safe="/-_.~") if key else "")
+        physical_key = self.prefix + key if key else ""
+        base = "/" + self.config["bucket"] if self.style == "path" else ""
+        path = base + ("/" + urllib.parse.quote(physical_key, safe="/-_.~") if physical_key else ("/" if not base else ""))
         qs = canonical_query(query)
         scope = date+"/"+self.config.get("region","auto")+"/s3/aws4_request"
         payload_hash = hashlib.sha256(data).hexdigest()
         headers = {"host":self.origin.netloc, "x-amz-content-sha256":payload_hash, "x-amz-date":timestamp}
+        if self.config.get("session_token") is not None:
+            headers["x-amz-security-token"] = self.config["session_token"]
         header_names = ";".join(sorted(headers))
         canonical_headers = "".join(k+":"+headers[k]+"\n" for k in sorted(headers))
         canonical = "\n".join([method,path,qs,canonical_headers,header_names,payload_hash])
@@ -88,12 +117,15 @@ class S3:
     def listing(self,prefix=""):
         token=None
         while True:
-            query={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+            query={"list-type":"2","prefix":self.prefix + prefix,"max-keys":"1000"}
             if token:query["continuation-token"]=token
             root=ET.fromstring(self.request("GET",query=query))
             ns={"s":"http://s3.amazonaws.com/doc/2006-03-01/"}
             for item in root.findall("s:Contents",ns):
-                yield {"key":item.findtext("s:Key",namespaces=ns),"size":int(item.findtext("s:Size",namespaces=ns)),
+                name = item.findtext("s:Key",namespaces=ns)
+                if not isinstance(name, str) or not name.startswith(self.prefix + prefix):
+                    raise RuntimeError("S3 listing returned an object outside the requested prefix")
+                yield {"key":name[len(self.prefix):],"size":int(item.findtext("s:Size",namespaces=ns)),
                        "modified":item.findtext("s:LastModified",namespaces=ns)}
             if root.findtext("s:IsTruncated",namespaces=ns)!="true":break
             token=root.findtext("s:NextContinuationToken",namespaces=ns)

@@ -51,6 +51,21 @@ class VerificationSecurity(unittest.TestCase):
         self.assertEqual(deletes,[(job,{"apiVersion":"v1","kind":"DeleteOptions","propagationPolicy":"Foreground","preconditions":{"uid":"job-uid"}})])
         self.assertFalse(any(method=="POST" for _,method,_ in kube.calls))
 
+    def test_restore_verification_uses_the_backup_original_destination(self):
+        backup,kube,_=self.setup_fixture()
+        backup['spec']['destination_id']='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        _,pvc,_=d.names(backup)
+        original=kube.call
+        def call(path,method='GET',value=None):
+            if path==pvc and method=='GET':
+                raise urllib.error.HTTPError(path,404,'missing',None,None)
+            return original(path,method,value)
+        kube.call=call
+        d.step(kube,backup)
+        created=next(value for _,method,value in kube.calls if method=='POST')
+        self.assertEqual(created['spec']['storageClassName'],'hc-verify-aaaaaaaabbbb4ccc8dddeeeeeeeeeeee')
+        self.assertEqual(created['spec']['dataSource']['name'],'backup-test')
+
     def test_timeout_retains_volume_identities_until_cleanup_is_verified(self):
         backup,kube,_=self.setup_fixture()
         state=json.loads(backup["metadata"]["annotations"][d.RESULT]);state["started_at"]=(dt.datetime.now(dt.timezone.utc)-dt.timedelta(hours=1)).isoformat()

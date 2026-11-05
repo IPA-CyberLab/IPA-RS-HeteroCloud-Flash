@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backup_destinations;
 pub mod backups;
 pub mod capacity;
 pub mod crd;

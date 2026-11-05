@@ -113,6 +113,12 @@ workloadIdentity:
 backups:
   storageNamespace: longhorn-system
   snapshotClass: ""
+  destinations:
+    enabled: false
+    proxySecret: flash-backup-s3-proxy
+    proxySecretKey: hmac-key
+    proxyReplicas: 2
+    proxyPort: 8088
   verification:
     enabled: false
     replicaCount: 2

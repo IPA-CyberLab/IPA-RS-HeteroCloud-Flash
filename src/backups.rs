@@ -19,6 +19,7 @@ use crate::{auth::ProviderClaims, crd::FlashService};
 
 const FINALIZER: &str = "flash.heterocloud.io/backup-protection";
 const MANAGER: &str = "heterocloud-flash-backup";
+const TARGET_LOCK: &str = "flash.heterocloud.io/backup-destination-lock";
 
 pub fn validated_crd() -> anyhow::Result<Value> {
     use kube::CustomResourceExt;
@@ -37,6 +38,8 @@ pub struct BackupRequest {
     pub name: String,
     pub source_pvc_uid: String,
     pub volume_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, kube::CustomResource, Deserialize, JsonSchema, Serialize)]
@@ -59,6 +62,8 @@ pub struct FlashBackupSpec {
     pub source_pvc_uid: String,
     pub volume_size_bytes: u64,
     pub snapshot_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -76,6 +81,8 @@ pub struct FlashBackupStatus {
 pub enum BackupError {
     #[error("backup storage is not configured")]
     Disabled,
+    #[error("backup destination is temporarily unavailable")]
+    Unavailable,
     #[error("backup or persistent disk was not found")]
     NotFound,
     #[error("backup scope does not match")]
@@ -114,7 +121,7 @@ pub fn view(backup: &FlashBackup) -> Value {
     json!({"id":backup.spec.id,"name":backup.spec.name,
         "phase":if backup.metadata.deletion_timestamp.is_some() {"deleting"} else if status.phase.is_empty() {"pending"} else {&status.phase},
         "message":status.message,"completed_at":status.completed_at,
-        "volume_size_bytes":backup.spec.volume_size_bytes,"restore_verification":verification})
+        "volume_size_bytes":backup.spec.volume_size_bytes,"destination_id":backup.spec.destination_id,"restore_verification":verification})
 }
 
 pub async fn request_verification(
@@ -305,6 +312,7 @@ pub async fn create(
         if existing.spec.name != request.name
             || existing.spec.source_pvc_uid != request.source_pvc_uid
             || existing.spec.volume_size_bytes != request.volume_size_bytes
+            || existing.spec.destination_id != request.destination_id
             || existing.metadata.deletion_timestamp.is_some()
         {
             return Err(BackupError::Conflict(
@@ -320,6 +328,27 @@ pub async fn create(
         return Err(BackupError::Conflict(
             "source persistent disk changed before backup",
         ));
+    }
+    if let Some(destination_id) = request.destination_id {
+        if std::env::var("FLASH_BACKUP_DESTINATIONS_ENABLED").as_deref() != Ok("true") {
+            return Err(BackupError::Unavailable);
+        }
+        let storage_namespace = std::env::var("FLASH_BACKUP_STORAGE_NAMESPACE")
+            .unwrap_or_else(|_| "longhorn-system".into());
+        let destination = crate::backup_destinations::get(
+            client.clone(),
+            &storage_namespace,
+            claims.organization_id,
+            destination_id,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::backup_destinations::DestinationError::Conflict => BackupError::Forbidden,
+            _ => BackupError::Unavailable,
+        })?;
+        if !destination.ready {
+            return Err(BackupError::Unavailable);
+        }
     }
     let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
         "snapshot.storage.k8s.io",
@@ -349,6 +378,7 @@ pub async fn create(
             source_pvc_uid: request.source_pvc_uid,
             volume_size_bytes: request.volume_size_bytes,
             snapshot_class: snapshot_class.to_owned(),
+            destination_id: request.destination_id,
         },
     );
     backup.metadata.finalizers = Some(vec![FINALIZER.to_owned()]);
@@ -376,6 +406,7 @@ pub async fn create(
                     name: backup.spec.name,
                     source_pvc_uid: backup.spec.source_pvc_uid,
                     volume_size_bytes: backup.spec.volume_size_bytes,
+                    destination_id: backup.spec.destination_id,
                 },
             ))
             .await
@@ -554,11 +585,32 @@ pub async fn ensure_restored_home(
     {
         return Err(BackupError::Conflict("backup is not ready for restoration"));
     }
+    let destination_class = if let Some(destination_id) = backup.spec.destination_id {
+        let storage_namespace = std::env::var("FLASH_BACKUP_STORAGE_NAMESPACE")
+            .unwrap_or_else(|_| "longhorn-system".into());
+        let destination = crate::backup_destinations::get(
+            client.clone(),
+            &storage_namespace,
+            backup.spec.organization_id,
+            destination_id,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::backup_destinations::DestinationError::Conflict => BackupError::Forbidden,
+            _ => BackupError::Unavailable,
+        })?;
+        if !destination.ready {
+            return Err(BackupError::Unavailable);
+        }
+        crate::backup_destinations::target_name(destination_id)
+    } else {
+        storage_class.to_owned()
+    };
     let mut claim: PersistentVolumeClaim = serde_json::from_value(json!({
         "apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":name,
             "ownerReferences":[flash.controller_owner_ref(&()).ok_or(BackupError::NotFound)?],
             "labels":{"flash.heterocloud.io/instance":flash.spec.service_instance_id,"flash.heterocloud.io/organization":flash.spec.organization_id}},
-        "spec":{"storageClassName":storage_class,"accessModes":["ReadWriteMany"],"volumeMode":"Filesystem",
+        "spec":{"storageClassName":destination_class,"accessModes":["ReadWriteMany"],"volumeMode":"Filesystem",
             "resources":{"requests":{"storage":backup.spec.volume_size_bytes.to_string()}},
             "dataSource":{"apiGroup":"snapshot.storage.k8s.io","kind":"VolumeSnapshot","name":backup_name(id)}}
     }))?;
@@ -589,6 +641,187 @@ async fn status(
     Ok(())
 }
 
+fn destinations_enabled() -> bool {
+    std::env::var("FLASH_BACKUP_DESTINATIONS_ENABLED").as_deref() == Ok("true")
+}
+
+fn longhorn_volumes(client: Client) -> Api<DynamicObject> {
+    let resource =
+        ApiResource::from_gvk(&GroupVersionKind::gvk("longhorn.io", "v1beta2", "Volume"));
+    let namespace = std::env::var("FLASH_BACKUP_STORAGE_NAMESPACE")
+        .unwrap_or_else(|_| "longhorn-system".into());
+    Api::namespaced_with(client, &namespace, &resource)
+}
+
+async fn backup_volume(
+    client: Client,
+    namespace: &str,
+    backup: &FlashBackup,
+) -> Result<Option<DynamicObject>, BackupError> {
+    let Some(pvc) = Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace)
+        .get_opt(&backup.spec.source_pvc)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if pvc.uid().as_deref() != Some(&backup.spec.source_pvc_uid) {
+        return Err(BackupError::Conflict("source disk identity changed"));
+    }
+    let volume_name = pvc
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.volume_name.as_deref())
+        .ok_or(BackupError::NotFound)?;
+    let pv = Api::<PersistentVolume>::all(client.clone())
+        .get(volume_name)
+        .await?;
+    let spec = pv.spec.as_ref().ok_or(BackupError::NotFound)?;
+    if spec
+        .claim_ref
+        .as_ref()
+        .and_then(|reference| reference.uid.as_deref())
+        != Some(backup.spec.source_pvc_uid.as_str())
+    {
+        return Err(BackupError::Conflict("persistent disk ownership changed"));
+    }
+    let csi = spec
+        .csi
+        .as_ref()
+        .filter(|csi| csi.driver == "driver.longhorn.io")
+        .ok_or(BackupError::Invalid(
+            "backup disk must use the configured storage driver",
+        ))?;
+    Ok(longhorn_volumes(client).get_opt(&csi.volume_handle).await?)
+}
+
+async fn release_target_lock(
+    client: Client,
+    namespace: &str,
+    backup: &FlashBackup,
+) -> Result<(), BackupError> {
+    if !destinations_enabled() {
+        return Ok(());
+    }
+    // A completed backup must remain usable after its source service/PVC has
+    // been deleted or replaced. There is then no old volume lock to release.
+    let volume = match backup_volume(client.clone(), namespace, backup).await {
+        Ok(Some(volume)) => volume,
+        Ok(None) | Err(BackupError::NotFound) | Err(BackupError::Conflict(_)) => return Ok(()),
+        Err(BackupError::Storage(kube::Error::Api(error))) if error.code == 404 => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if volume.annotations().get(TARGET_LOCK) != Some(&backup.spec.id.to_string()) {
+        return Ok(());
+    }
+    longhorn_volumes(client).patch(&volume.name_any(), &PatchParams::default(), &Patch::Merge(json!({
+        "metadata":{"resourceVersion":volume.resource_version(),"annotations":{(TARGET_LOCK):null}},
+        "spec":{"backupTargetName":"default"}
+    }))).await?;
+    Ok(())
+}
+
+/// Serialize backup destination changes at the source volume. A running CSI
+/// backup retains the lock until its snapshot is ready or fully deleted.
+async fn acquire_target_lock(
+    client: Client,
+    namespace: &str,
+    backup: &FlashBackup,
+) -> Result<bool, BackupError> {
+    if !destinations_enabled() {
+        if backup.spec.destination_id.is_some() {
+            return Err(BackupError::Unavailable);
+        }
+        // A rollback or partial rollout must not send an ordinary backup to a
+        // previously selected tenant bucket. Wait for explicit recovery.
+        let Some(volume) = backup_volume(client, namespace, backup).await? else {
+            return Err(BackupError::NotFound);
+        };
+        if volume.annotations().contains_key(TARGET_LOCK)
+            || volume.data["spec"]["backupTargetName"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty() && name != "default")
+        {
+            return Err(BackupError::Unavailable);
+        }
+        return Ok(true);
+    }
+    let Some(volume) = backup_volume(client.clone(), namespace, backup).await? else {
+        return Err(BackupError::NotFound);
+    };
+    let own_id = backup.spec.id.to_string();
+    let current = volume.annotations().get(TARGET_LOCK).cloned();
+    let desired_target = backup
+        .spec
+        .destination_id
+        .map(crate::backup_destinations::target_name)
+        .unwrap_or_else(|| "default".into());
+    if current.as_deref() == Some(own_id.as_str()) {
+        if volume.data["spec"]["backupTargetName"] != desired_target {
+            return Err(BackupError::Conflict(
+                "backup destination changed during transfer",
+            ));
+        }
+        return Ok(true);
+    }
+    let snapshots_api = snapshots(client.clone(), namespace);
+    if let Some(holder) = current {
+        let holder = Uuid::parse_str(&holder)
+            .map_err(|_| BackupError::Conflict("invalid backup destination lock"))?;
+        let other = Api::<FlashBackup>::namespaced(client.clone(), namespace)
+            .get_opt(&backup_name(holder))
+            .await?;
+        let other_snapshot = snapshots_api.get_opt(&backup_name(holder)).await?;
+        if other_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.data["status"]["readyToUse"] != true)
+            || other.as_ref().is_some_and(|item| {
+                item.status
+                    .as_ref()
+                    .is_none_or(|s| !matches!(s.phase.as_str(), "ready" | "error"))
+            })
+        {
+            return Ok(false);
+        }
+    }
+    // A legacy controller may already have created an unready snapshot before
+    // the destination feature was enabled. Do not redirect that transfer.
+    let all_snapshots = snapshots_api.list(&ListParams::default()).await?;
+    if all_snapshots.items.iter().any(|snapshot| {
+        snapshot.name_any() != backup.name_any()
+            && snapshot.data["spec"]["source"]["persistentVolumeClaimName"]
+                == backup.spec.source_pvc
+            && snapshot.data["status"]["readyToUse"] != true
+    }) {
+        return Ok(false);
+    }
+    if let Some(id) = backup.spec.destination_id {
+        let storage_namespace = std::env::var("FLASH_BACKUP_STORAGE_NAMESPACE")
+            .unwrap_or_else(|_| "longhorn-system".into());
+        let destination = crate::backup_destinations::get(
+            client.clone(),
+            &storage_namespace,
+            backup.spec.organization_id,
+            id,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::backup_destinations::DestinationError::Conflict => BackupError::Forbidden,
+            _ => BackupError::Unavailable,
+        })?;
+        if !destination.ready {
+            return Ok(false);
+        }
+    }
+    match longhorn_volumes(client).patch(&volume.name_any(), &PatchParams::default(), &Patch::Merge(json!({
+        "metadata":{"resourceVersion":volume.resource_version(),"annotations":{(TARGET_LOCK):own_id}},
+        "spec":{"backupTargetName":desired_target}
+    }))).await {
+        Ok(_) => Ok(true),
+        Err(kube::Error::Api(error)) if error.code == 409 => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn reconcile(
     client: Client,
     namespace: &str,
@@ -601,7 +834,7 @@ async fn reconcile(
         if offsite_locked(&backup) {
             return Ok(());
         }
-        if restore_pending(client, namespace, backup.spec.id).await? {
+        if restore_pending(client.clone(), namespace, backup.spec.id).await? {
             return Ok(());
         }
         if snapshots.get_opt(&name).await?.is_some() {
@@ -612,6 +845,7 @@ async fn reconcile(
             }
             return Ok(());
         }
+        release_target_lock(client.clone(), namespace, &backup).await?;
         let remaining: Vec<_> = backup
             .finalizers()
             .iter()
@@ -621,7 +855,42 @@ async fn reconcile(
         api.patch(&name,&PatchParams::default(),&Patch::Merge(json!({"metadata":{"resourceVersion":backup.resource_version(),"finalizers":remaining}}))).await?;
         return Ok(());
     }
-    let snapshot = if let Some(snapshot) = snapshots.get_opt(&name).await? {
+    let existing_snapshot = snapshots.get_opt(&name).await?;
+    let completed_missing = existing_snapshot.is_none()
+        && backup
+            .status
+            .as_ref()
+            .is_some_and(|s| matches!(s.phase.as_str(), "ready" | "error"));
+    let already_ready = existing_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.data["status"]["readyToUse"] == true)
+        && backup.status.as_ref().is_some_and(|s| s.phase == "ready");
+    if !completed_missing
+        && !already_ready
+        && !acquire_target_lock(client.clone(), namespace, &backup).await?
+    {
+        let expired = backup
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .is_some_and(|t| {
+                chrono::Utc::now()
+                    .timestamp()
+                    .saturating_sub(t.0.as_second())
+                    >= 1800
+            });
+        return status(
+            &api,
+            &backup,
+            FlashBackupStatus {
+                phase: if expired { "error" } else { "creating" }.into(),
+                message: expired.then(|| "backup_storage_error".into()),
+                completed_at: None,
+            },
+        )
+        .await;
+    }
+    let snapshot = if let Some(snapshot) = existing_snapshot {
         snapshot
     } else {
         // Never silently recreate a completed backup from a later source state.
@@ -641,7 +910,7 @@ async fn reconcile(
             )
             .await;
         }
-        let pvc = Api::<PersistentVolumeClaim>::namespaced(client, namespace)
+        let pvc = Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace)
             .get_opt(&backup.spec.source_pvc)
             .await?
             .ok_or(BackupError::NotFound)?;
@@ -694,7 +963,11 @@ async fn reconcile(
             },
         },
     )
-    .await
+    .await?;
+    if phase == "ready" {
+        release_target_lock(client, namespace, &backup).await?;
+    }
+    Ok(())
 }
 
 pub async fn run_controller(client: Client, namespace: String) -> anyhow::Result<()> {
@@ -756,6 +1029,7 @@ mod tests {
                 source_pvc_uid: "uid".into(),
                 volume_size_bytes: 1024,
                 snapshot_class: "backup".into(),
+                destination_id: None,
             },
         );
         check_scope(&backup, &claims)?;
@@ -838,6 +1112,7 @@ mod tests {
                 source_pvc_uid: "private-uid".into(),
                 volume_size_bytes: 1024,
                 snapshot_class: "private-class".into(),
+                destination_id: None,
             },
         );
         let rendered = view(&backup).to_string();

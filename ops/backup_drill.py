@@ -10,6 +10,7 @@ import json
 import os
 import time
 import urllib.error
+import uuid
 from capacity import Kube, NS, STORAGE_NS, SYSTEM_NS
 
 BASE = f"/apis/flash.heterocloud.io/v1alpha1/namespaces/{NS}/flashbackups"
@@ -141,8 +142,14 @@ def step(kube, backup):
     metadata = {"name": name, "namespace": NS, "labels": labels, "ownerReferences": [owner]}
     claim = get(kube, pvc_path)
     if claim is None:
+        destination = backup.get("spec", {}).get("destination_id")
+        storage_class = STORAGE_CLASS
+        if destination:
+            # The backup specification is immutable and was authorized by the
+            # provider. Never interpolate an unchecked name into a cluster API.
+            storage_class = "hc-verify-" + uuid.UUID(destination).hex
         kube.call(pvc_path.rsplit("/", 1)[0], "POST", {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": metadata,
-            "spec": {"storageClassName": STORAGE_CLASS, "accessModes": ["ReadWriteOnce"], "volumeMode": "Filesystem",
+            "spec": {"storageClassName": storage_class, "accessModes": ["ReadWriteOnce"], "volumeMode": "Filesystem",
                      "resources": {"requests": {"storage": str(backup["spec"]["volume_size_bytes"])}},
                      "dataSource": {"apiGroup": "snapshot.storage.k8s.io", "kind": "VolumeSnapshot", "name": backup["metadata"]["name"]}}})
         return

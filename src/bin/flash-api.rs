@@ -157,6 +157,10 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route("/internal/v1/gpus/access", put(update_gpu_access))
         .route("/internal/v1/usage", get(list_usage))
         .route(
+            "/internal/v1/organizations/{organization_id}/backup-destinations/{id}",
+            get(get_backup_destination).put(put_backup_destination),
+        )
+        .route(
             "/internal/v1/service-instances/{id}/backup-source",
             get(get_backup_source),
         )
@@ -206,10 +210,99 @@ fn backup_error(error: heterocloud_flash::backups::BackupError) -> ApiError {
         BackupError::Forbidden => ApiError::Forbidden,
         BackupError::Conflict(message) => ApiError::Conflict(message.into()),
         BackupError::Invalid(message) => ApiError::BadRequest(message.into()),
-        BackupError::Disabled | BackupError::Storage(_) | BackupError::Decode(_) => {
-            ApiError::NotReady
-        }
+        BackupError::Disabled
+        | BackupError::Unavailable
+        | BackupError::Storage(_)
+        | BackupError::Decode(_) => ApiError::NotReady,
     }
+}
+
+fn backup_destination_error(
+    error: heterocloud_flash::backup_destinations::DestinationError,
+) -> ApiError {
+    use heterocloud_flash::backup_destinations::DestinationError;
+    match error {
+        DestinationError::Invalid => ApiError::BadRequest("Invalid backup destination".into()),
+        DestinationError::Conflict => {
+            ApiError::Conflict("Backup destination ownership or immutable settings conflict".into())
+        }
+        DestinationError::ProxyUnavailable
+        | DestinationError::InvalidStorageClass
+        | DestinationError::StorageUnavailable => ApiError::NotReady,
+    }
+}
+
+fn backup_destination_scope(
+    claims: &ProviderClaims,
+    organization: Uuid,
+    id: Uuid,
+) -> Result<(), ApiError> {
+    if organization.is_nil()
+        || id.is_nil()
+        || claims.organization_id != organization
+        || claims.service_instance_id != id
+        || claims.generation != 1
+    {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+async fn put_backup_destination(
+    State(state): State<Arc<AppState>>,
+    Path((organization, id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(input): Json<heterocloud_flash::backup_destinations::S3Destination>,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, "flash.backups.destination.write")?;
+    backup_destination_scope(&claims, organization, id)?;
+    let key_file = env::var("FLASH_BACKUP_S3_PROXY_KEY_FILE").map_err(|_| ApiError::NotReady)?;
+    let key = std::fs::read(key_file).map_err(|_| ApiError::NotReady)?;
+    let proxy = env::var("FLASH_BACKUP_S3_PROXY_URL").map_err(|_| ApiError::NotReady)?;
+    let restore = env::var("FLASH_BACKUP_RESTORE_STORAGE_CLASS").map_err(|_| ApiError::NotReady)?;
+    let verification =
+        env::var("FLASH_BACKUP_VERIFY_STORAGE_CLASS").map_err(|_| ApiError::NotReady)?;
+    let namespace =
+        env::var("FLASH_BACKUP_STORAGE_NAMESPACE").unwrap_or_else(|_| "longhorn-system".into());
+    let result = heterocloud_flash::backup_destinations::put(
+        state.client.clone(),
+        organization,
+        id,
+        &input,
+        &proxy,
+        &key,
+        &namespace,
+        &restore,
+        &verification,
+    )
+    .await
+    .map_err(backup_destination_error)?;
+    Ok((StatusCode::ACCEPTED, Json(result)))
+}
+
+async fn get_backup_destination(
+    State(state): State<Arc<AppState>>,
+    Path((organization, id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<heterocloud_flash::backup_destinations::DestinationView>, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, "flash.backups.destination.get")?;
+    backup_destination_scope(&claims, organization, id)?;
+    let namespace =
+        env::var("FLASH_BACKUP_STORAGE_NAMESPACE").unwrap_or_else(|_| "longhorn-system".into());
+    Ok(Json(
+        heterocloud_flash::backup_destinations::get(
+            state.client.clone(),
+            &namespace,
+            organization,
+            id,
+        )
+        .await
+        .map_err(backup_destination_error)?,
+    ))
 }
 
 async fn verify_backup(
