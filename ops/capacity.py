@@ -6,6 +6,7 @@ A resourceVersion-fenced ledger serializes reservations across webhook replicas.
 The Kubernetes scheduler still enforces affinity, taints, and resource requests.
 """
 import base64
+import contextlib
 import copy
 import datetime as dt
 import decimal
@@ -35,6 +36,16 @@ LEDGER = "flash-capacity-reservations"
 
 class Unavailable(Exception):
     pass
+
+
+@contextlib.contextmanager
+def bounded_lock(lock):
+    if not lock.acquire(timeout=1):
+        raise Unavailable('capacity_busy')
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def quantity(value):
@@ -280,8 +291,16 @@ class Guard:
     def snapshot(self):
         # Controllers request usage concurrently for every service. Only one
         # refresh may retain API responses at a time; readers reuse the result.
-        with self.snapshot_lock:
+        with bounded_lock(self.snapshot_lock):
             return self._snapshot()
+
+    def usage_snapshot(self):
+        # Usage is observational and includes its original sample timestamp.
+        # Reuse a recent snapshot instead of making many callers occupy every
+        # admission slot while a single Kubernetes refresh is in progress.
+        if self.cache is not None and time.time() - self.cache_at < 20:
+            return self.cache
+        return self.snapshot()
 
     def _snapshot(self):
         now = time.time()
@@ -421,7 +440,7 @@ class Guard:
                 "desired_storage_replicas": replicas, "degraded_storage": allowed and len(selected) < replicas}
 
     def evaluate(self, kind, obj, identity, dry_run=False, replaces=None):
-        with self.lock:
+        with bounded_lock(self.lock):
             nodes, pods, summaries = self.snapshot()
             for _ in range(8):
                 path, ledger, records = self.ledger(pods, summaries)
@@ -559,7 +578,7 @@ def handler(guard):
                     self.send(200, {"allowed": result["allowed"], "reason": result.get("reason")})
                 elif route == "/usage":
                     sid = str(uuid.UUID(value["service_instance_id"]))
-                    _, _, summaries = guard.snapshot()
+                    _, _, summaries = guard.usage_snapshot()
                     volumes = [v for summary in summaries.values() for pod in summary.get("pods", [])
                                for v in pod.get("volume", []) if v.get("pvcRef", {}).get("namespace") == NS
                                and v.get("pvcRef", {}).get("name") == f"flash-{sid}-home"

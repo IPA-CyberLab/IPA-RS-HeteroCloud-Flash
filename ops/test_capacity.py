@@ -384,6 +384,30 @@ class ReservationTests(unittest.TestCase):
         self.assertEqual(list(summaries), ['worker'])
         self.assertEqual(len(kube.lookups), 1)
 
+    def test_usage_reuses_recent_snapshot_while_refresh_is_busy(self):
+        guard = c.Guard(FakeKube(), POLICY)
+        snapshot = ([node()], [], {'worker': summary()})
+        guard.cache, guard.cache_at = snapshot, time.time() - 10
+        guard.snapshot_lock.acquire()
+        try:
+            self.assertIs(guard.usage_snapshot(), snapshot)
+            guard.cache_at = time.time() - 21
+            with self.assertRaises(c.Unavailable):
+                guard.usage_snapshot()
+        finally:
+            guard.snapshot_lock.release()
+
+    def test_busy_admission_fails_closed_without_blocking_all_workers(self):
+        guard = c.Guard(FakeKube(), POLICY)
+        guard.lock.acquire()
+        try:
+            started = time.monotonic()
+            with self.assertRaises(c.Unavailable):
+                guard.evaluate('Pod', pod(), 'busy', True)
+            self.assertLess(time.monotonic() - started, 3)
+        finally:
+            guard.lock.release()
+
     def test_disk_shortage_is_not_hidden_by_another_nodes_cpu_shortage(self):
         cpu_node, disk_node = node('cpu-node'), node('disk-node')
         cpu_node['status']['allocatable']['cpu'] = '500m'
