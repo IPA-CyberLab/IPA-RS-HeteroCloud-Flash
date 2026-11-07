@@ -1280,7 +1280,9 @@ async fn get_logs(
     containers.sort_by(|left, right| left.name.cmp(&right.name));
     let (text, truncated) = if let Some(ref name) = query.pod {
         if !containers.iter().any(|container| container.name == *name) {
-            return Err(ApiError::Forbidden);
+            // A vanished or unrelated pod is indistinguishable to the caller.
+            // Keep the provider healthy signal separate from a stale selection.
+            return Err(ApiError::NotFound);
         }
         let params = LogParams {
             container: Some("workload".into()),
@@ -2285,7 +2287,7 @@ mod tests {
             format!("{uri}&pod=another-service-pod"),
         )
         .await?;
-        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
         assert_eq!(reads, 2);
 
         let (response, reads) = signed_status_request(
