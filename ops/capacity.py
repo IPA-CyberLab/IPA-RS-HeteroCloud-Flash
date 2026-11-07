@@ -490,7 +490,12 @@ class BoundedServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, *args, **kwargs):
         self.slots = threading.BoundedSemaphore(16)
+        self.last_poll = time.monotonic()
         super().__init__(*args, **kwargs)
+
+    def service_actions(self):
+        self.last_poll = time.monotonic()
+        super().service_actions()
 
     def handle_error(self, *_):
         print(json.dumps({"event": "capacity_client_request_failed"}), flush=True)
@@ -567,6 +572,19 @@ def handler(guard):
     return Handler
 
 
+def liveness_handler(server):
+    """Keep liveness independent of admission saturation, but detect a stuck listener."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            alive = self.path == '/livez' and time.monotonic() - server.last_poll < 15
+            self.send_response(200 if alive else 503)
+            self.end_headers()
+    return Handler
+
+
 def serve():
     guard = Guard(Kube(), {"min_free_bytes": int(os.environ.get("CAPACITY_MIN_FREE_GIB", "10")) * GIB,
                           "free_percent": int(os.environ.get("CAPACITY_FREE_PERCENT", "25")),
@@ -576,6 +594,9 @@ def serve():
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain("/tls/tls.crt", "/tls/tls.key")
     server.socket = context.wrap_socket(server.socket, server_side=True)
+    # Loopback only: kubelet's exec probe cannot be starved by admission work.
+    liveness = http.server.HTTPServer(('127.0.0.1', 9444), liveness_handler(server))
+    threading.Thread(target=liveness.serve_forever, daemon=True).start()
     def reload_certificate():
         previous = None
         while True:

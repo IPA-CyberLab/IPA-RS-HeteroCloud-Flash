@@ -198,6 +198,55 @@ class StorageTests(unittest.TestCase):
 
 
 class HTTPTests(unittest.TestCase):
+    def test_liveness_survives_saturated_admission_but_detects_stuck_listener(self):
+        entered = threading.Event()
+        release = threading.Event()
+        lock = threading.Lock()
+        count = [0]
+
+        class Guard:
+            def evaluate(self, *_):
+                with lock:
+                    count[0] += 1
+                    if count[0] == 16:
+                        entered.set()
+                release.wait(10)
+                return {'allowed': False, 'reason': 'insufficient_disk_capacity'}
+
+        server = c.BoundedServer(('127.0.0.1', 0), c.handler(Guard()))
+        probe = c.http.server.HTTPServer(('127.0.0.1', 0), c.liveness_handler(server))
+        main_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        probe_thread = threading.Thread(target=probe.serve_forever, daemon=True)
+        main_thread.start(); probe_thread.start()
+        origin = f'http://127.0.0.1:{server.server_port}'
+        probe_url = f'http://127.0.0.1:{probe.server_port}/livez'
+        def request():
+            data = json.dumps({'kind': 'Pod', 'object': pod(), 'recreate': True}).encode()
+            req = urllib.request.Request(origin + '/preflight', data=data, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=12) as response:
+                return json.load(response)
+        try:
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                futures = [pool.submit(request) for _ in range(16)]
+                self.assertTrue(entered.wait(5), 'admission workers did not become saturated')
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(origin + '/healthz', timeout=3)
+                self.assertEqual(error.exception.code, 503)
+                with urllib.request.urlopen(probe_url, timeout=3) as response:
+                    self.assertEqual(response.status, 200)
+                release.set()
+                self.assertEqual(len([future.result(timeout=5) for future in futures]), 16)
+            server.shutdown(); main_thread.join(timeout=5)
+            server.last_poll = time.monotonic() - 30
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(probe_url, timeout=3)
+            self.assertEqual(error.exception.code, 503)
+        finally:
+            release.set()
+            if main_thread.is_alive():
+                server.shutdown(); main_thread.join(timeout=5)
+            server.server_close(); probe.shutdown(); probe.server_close(); probe_thread.join(timeout=5)
+
     def test_kubernetes_timeout_query_uses_the_admission_endpoint(self):
         class Guard:
             def evaluate(self, *_):
