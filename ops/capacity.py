@@ -55,6 +55,32 @@ def fresh(value, now, age=90):
         return False
 
 
+def running_pod_accounted(pod, summaries, now):
+    """Release a pull reservation only after running and fresh kubelet accounting."""
+    names = {c.get("name") for c in pod.get("spec", {}).get("containers", [])}
+    if not names or None in names:
+        return False
+    statuses = {c.get("name"): c for c in pod.get("status", {}).get("containerStatuses", [])}
+    started = []
+    for name in names:
+        value = (statuses.get(name, {}).get("state", {}).get("running") or {}).get("startedAt")
+        try:
+            stamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                return False
+            started.append(stamp.timestamp())
+        except (AttributeError, ValueError, TypeError):
+            return False
+    if not 120 <= now - max(started):
+        return False
+    summary = summaries.get(pod.get("spec", {}).get("nodeName"), {})
+    node = summary.get("node", {})
+    if not fresh((node.get("fs") or {}).get("time"), now) or not fresh((node.get("runtime", {}).get("imageFs") or {}).get("time"), now):
+        return False
+    uid = pod.get("metadata", {}).get("uid")
+    return bool(uid and any(item.get("podRef", {}).get("uid") == uid for item in summary.get("pods", [])))
+
+
 def alive(pod):
     return pod.get("status", {}).get("phase") not in ("Failed", "Succeeded")
 
@@ -214,7 +240,11 @@ def select_node(pod, nodes, summaries, pods, reservations, now, policy, image_by
             continue
         candidates.append((cached, int(summary["node"]["fs"]["availableBytes"]) - disk_need, name, peak))
     if not candidates:
-        return {"allowed": False, "reason": sorted(reasons)[0] if reasons else "no_eligible_node"}
+        # A node with compute headroom but insufficient disk is a more useful
+        # explanation than a different node that lacks CPU or memory.
+        priority = ("capacity_metrics_unavailable", "insufficient_disk_capacity", "insufficient_inodes",
+                    "image_capacity_unknown", "insufficient_pod_capacity", "insufficient_compute_capacity")
+        return {"allowed": False, "reason": next((reason for reason in priority if reason in reasons), "no_eligible_node")}
     cached, _, name, peak = max(candidates)
     return {"allowed": True, "node": name, "peak_bytes": peak,
             "cached_image_only": image_bytes is None,
@@ -266,9 +296,12 @@ class Guard:
                 # Scheduling never needs env values, mounts, logs or managedFields.
                 # Compact each page before requesting the next one.
                 meta, spec = pod.get("metadata", {}), pod.get("spec", {})
+                status = pod.get("status", {})
                 compact = {"metadata": {k: meta[k] for k in ("name", "namespace", "uid", "labels", "annotations") if k in meta},
                            "spec": {k: spec[k] for k in ("nodeName", "overhead") if k in spec},
-                           "status": {"phase": pod.get("status", {}).get("phase")}}
+                           "status": {"phase": status.get("phase"), "containerStatuses": [
+                               {"name": item.get("name"), "state": {"running": item.get("state", {}).get("running", {})}}
+                               for item in status.get("containerStatuses", [])]}}
                 for field in ("containers", "initContainers"):
                     compact["spec"][field] = [{k: c[k] for k in ("name", "image", "resources", "restartPolicy") if k in c} for c in spec.get(field, [])]
                 compact["metadata"]["annotations"] = {k: v for k, v in meta.get("annotations", {}).items() if k in (RESERVATION, IMAGE_BYTES)}
@@ -279,7 +312,11 @@ class Guard:
         summaries = {}
         for node in nodes:
             name = node["metadata"]["name"]
-            if node["metadata"].get("labels", {}).get("heteronetwork.io/control-plane-only") == "true":
+            labels = node["metadata"].get("labels", {})
+            conditions = {item["type"]: item["status"] for item in node.get("status", {}).get("conditions", [])}
+            if (labels.get("heteronetwork.io/control-plane-only") == "true"
+                    or labels.get("heteronetwork.io/lifecycle") == "stopped"
+                    or conditions.get("Ready") != "True"):
                 continue
             try:
                 raw = self.kube.call(f"/api/v1/nodes/{name}/proxy/stats/summary")
@@ -290,7 +327,7 @@ class Guard:
         self.cache, self.cache_at = (nodes, pods, summaries), time.time()
         return self.cache
 
-    def ledger(self, pods):
+    def ledger(self, pods, summaries):
         path = f"/api/v1/namespaces/{SYSTEM_NS}/configmaps/{LEDGER}"
         value = self.kube.call(path)
         records = json.loads(value.get("data", {}).get("reservations", "{}"))
@@ -302,9 +339,7 @@ class Guard:
             pod = live.get(key)
             if r["kind"] == "Pod":
                 if pod and pod.get("status", {}).get("phase") == "Running":
-                    if not r.get("running_at"):
-                        r["running_at"] = now
-                    if now - r["running_at"] > 120:
+                    if running_pod_accounted(pod, summaries, now):
                         records.pop(key)
                 elif not pod and now - r["created_at"] > 120:
                     records.pop(key)
@@ -384,7 +419,7 @@ class Guard:
         with self.lock:
             nodes, pods, summaries = self.snapshot()
             for _ in range(8):
-                path, ledger, records = self.ledger(pods)
+                path, ledger, records = self.ledger(pods, summaries)
                 fingerprint=hashlib.sha256(json.dumps({"spec":obj.get("spec"),"kind":kind},sort_keys=True).encode()).hexdigest()
                 if identity in records:
                     if records[identity].get("fingerprint")==fingerprint:

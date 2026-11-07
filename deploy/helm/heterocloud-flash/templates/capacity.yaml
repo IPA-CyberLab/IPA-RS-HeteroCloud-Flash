@@ -94,7 +94,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: capacity
-          image: {{ include "flash.image" . }}
+          image: {{ .Values.capacity.image | default (include "flash.image" .) | quote }}
           command: ["python3", "-B", "/usr/local/lib/flash-ops/capacity.py"]
           ports:
             - containerPort: 9443

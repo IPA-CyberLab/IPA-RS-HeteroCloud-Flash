@@ -111,6 +111,10 @@
         "enabled": {
           "type": "boolean"
         },
+        "image": {
+          "type": "string",
+          "pattern": "^(|\\S+@sha256:[a-f0-9]{64})$"
+        },
         "replicaCount": {
           "type": "integer",
           "minimum": 2,

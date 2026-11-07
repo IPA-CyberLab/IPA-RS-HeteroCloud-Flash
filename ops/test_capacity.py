@@ -240,6 +240,104 @@ class FakeKube:
 
 
 class ReservationTests(unittest.TestCase):
+    def test_recreate_preflight_releases_accounted_running_pod_without_a_ledger_write(self):
+        old = pod()
+        old['metadata'].update(uid='old-pod', annotations={c.RESERVATION: 'old-reservation'})
+        old['spec']['nodeName'] = 'worker'
+        old['status'] = {'phase': 'Running', 'containerStatuses': [{
+            'name': 'workload', 'state': {'running': {'startedAt':
+                dt.datetime.fromtimestamp(NOW - 300, dt.timezone.utc).isoformat()}}}]}
+
+        class RunningKube(FakeKube):
+            def __init__(self):
+                super().__init__()
+                self.value['data']['reservations'] = json.dumps({'old-reservation': {
+                    'id': 'old-reservation', 'kind': 'Pod', 'node': 'worker', 'created_at': NOW - 600,
+                    'requests': {'cpu': '1', 'memory': str(c.GIB)}, 'disk_bytes': 12*c.GIB,
+                    'peak_bytes': 6*c.GIB}})
+
+            def call(self, path, method='GET', value=None):
+                if path.startswith('/api/v1/pods?'):
+                    return {'items': [old]}
+                if '/proxy/stats/summary' in path:
+                    result = summary(62*c.GIB)
+                    result['pods'] = [{'podRef': {'uid': 'old-pod'}, 'ephemeral-storage': {'usedBytes': 0}}]
+                    return result
+                return super().call(path, method, value)
+
+        kube = RunningKube()
+        before = copy.deepcopy(kube.value)
+        guard = c.Guard(kube, POLICY)
+        for _ in range(2):
+            result = guard.evaluate('Pod', pod(), 'preflight', True, old['metadata']['labels'][c.INSTANCE])
+            self.assertTrue(result['allowed'], result)
+        server = c.BoundedServer(('127.0.0.1', 0), c.handler(guard))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f'http://127.0.0.1:{server.server_port}/preflight',
+                data=json.dumps({'kind': 'Pod', 'object': pod(), 'recreate': True}).encode(),
+                headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                self.assertTrue(json.load(response)['allowed'])
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=5)
+        self.assertEqual(kube.value, before, 'preflight must remain side-effect free')
+
+    def test_recent_or_unaccounted_running_pod_keeps_its_reservation(self):
+        old = pod()
+        old['metadata'].update(uid='old-pod', annotations={c.RESERVATION: 'old-reservation'})
+        old['spec']['nodeName'] = 'worker'
+        old['status'] = {'phase': 'Running', 'containerStatuses': [{
+            'name': 'workload', 'state': {'running': {'startedAt':
+                dt.datetime.fromtimestamp(NOW - 300, dt.timezone.utc).isoformat()}}}]}
+        kube = FakeKube()
+        kube.value['data']['reservations'] = json.dumps({'old-reservation': {
+            'id': 'old-reservation', 'kind': 'Pod', 'node': 'worker', 'created_at': NOW - 600}})
+        sampled = summary()
+        sampled['pods'] = [{'podRef': {'uid': 'old-pod'}}]
+        guard = c.Guard(kube, POLICY)
+        self.assertNotIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
+        old['status']['containerStatuses'][0]['state']['running']['startedAt'] = STAMP
+        self.assertIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
+        old['status']['containerStatuses'][0]['state']['running']['startedAt'] = dt.datetime.fromtimestamp(NOW - 300, dt.timezone.utc).isoformat()
+        sampled['pods'] = []
+        self.assertIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
+        sampled['pods'] = [{'podRef': {'uid': 'old-pod'}}]
+        sampled['node']['fs']['time'] = '2020-01-01T00:00:00Z'
+        self.assertIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
+
+    def test_snapshot_does_not_wait_for_stopped_or_unready_nodes(self):
+        class UnavailableNodes(FakeKube):
+            def __init__(self):
+                super().__init__()
+                self.lookups = []
+
+            def call(self, path, method='GET', value=None):
+                if path == '/api/v1/nodes':
+                    stopped, unready = node('stopped'), node('unready')
+                    stopped['metadata']['labels']['heteronetwork.io/lifecycle'] = 'stopped'
+                    unready['status']['conditions'][0]['status'] = 'Unknown'
+                    return {'items': [node(), stopped, unready]}
+                if '/proxy/stats/summary' in path:
+                    self.lookups.append(path)
+                return super().call(path, method, value)
+
+        kube = UnavailableNodes()
+        _, _, summaries = c.Guard(kube, POLICY).snapshot()
+        self.assertEqual(list(summaries), ['worker'])
+        self.assertEqual(len(kube.lookups), 1)
+
+    def test_disk_shortage_is_not_hidden_by_another_nodes_cpu_shortage(self):
+        cpu_node, disk_node = node('cpu-node'), node('disk-node')
+        cpu_node['status']['allocatable']['cpu'] = '500m'
+        result = c.select_node(pod(), [cpu_node, disk_node],
+                               {'cpu-node': summary(), 'disk-node': summary(50*c.GIB)},
+                               [], {}, NOW, POLICY, c.GIB)
+        self.assertFalse(result['allowed'])
+        self.assertEqual(result['reason'], 'insufficient_disk_capacity')
+
     def test_legacy_restart_uses_only_the_cached_immutable_image(self):
         image = "test@sha256:" + "a" * 64
         class LegacyKube(FakeKube):

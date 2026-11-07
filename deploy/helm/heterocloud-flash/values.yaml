@@ -136,6 +136,8 @@ backups:
 # Requires cert-manager. Admission applies only to new Flash Pods and home PVCs.
 capacity:
   enabled: false
+  # An optional immutable image for independently rolling out the admission service.
+  image: ""
   replicaCount: 2
   minFreeGiB: 10
   freePercent: 25
