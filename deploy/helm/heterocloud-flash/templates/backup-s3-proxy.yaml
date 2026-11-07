@@ -11,6 +11,14 @@ metadata:
     app.kubernetes.io/component: backup-s3-proxy
 spec:
   replicas: {{ .Values.backups.destinations.proxyReplicas }}
+  # Required node anti-affinity can leave no room for a surge pod when all
+  # worker nodes already host a replica. Allow one old replica to be replaced
+  # at a time so updates make progress; two replicas retain one during rollout.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "flash.name" . }}
