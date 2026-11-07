@@ -94,4 +94,4 @@ jobs:
           arm64=$(cat digests/digest-arm64)
           [[ "$amd64" =~ ^sha256:[0-9a-f]{64}$ && "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker buildx imagetools create --metadata-file index.json --tag "$repo:$GITHUB_SHA" "$repo@$amd64" "$repo@$arm64"
-          jq -r '.["containerimage.digest"]' index.json
+          jq -er '.["containerimage.descriptor"].digest | select(test("^sha256:[0-9a-f]{64}$"))' index.json
