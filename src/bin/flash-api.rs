@@ -20,12 +20,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, io::AsyncReadExt as FuturesAsyncReadExt};
 use heterocloud_flash::{
-    PROVIDER_DELETE_ACTION, PROVIDER_EXEC_ACTION, PROVIDER_GPU_ACCESS_UPDATE_ACTION,
-    PROVIDER_GPU_CATALOG_LIST_ACTION, PROVIDER_GPU_TYPES_LIST_ACTION,
-    PROVIDER_LIST_CONTAINERS_ACTION, PROVIDER_RECONCILE_ACTION, PROVIDER_STATUS_GET_ACTION,
-    PROVIDER_USAGE_LIST_ACTION, RUNTIME_CLASS_NAME,
+    PROVIDER_DELETE_ACTION, PROVIDER_EXEC_ACTION, PROVIDER_GET_LOGS_ACTION,
+    PROVIDER_GPU_ACCESS_UPDATE_ACTION, PROVIDER_GPU_CATALOG_LIST_ACTION,
+    PROVIDER_GPU_TYPES_LIST_ACTION, PROVIDER_LIST_CONTAINERS_ACTION, PROVIDER_RECONCILE_ACTION,
+    PROVIDER_STATUS_GET_ACTION, PROVIDER_USAGE_LIST_ACTION, RUNTIME_CLASS_NAME,
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
     crd::{
         FlashGpuDevice, FlashGpuVisibility, FlashService, FlashServicePhase, FlashServicePolicy,
@@ -40,7 +40,7 @@ use heterocloud_flash::{
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::{
     Api, Client, Resource,
-    api::{AttachParams, DeleteParams, ListParams, Patch, PatchParams, TerminalSize},
+    api::{AttachParams, DeleteParams, ListParams, LogParams, Patch, PatchParams, TerminalSize},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -57,6 +57,9 @@ use uuid::Uuid;
 const FIELD_MANAGER: &str = "heterocloud-flash-provider";
 const GPU_ACCESS_FIELD_MANAGER: &str = "heterocloud-owner-api";
 const MAX_EXEC_SESSION_SECONDS: u64 = 1_800;
+const MAX_LOG_BYTES: usize = 256 * 1024;
+const MAX_LOG_LINES: i64 = 500;
+const LOG_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EXEC_MESSAGE_BYTES: usize = 64 * 1024;
 const EXEC_SHUTDOWN_GRACE_SECONDS: u64 = 2;
 const EXEC_SHELL_SCRIPT: &str = "export TERM=xterm-256color COLORTERM=truecolor LANG=C.UTF-8 LC_ALL=C.UTF-8 HOME=/root NPM_CONFIG_PREFIX=/root/.local PATH=/root/.local/bin:$PATH; mkdir -p /root/.local/bin; cd /root || cd /; exec /bin/sh";
@@ -195,6 +198,10 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route(
             "/internal/v1/service-instances/{service_instance_id}/containers",
             get(list_containers),
+        )
+        .route(
+            "/internal/v1/service-instances/{service_instance_id}/logs",
+            get(get_logs),
         )
         .route(
             "/internal/v1/service-instances/{service_instance_id}/exec",
@@ -1243,6 +1250,76 @@ async fn list_containers(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LogsQuery {
+    generation: i64,
+    pod: Option<String>,
+    #[serde(default)]
+    previous: bool,
+}
+
+async fn get_logs(
+    State(state): State<Arc<AppState>>,
+    Path(service_instance_id): Path<Uuid>,
+    Query(query): Query<LogsQuery>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_GET_LOGS_ACTION)?;
+    validate_command(&claims, service_instance_id, query.generation)?;
+    validate_resource_scope(&state, &claims, service_instance_id, query.generation).await?;
+    let mut containers = state
+        .pods
+        .list(&service_pod_selector(service_instance_id))
+        .await?
+        .items
+        .into_iter()
+        .filter(|pod| pod_belongs_to_service(pod, service_instance_id))
+        .filter_map(container_summary)
+        .collect::<Vec<_>>();
+    containers.sort_by(|left, right| left.name.cmp(&right.name));
+    let (text, truncated) = if let Some(ref name) = query.pod {
+        if !containers.iter().any(|container| container.name == *name) {
+            return Err(ApiError::Forbidden);
+        }
+        let params = LogParams {
+            container: Some("workload".into()),
+            limit_bytes: Some(MAX_LOG_BYTES as i64),
+            tail_lines: Some(MAX_LOG_LINES),
+            previous: query.previous,
+            timestamps: true,
+            ..LogParams::default()
+        };
+        let bytes = time::timeout(LOG_TIMEOUT, async {
+            let stream = state.pods.log_stream(name, &params).await?;
+            let mut bounded = stream.take((MAX_LOG_BYTES + 1) as u64);
+            let mut bytes = Vec::new();
+            bounded
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| ApiError::Internal)?;
+            Ok::<_, ApiError>(bytes)
+        })
+        .await
+        .map_err(|_| ApiError::NotReady)??;
+        let truncated = bytes.len() >= MAX_LOG_BYTES;
+        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_LOG_BYTES)]).into_owned();
+        (Some(text), truncated)
+    } else {
+        (None, false)
+    };
+    let mut response = Json(json!({ "items": containers, "pod": query.pod,
+        "previous": query.previous, "text": text, "truncated": truncated }))
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExecQuery {
     generation: i64,
     pod: String,
@@ -2090,6 +2167,19 @@ mod tests {
                             200,
                             json!({"apiVersion": "v1", "kind": "PodList", "metadata": {}, "items": [pod]}),
                         )
+                    } else if request.uri().path()
+                        == "/api/v1/namespaces/test/pods/flash-workload-abc123/log"
+                    {
+                        let query = request.uri().query().ok_or("log query missing")?;
+                        assert!(query.contains("container=workload"));
+                        assert!(query.contains("tailLines=500"));
+                        assert!(query.contains("limitBytes=262144"));
+                        assert!(!query.contains("follow=true"));
+                        if query.contains("previous=true") {
+                            (200, json!("x".repeat(super::MAX_LOG_BYTES + 1024)))
+                        } else {
+                            (200, json!("test-container-log"))
+                        }
                     } else {
                         assert_eq!(
                             request.uri().path(),
@@ -2165,6 +2255,73 @@ mod tests {
             assert_eq!(body["items"][0]["ready"], true);
             assert_eq!(body["items"][0]["name"], "flash-workload-abc123");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logs_require_their_own_action_and_owned_service_and_pod()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut claims, resource) = access_fixture()?;
+        let uri = format!(
+            "/internal/v1/service-instances/{}/logs?generation=4",
+            claims.service_instance_id
+        );
+        let (response, reads) =
+            signed_status_request(claims.clone(), Some(resource.clone()), uri.clone()).await?;
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+        assert_eq!(reads, 0);
+
+        claims.action = super::PROVIDER_GET_LOGS_ACTION.into();
+        let mut wrong_account = claims.clone();
+        wrong_account.organization_id = Uuid::from_u128(99);
+        let (response, reads) =
+            signed_status_request(wrong_account, Some(resource.clone()), uri.clone()).await?;
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(reads, 1);
+
+        let (response, reads) = signed_status_request(
+            claims.clone(),
+            Some(resource.clone()),
+            format!("{uri}&pod=another-service-pod"),
+        )
+        .await?;
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(reads, 2);
+
+        let (response, reads) = signed_status_request(
+            claims.clone(),
+            Some(resource.clone()),
+            format!("{uri}&pod=flash-workload-abc123"),
+        )
+        .await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(reads, 3);
+        let body: Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 65536).await?)?;
+        assert_eq!(body["items"][0]["name"], "flash-workload-abc123");
+        assert_eq!(body["text"], "\"test-container-log\"");
+
+        let (response, _) = signed_status_request(
+            claims,
+            Some(resource),
+            format!("{uri}&pod=flash-workload-abc123&previous=true"),
+        )
+        .await?;
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 2 * super::MAX_LOG_BYTES).await?,
+        )?;
+        assert_eq!(body["truncated"], true);
+        assert_eq!(
+            body["text"].as_str().ok_or("text")?.len(),
+            super::MAX_LOG_BYTES
+        );
         Ok(())
     }
 

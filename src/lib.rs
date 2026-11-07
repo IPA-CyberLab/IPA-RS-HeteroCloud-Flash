@@ -17,6 +17,7 @@ mod web;
 pub const PROVIDER_RECONCILE_ACTION: &str = "service-instance.reconcile";
 pub const PROVIDER_DELETE_ACTION: &str = "service-instance.delete";
 pub const PROVIDER_LIST_CONTAINERS_ACTION: &str = "flash.containers.list";
+pub const PROVIDER_GET_LOGS_ACTION: &str = "flash.logs.get";
 pub const PROVIDER_EXEC_ACTION: &str = "flash.exec";
 pub const PROVIDER_STATUS_GET_ACTION: &str = "flash.status.get";
 pub const PROVIDER_USAGE_LIST_ACTION: &str = "flash.usage.list";
