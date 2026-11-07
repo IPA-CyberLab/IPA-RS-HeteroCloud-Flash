@@ -8,6 +8,8 @@ image:
 workloadHelperImage: ""
 
 api:
+  # Optional digest-pinned provider-only image for independent rollouts.
+  image: ""
   replicaCount: 3
   port: 8080
   maxExecSessions: 32

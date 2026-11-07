@@ -57,6 +57,32 @@ use uuid::Uuid;
 const FIELD_MANAGER: &str = "heterocloud-flash-provider";
 const GPU_ACCESS_FIELD_MANAGER: &str = "heterocloud-owner-api";
 const MAX_EXEC_SESSION_SECONDS: u64 = 1_800;
+const MAX_SSH_SESSION_SECONDS: u64 = 28_800;
+const MAX_SSH_COMMAND_BYTES: usize = 16 * 1024;
+// gVisor's loopback belongs to the sandbox and is not reachable via kubelet's
+// port-forward socket. Start the relay inside the existing workload instead.
+const SSH_FORWARD_SCRIPT: &str = r#"if command -v nc >/dev/null 2>&1; then
+  exec nc 127.0.0.1 "$1"
+elif command -v python3 >/dev/null 2>&1; then
+  exec python3 -c 'import os,select,socket,sys
+s=socket.create_connection(("127.0.0.1",int(sys.argv[1])),5)
+inputs=[s,sys.stdin.buffer]
+while inputs:
+ for item in select.select(inputs,[],[])[0]:
+  if item is s:
+   data=s.recv(65536)
+   if not data: sys.exit(0)
+   sys.stdout.buffer.write(data); sys.stdout.buffer.flush()
+  else:
+   data=os.read(0,65536)
+   if data: s.sendall(data)
+   else: inputs.remove(item); s.shutdown(socket.SHUT_WR)' "$1"
+elif command -v bash >/dev/null 2>&1; then
+  exec bash -c 'exec 3<>/dev/tcp/127.0.0.1/"$1" || exit 1; cat <&3 & reader=$!; cat >&3; wait "$reader"' flash-ssh-forward "$1"
+else
+  echo 'SSH port forwarding requires nc, python3, or bash in the container' >&2
+  exit 127
+fi"#;
 const MAX_LOG_BYTES: usize = 256 * 1024;
 const MAX_LOG_LINES: i64 = 500;
 const LOG_TIMEOUT: Duration = Duration::from_secs(10);
@@ -206,6 +232,14 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route(
             "/internal/v1/service-instances/{service_instance_id}/exec",
             get(exec),
+        )
+        .route(
+            "/internal/v1/service-instances/{service_instance_id}/ssh-exec",
+            get(ssh_exec),
+        )
+        .route(
+            "/internal/v1/service-instances/{service_instance_id}/ssh-forward",
+            get(ssh_forward),
         )
         .with_state(state)
 }
@@ -1359,6 +1393,342 @@ async fn exec(
         .on_upgrade(move |socket| exec_shell(socket, pods, pod_name, permit)))
 }
 
+// This endpoint is internal and requires the same signed, service-scoped
+// provider claim as Web Shell. The command travels inside the WebSocket,
+// rather than in a URL that could be retained by ingress logs.
+async fn ssh_exec(
+    State(state): State<Arc<AppState>>,
+    Path(service_instance_id): Path<Uuid>,
+    Query(query): Query<ExecQuery>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Result<impl IntoResponse, ApiError> {
+    if state.draining.load(Ordering::Acquire) {
+        return Err(ApiError::Draining);
+    }
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_EXEC_ACTION)?;
+    validate_command(&claims, service_instance_id, query.generation)?;
+    validate_resource_scope(&state, &claims, service_instance_id, query.generation).await?;
+    let pod = state.pods.get(&query.pod).await?;
+    if !pod_belongs_to_service(&pod, service_instance_id) || !pod_can_exec(&pod) {
+        return Err(ApiError::Forbidden);
+    }
+    let permit = Arc::clone(&state.exec_sessions)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::TooManyExecSessions)?;
+    if state.draining.load(Ordering::Acquire) {
+        return Err(ApiError::Draining);
+    }
+    Ok(upgrade
+        .max_message_size(MAX_EXEC_MESSAGE_BYTES)
+        .on_upgrade(move |socket| ssh_exec_process(socket, state.pods.clone(), query.pod, permit)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SshForwardQuery {
+    generation: i64,
+    pod: String,
+    port: u16,
+}
+
+async fn ssh_forward(
+    State(state): State<Arc<AppState>>,
+    Path(service_instance_id): Path<Uuid>,
+    Query(query): Query<SshForwardQuery>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Result<impl IntoResponse, ApiError> {
+    if state.draining.load(Ordering::Acquire) {
+        return Err(ApiError::Draining);
+    }
+    if query.port == 0 {
+        return Err(ApiError::BadRequest("Invalid port".into()));
+    }
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_EXEC_ACTION)?;
+    validate_command(&claims, service_instance_id, query.generation)?;
+    validate_resource_scope(&state, &claims, service_instance_id, query.generation).await?;
+    let pod = state.pods.get(&query.pod).await?;
+    if !pod_belongs_to_service(&pod, service_instance_id) || !pod_can_exec(&pod) {
+        return Err(ApiError::Forbidden);
+    }
+    let permit = Arc::clone(&state.exec_sessions)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::TooManyExecSessions)?;
+    if state.draining.load(Ordering::Acquire) {
+        return Err(ApiError::Draining);
+    }
+    Ok(upgrade
+        .max_message_size(MAX_EXEC_MESSAGE_BYTES)
+        .on_upgrade(move |socket| {
+            ssh_forward_stream(socket, state.pods.clone(), query.pod, query.port, permit)
+        }))
+}
+
+async fn ssh_forward_stream(
+    mut socket: WebSocket,
+    pods: Api<Pod>,
+    pod: String,
+    port: u16,
+    _permit: OwnedSemaphorePermit,
+) {
+    let params = AttachParams::default()
+        .container("workload")
+        .stdin(true)
+        .stdout(true)
+        .stderr(false)
+        .max_stdin_buf_size(MAX_EXEC_MESSAGE_BYTES)
+        .max_stdout_buf_size(MAX_EXEC_MESSAGE_BYTES);
+    let mut process = match pods
+        .exec(
+            &pod,
+            [
+                "/bin/sh",
+                "-c",
+                SSH_FORWARD_SCRIPT,
+                "flash-ssh-forward",
+                &port.to_string(),
+            ],
+            &params,
+        )
+        .await
+    {
+        Ok(process) => process,
+        Err(error) => {
+            tracing::warn!(%pod, port, error = %error, "Flash SSH forwarding failed");
+            return;
+        }
+    };
+    let (Some(mut stdin), Some(mut stdout)) = (process.stdin(), process.stdout()) else {
+        process.abort();
+        return;
+    };
+    if socket
+        .send(Message::Text(json!({"type":"started"}).to_string().into()))
+        .await
+        .is_err()
+    {
+        process.abort();
+        return;
+    }
+    let (mut sender, mut receiver) = socket.split();
+    let session = async {
+        let mut output = vec![0_u8; 8 * 1024];
+        loop {
+            tokio::select! {
+                read = stdout.read(&mut output) => {
+                    let count = read.unwrap_or(0);
+                    if count == 0 || sender.send(Message::Binary(output[..count].to_vec().into())).await.is_err() { break; }
+                }
+                message = receiver.next() => match message {
+                    Some(Ok(Message::Binary(input))) => { if stdin.write_all(&input).await.is_err() { break; } }
+                    Some(Ok(Message::Text(control))) if control.as_str() == "eof" => { let _result = stdin.shutdown().await; }
+                    Some(Ok(Message::Ping(payload))) => { if sender.send(Message::Pong(payload)).await.is_err() { break; } }
+                    Some(Ok(Message::Pong(_))) => {},
+                    _ => break,
+                },
+            }
+        }
+    };
+    let _result = time::timeout(Duration::from_secs(MAX_SSH_SESSION_SECONDS), session).await;
+    let _result = sender.send(Message::Close(None)).await;
+    process.abort();
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum SshExecMessage {
+    Start {
+        command: Option<String>,
+        tty: bool,
+        cols: u16,
+        rows: u16,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Eof,
+}
+
+fn ssh_command(command: Option<&str>) -> Option<Vec<String>> {
+    match command {
+        None => Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            EXEC_SHELL_SCRIPT.into(),
+        ]),
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= MAX_SSH_COMMAND_BYTES
+                && !value.as_bytes().contains(&0) =>
+        {
+            Some(vec!["/bin/sh".into(), "-c".into(), value.into()])
+        }
+        Some(_) => None,
+    }
+}
+
+fn ssh_exit_code(status: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Status>) -> u32 {
+    let Some(status) = status else { return 255 };
+    if status.status.as_deref() == Some("Success") {
+        return 0;
+    }
+    status
+        .details
+        .into_iter()
+        .flat_map(|details| details.causes.unwrap_or_default())
+        .find(|cause| cause.reason.as_deref() == Some("ExitCode"))
+        .and_then(|cause| cause.message.and_then(|message| message.parse::<u8>().ok()))
+        .map_or(255, u32::from)
+}
+
+async fn ssh_exec_process(
+    mut socket: WebSocket,
+    pods: Api<Pod>,
+    pod_name: String,
+    _permit: OwnedSemaphorePermit,
+) {
+    let first = time::timeout(Duration::from_secs(15), socket.recv()).await;
+    let Ok(Some(Ok(Message::Text(first)))) = first else {
+        return;
+    };
+    let Ok(SshExecMessage::Start {
+        command,
+        tty,
+        cols,
+        rows,
+    }) = serde_json::from_str::<SshExecMessage>(&first)
+    else {
+        return;
+    };
+    let Some(command) = ssh_command(command.as_deref()) else {
+        return;
+    };
+    if tty && (cols == 0 || rows == 0) {
+        return;
+    }
+    let params = AttachParams::default()
+        .container("workload")
+        .stdin(true)
+        .stdout(true)
+        .stderr(!tty)
+        .tty(tty)
+        .max_stdin_buf_size(MAX_EXEC_MESSAGE_BYTES)
+        .max_stdout_buf_size(MAX_EXEC_MESSAGE_BYTES)
+        .max_stderr_buf_size(MAX_EXEC_MESSAGE_BYTES);
+    let mut process = match pods.exec(&pod_name, command, &params).await {
+        Ok(process) => process,
+        Err(error) => {
+            tracing::warn!(%pod_name, error = %error, "Flash SSH command could not be started");
+            let _result = socket
+                .send(Message::Text(json!({"type":"error"}).to_string().into()))
+                .await;
+            return;
+        }
+    };
+    let (Some(mut stdin), Some(mut stdout), Some(status)) =
+        (process.stdin(), process.stdout(), process.take_status())
+    else {
+        process.abort();
+        return;
+    };
+    let mut stderr = process.stderr();
+    let mut terminal_size = process.terminal_size();
+    if let Some(size) = terminal_size.as_mut() {
+        let _result = size
+            .send(TerminalSize {
+                width: cols,
+                height: rows,
+            })
+            .await;
+    }
+    if socket
+        .send(Message::Text(json!({"type":"started"}).to_string().into()))
+        .await
+        .is_err()
+    {
+        process.abort();
+        return;
+    }
+    let (mut sender, mut receiver) = socket.split();
+    let mut stdout_open = true;
+    let mut stderr_open = stderr.is_some();
+    let mut stdin_open = true;
+    let session = async {
+        let mut out = vec![0_u8; 8 * 1024];
+        let mut err = vec![0_u8; 8 * 1024];
+        while stdout_open || stderr_open {
+            tokio::select! {
+                read = stdout.read(&mut out), if stdout_open => {
+                    match read {
+                        Ok(0) | Err(_) => stdout_open = false,
+                        Ok(count) => {
+                            let mut frame = Vec::with_capacity(count + 1);
+                            frame.push(1);
+                            frame.extend_from_slice(&out[..count]);
+                            if sender.send(Message::Binary(frame.into())).await.is_err() { return false; }
+                        }
+                    }
+                }
+                read = async { match stderr.as_mut() { Some(stream) => stream.read(&mut err).await, None => Ok(0) } }, if stderr_open => {
+                    match read {
+                        Ok(0) | Err(_) => stderr_open = false,
+                        Ok(count) => {
+                            let mut frame = Vec::with_capacity(count + 1);
+                            frame.push(2);
+                            frame.extend_from_slice(&err[..count]);
+                            if sender.send(Message::Binary(frame.into())).await.is_err() { return false; }
+                        }
+                    }
+                }
+                message = receiver.next() => match message {
+                    Some(Ok(Message::Binary(input))) if stdin_open => {
+                        if stdin.write_all(&input).await.is_err() { stdin_open = false; }
+                    }
+                    Some(Ok(Message::Text(control))) => match serde_json::from_str::<SshExecMessage>(&control) {
+                        Ok(SshExecMessage::Resize { cols, rows }) if cols > 0 && rows > 0 => {
+                            if let Some(size) = terminal_size.as_mut() {
+                                let _result = size.send(TerminalSize { width: cols, height: rows }).await;
+                            }
+                        }
+                        Ok(SshExecMessage::Eof) => { let _result = stdin.shutdown().await; stdin_open = false; }
+                        _ => return false,
+                    },
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() { return false; }
+                    }
+                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) => {},
+                    _ => return false,
+                },
+            }
+        }
+        true
+    };
+    if matches!(
+        time::timeout(Duration::from_secs(MAX_SSH_SESSION_SECONDS), session).await,
+        Ok(true)
+    ) {
+        let status = time::timeout(Duration::from_secs(EXEC_SHUTDOWN_GRACE_SECONDS), status)
+            .await
+            .ok()
+            .flatten();
+        let _result = sender
+            .send(Message::Text(
+                json!({"type":"exit","code":ssh_exit_code(status)})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        let _result = sender.send(Message::Close(None)).await;
+    }
+    process.abort();
+}
+
 async fn validate_resource_scope(
     state: &AppState,
     claims: &ProviderClaims,
@@ -1683,6 +2053,42 @@ async fn shutdown_signal(state: Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ssh_command_rejects_empty_nul_and_oversized_input() {
+        assert!(super::ssh_command(None).is_some());
+        assert_eq!(
+            super::ssh_command(Some("printf test")).map(|v| v[2].clone()),
+            Some("printf test".into())
+        );
+        assert!(super::ssh_command(Some("")).is_none());
+        assert!(super::ssh_command(Some("test\0command")).is_none());
+        assert!(super::ssh_command(Some(&"x".repeat(super::MAX_SSH_COMMAND_BYTES + 1))).is_none());
+    }
+
+    #[test]
+    fn ssh_exit_status_preserves_remote_exit_code_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ok: k8s_openapi::apimachinery::pkg::apis::meta::v1::Status =
+            serde_json::from_value(serde_json::json!({"status":"Success"}))?;
+        let failed: k8s_openapi::apimachinery::pkg::apis::meta::v1::Status =
+            serde_json::from_value(
+                serde_json::json!({"status":"Failure","details":{"causes":[{"reason":"ExitCode","message":"42"}]}}),
+            )?;
+        assert_eq!(super::ssh_exit_code(Some(ok)), 0);
+        assert_eq!(super::ssh_exit_code(Some(failed)), 42);
+        assert_eq!(super::ssh_exit_code(None), 255);
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_exec_control_rejects_unrecognized_fields() {
+        assert!(
+            serde_json::from_value::<super::SshExecMessage>(serde_json::json!({
+                "type":"start","command":"true","tty":false,"cols":0,"rows":0,"extra":true
+            }))
+            .is_err()
+        );
+    }
     use k8s_openapi::api::core::v1::Pod;
     use serde_json::{Value, json};
     use uuid::Uuid;

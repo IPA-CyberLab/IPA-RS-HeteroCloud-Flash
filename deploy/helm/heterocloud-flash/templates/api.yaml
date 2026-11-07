@@ -31,7 +31,7 @@ spec:
         {{- include "flash.affinity" (dict "root" . "component" "api") | nindent 8 }}
       containers:
         - name: api
-          image: {{ include "flash.image" . }}
+          image: {{ .Values.api.image | default (include "flash.image" .) | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/flash-api"]
           ports:
