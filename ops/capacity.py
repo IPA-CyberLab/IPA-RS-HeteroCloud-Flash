@@ -57,10 +57,13 @@ def fresh(value, now, age=90):
 
 def running_pod_accounted(pod, summaries, now):
     """Release a pull reservation only after running and fresh kubelet accounting."""
-    names = {c.get("name") for c in pod.get("spec", {}).get("containers", [])}
+    spec = pod.get("spec", {})
+    names = {c.get("name") for c in spec.get("containers", [])}
+    names.update(c.get("name") for c in spec.get("initContainers", []) if c.get("restartPolicy") == "Always")
     if not names or None in names:
         return False
-    statuses = {c.get("name"): c for c in pod.get("status", {}).get("containerStatuses", [])}
+    status = pod.get("status", {})
+    statuses = {c.get("name"): c for c in status.get("containerStatuses", []) + status.get("initContainerStatuses", [])}
     started = []
     for name in names:
         value = (statuses.get(name, {}).get("state", {}).get("running") or {}).get("startedAt")
@@ -299,9 +302,11 @@ class Guard:
                 status = pod.get("status", {})
                 compact = {"metadata": {k: meta[k] for k in ("name", "namespace", "uid", "labels", "annotations") if k in meta},
                            "spec": {k: spec[k] for k in ("nodeName", "overhead") if k in spec},
-                           "status": {"phase": status.get("phase"), "containerStatuses": [
-                               {"name": item.get("name"), "state": {"running": item.get("state", {}).get("running", {})}}
-                               for item in status.get("containerStatuses", [])]}}
+                           "status": {"phase": status.get("phase")}}
+                for field in ("containerStatuses", "initContainerStatuses"):
+                    compact["status"][field] = [
+                        {"name": item.get("name"), "state": {"running": item.get("state", {}).get("running", {})}}
+                        for item in status.get(field, [])]
                 for field in ("containers", "initContainers"):
                     compact["spec"][field] = [{k: c[k] for k in ("name", "image", "resources", "restartPolicy") if k in c} for c in spec.get(field, [])]
                 compact["metadata"]["annotations"] = {k: v for k, v in meta.get("annotations", {}).items() if k in (RESERVATION, IMAGE_BYTES)}

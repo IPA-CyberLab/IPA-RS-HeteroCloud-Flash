@@ -351,6 +351,12 @@ class ReservationTests(unittest.TestCase):
         old['status']['containerStatuses'][0]['state']['running']['startedAt'] = STAMP
         self.assertIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
         old['status']['containerStatuses'][0]['state']['running']['startedAt'] = dt.datetime.fromtimestamp(NOW - 300, dt.timezone.utc).isoformat()
+        old['spec']['initContainers'] = [{'name': 'sidecar', 'restartPolicy': 'Always'}]
+        self.assertIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
+        old['status']['initContainerStatuses'] = [{'name': 'sidecar', 'state': {'running': {'startedAt': STAMP}}}]
+        self.assertIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
+        old['status']['initContainerStatuses'][0]['state']['running']['startedAt'] = dt.datetime.fromtimestamp(NOW - 300, dt.timezone.utc).isoformat()
+        self.assertNotIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
         sampled['pods'] = []
         self.assertIn('old-reservation', guard.ledger([old], {'worker': sampled})[2])
         sampled['pods'] = [{'podRef': {'uid': 'old-pod'}}]
