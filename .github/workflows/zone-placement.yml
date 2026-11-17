@@ -51,14 +51,21 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           test -s "$FLASH_ZONE_E2E_OUTPUT/required.json"
           test -s "$FLASH_ZONE_E2E_OUTPUT/preferred.json"
+          test -s "$FLASH_ZONE_E2E_OUTPUT/network-required.json"
+          test -s "$FLASH_ZONE_E2E_OUTPUT/network-preferred.json"
       - uses: azure/setup-helm@v5
       - name: Validate chart and configuration
         run: |
           helm lint --strict deploy/helm/heterocloud-flash --set providerAuth.existingSecret=validation
           helm template flash deploy/helm/heterocloud-flash --set providerAuth.existingSecret=validation --set controller.zoneSpread=required > "$RUNNER_TEMP/flash-zone-chart.yaml"
           grep -A 1 'name: FLASH_ZONE_SPREAD' "$RUNNER_TEMP/flash-zone-chart.yaml" | grep -q 'value: "required"'
+          grep -A 1 'name: FLASH_NETWORK_SPREAD' "$RUNNER_TEMP/flash-zone-chart.yaml" | grep -q 'value: "preferred"'
           if helm template flash deploy/helm/heterocloud-flash --set controller.zoneSpread=invalid > /dev/null 2>&1; then
             echo 'invalid zone policy was accepted' >&2
+            exit 1
+          fi
+          if helm template flash deploy/helm/heterocloud-flash --set controller.networkSpread=invalid > /dev/null 2>&1; then
+            echo 'invalid network policy was accepted' >&2
             exit 1
           fi
       - name: Create disposable two-site Kubernetes cluster

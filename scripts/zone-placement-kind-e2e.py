@@ -44,7 +44,9 @@ def ready_nodes(name):
 def deployment(name, fixture):
     source = json.loads(fixture.read_text())
     constraints = source["spec"]["template"]["spec"]["topologySpreadConstraints"]
-    assert len(constraints) == 2 and constraints[1]["topologyKey"] == "topology.kubernetes.io/zone"
+    assert len(constraints) in (2, 3) and constraints[1]["topologyKey"] == "topology.kubernetes.io/zone"
+    if len(constraints) == 3:
+        assert constraints[2]["topologyKey"] == "heteronetwork.io/network-domain"
     for constraint in constraints:
         constraint["labelSelector"] = {"matchLabels": {"app": name}}
     return {
@@ -110,7 +112,31 @@ def main():
     kubectl("-n", NAMESPACE, "scale", "deployment", "preferred", "--replicas=3")
     wait("new preferred replica to use the recovered zone", lambda: (
         len(ready_nodes("preferred")) == 3 and WORKERS[1] in ready_nodes("preferred")))
-    print("zone scheduler E2E passed: strict pending/recovery and preferred availability/recovery")
+    kubectl("-n", NAMESPACE, "delete", "deployment", "preferred", "--wait=true", "--timeout=90s")
+
+    # Both workers share the same physical zone but have distinct uplinks.
+    for node, network in ((WORKERS[0], "main-uplink"), (WORKERS[1], "other-uplink")):
+        kubectl("label", "node", node, "topology.kubernetes.io/zone=shared-room",
+                f"heteronetwork.io/network-domain={network}", "--overwrite")
+    apply(deployment("network-required", fixtures / "network-required.json"))
+    wait("required replicas across uplinks in one zone", lambda: set(ready_nodes("network-required")) == set(WORKERS))
+    kubectl("taint", "node", WORKERS[1], "flash-zone-e2e=offline:NoExecute")
+    wait("required network placement to wait on one uplink", lambda: (
+        ready_nodes("network-required") == [WORKERS[0]] and any(
+            pod.get("status", {}).get("phase") == "Pending" for pod in pods("network-required"))))
+    kubectl("taint", "node", WORKERS[1], "flash-zone-e2e=offline:NoExecute-")
+    wait("required network placement to recover", lambda: set(ready_nodes("network-required")) == set(WORKERS))
+    kubectl("-n", NAMESPACE, "delete", "deployment", "network-required", "--wait=true", "--timeout=90s")
+
+    apply(deployment("network-preferred", fixtures / "network-preferred.json"))
+    wait("preferred replicas across uplinks", lambda: set(ready_nodes("network-preferred")) == set(WORKERS))
+    kubectl("taint", "node", WORKERS[1], "flash-zone-e2e=offline:NoExecute")
+    wait("preferred network placement uses surviving uplink", lambda: ready_nodes("network-preferred").count(WORKERS[0]) == 2)
+    kubectl("taint", "node", WORKERS[1], "flash-zone-e2e=offline:NoExecute-")
+    kubectl("-n", NAMESPACE, "scale", "deployment", "network-preferred", "--replicas=3")
+    wait("new network replica uses recovered uplink", lambda: (
+        len(ready_nodes("network-preferred")) == 3 and WORKERS[1] in ready_nodes("network-preferred")))
+    print("zone and network scheduler E2E passed: independent domains, pending and recovery")
 
 
 if __name__ == "__main__":

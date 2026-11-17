@@ -45,6 +45,8 @@ controller:
   # preferred preserves availability with one site; required keeps excess
   # replicas pending unless at least two eligible, labelled zones exist.
   zoneSpread: preferred
+  # Separate from physical site/zone; groups nodes sharing an uplink.
+  networkSpread: preferred
   resources:
     requests:
       cpu: 100m

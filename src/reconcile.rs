@@ -79,11 +79,15 @@ pub enum ZoneSpreadMode {
 
 impl ZoneSpreadMode {
     pub fn parse(value: &str) -> Result<Self> {
+        Self::parse_named(value, "FLASH_ZONE_SPREAD")
+    }
+
+    pub fn parse_named(value: &str, name: &str) -> Result<Self> {
         match value {
             "disabled" => Ok(Self::Disabled),
             "preferred" => Ok(Self::Preferred),
             "required" => Ok(Self::Required),
-            _ => anyhow::bail!("FLASH_ZONE_SPREAD must be disabled, preferred, or required"),
+            _ => anyhow::bail!("{name} must be disabled, preferred, or required"),
         }
     }
 }
@@ -186,6 +190,7 @@ pub struct ControllerContext {
     activator_service: String,
     activator_port: u16,
     zone_spread: ZoneSpreadMode,
+    network_spread: ZoneSpreadMode,
 }
 
 pub struct ControllerConfig {
@@ -205,6 +210,7 @@ pub struct ControllerConfig {
     pub activator_service: String,
     pub activator_port: u16,
     pub zone_spread: ZoneSpreadMode,
+    pub network_spread: ZoneSpreadMode,
 }
 
 impl ControllerContext {
@@ -229,6 +235,7 @@ impl ControllerContext {
             activator_service: config.activator_service,
             activator_port: config.activator_port,
             zone_spread: config.zone_spread,
+            network_spread: config.network_spread,
         }
     }
 }
@@ -1165,6 +1172,7 @@ async fn reconcile(
             gpu_assignment,
             workload_identity_endpoint: context.workload_identity_endpoint.as_deref(),
             zone_spread: context.zone_spread,
+            network_spread: context.network_spread,
         },
     )?;
     let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
@@ -1815,6 +1823,7 @@ struct DeploymentOptions<'a> {
     gpu_assignment: Option<&'a FlashGpuAssignment>,
     workload_identity_endpoint: Option<&'a str>,
     zone_spread: ZoneSpreadMode,
+    network_spread: ZoneSpreadMode,
 }
 
 fn flash_secret_service_account_name(flash: &FlashService) -> Result<String, ReconcileError> {
@@ -2084,29 +2093,34 @@ fn desired_deployment(
             .is_some_and(|scaling| scaling.max_replicas > 1);
     // A single persistent home is a ReadWriteOnce volume. Do not claim that
     // its simultaneous users can run in separate zones.
-    if multi_replica
-        && options.persistent_volume_claim.is_none()
-        && options.zone_spread != ZoneSpreadMode::Disabled
-    {
-        let mut constraint = json!({
-            "maxSkew": 1,
-            "topologyKey": "topology.kubernetes.io/zone",
-            "whenUnsatisfiable": if options.zone_spread == ZoneSpreadMode::Required {
-                "DoNotSchedule"
-            } else {
-                "ScheduleAnyway"
-            },
-            "nodeAffinityPolicy": "Honor",
-            "nodeTaintsPolicy": "Honor",
-            "labelSelector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}}
-        });
-        if options.zone_spread == ZoneSpreadMode::Required {
-            // Without two eligible domains, leave excess replicas pending
-            // instead of silently presenting a single site as redundant.
-            constraint["minDomains"] = json!(2);
-        }
-        if let Some(constraints) = pod_spec["topologySpreadConstraints"].as_array_mut() {
-            constraints.push(constraint);
+    if multi_replica && options.persistent_volume_claim.is_none() {
+        for (topology_key, mode) in [
+            ("topology.kubernetes.io/zone", options.zone_spread),
+            ("heteronetwork.io/network-domain", options.network_spread),
+        ] {
+            if mode == ZoneSpreadMode::Disabled {
+                continue;
+            }
+            let mut constraint = json!({
+                "maxSkew": 1,
+                "topologyKey": topology_key,
+                "whenUnsatisfiable": if mode == ZoneSpreadMode::Required {
+                    "DoNotSchedule"
+                } else {
+                    "ScheduleAnyway"
+                },
+                "nodeAffinityPolicy": "Honor",
+                "nodeTaintsPolicy": "Honor",
+                "labelSelector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}}
+            });
+            if mode == ZoneSpreadMode::Required {
+                // Without two eligible domains, leave excess replicas pending
+                // instead of silently presenting a single site as redundant.
+                constraint["minDomains"] = json!(2);
+            }
+            if let Some(constraints) = pod_spec["topologySpreadConstraints"].as_array_mut() {
+                constraints.push(constraint);
+            }
         }
     }
     if workload.task_role.is_some() {
@@ -4083,6 +4097,7 @@ mod tests {
                 GIB_BYTES,
                 DeploymentOptions {
                     zone_spread: mode,
+                    network_spread: super::ZoneSpreadMode::Disabled,
                     persistent_volume_claim: claim,
                     ..Default::default()
                 },
@@ -4170,7 +4185,57 @@ mod tests {
                 directory.join("required.json"),
                 serde_json::to_vec(&required)?,
             )?;
+            for (name, network_spread) in [
+                ("network-preferred.json", super::ZoneSpreadMode::Preferred),
+                ("network-required.json", super::ZoneSpreadMode::Required),
+            ] {
+                let deployment = desired_deployment(
+                    &flash,
+                    &owner(),
+                    "example.invalid/app:v1",
+                    GIB_BYTES,
+                    DeploymentOptions {
+                        zone_spread: super::ZoneSpreadMode::Preferred,
+                        network_spread,
+                        ..Default::default()
+                    },
+                )?;
+                std::fs::write(directory.join(name), serde_json::to_vec(&deployment)?)?;
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn network_spread_is_independent_of_the_physical_zone() -> anyhow::Result<()> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.replicas = 2;
+        let deployment = desired_deployment(
+            &flash,
+            &owner(),
+            "example.invalid/app:v1",
+            GIB_BYTES,
+            DeploymentOptions {
+                zone_spread: super::ZoneSpreadMode::Preferred,
+                network_spread: super::ZoneSpreadMode::Required,
+                ..Default::default()
+            },
+        )?;
+        let json = serde_json::to_value(deployment)?;
+        let constraints = json["spec"]["template"]["spec"]["topologySpreadConstraints"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing placement constraints"))?;
+        assert_eq!(constraints.len(), 3);
+        assert_eq!(constraints[1]["topologyKey"], "topology.kubernetes.io/zone");
+        assert_eq!(constraints[1]["whenUnsatisfiable"], "ScheduleAnyway");
+        assert_eq!(
+            constraints[2]["topologyKey"],
+            "heteronetwork.io/network-domain"
+        );
+        assert_eq!(constraints[2]["whenUnsatisfiable"], "DoNotSchedule");
+        assert_eq!(constraints[2]["minDomains"], 2);
+        assert_eq!(constraints[2]["nodeTaintsPolicy"], "Honor");
+        assert_eq!(constraints[2]["nodeAffinityPolicy"], "Honor");
         Ok(())
     }
 

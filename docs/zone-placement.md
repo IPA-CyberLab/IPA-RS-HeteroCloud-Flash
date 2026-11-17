@@ -8,6 +8,15 @@ prove that nodes are independent. The existing hostname spread remains enabled.
 Taints and node affinity are honored when deciding which zones are eligible, so
 dedicated control-plane nodes without matching tolerations do not count.
 
+Network failure domains are separate: `heteronetwork.io/network-domain`
+identifies an uplink or network shared by nodes. `controller.networkSpread`
+accepts the same `disabled`, `preferred` and `required` modes, independently
+of `controller.zoneSpread`. The default is `preferred`. For example, two
+workers can share a room and power supply while using different uplinks; label
+both with the same zone and different network domains. This can improve
+availability during network isolation, but it does not protect against a shared
+room or power failure.
+
 Set `controller.zoneSpread` in the Helm values to:
 
 - `preferred` (default): favor different zones but retain availability in one.
@@ -32,5 +41,6 @@ survival.
 `scripts/zone-placement-kind-e2e.py` consumes real controller-generated Pod
 constraints in a disposable two-worker kind cluster. It taints one worker to
 model one unavailable site, checks strict pending versus preferred recovery,
-and restores the worker. This validates Kubernetes scheduling behavior; it
-does not emulate WAN packet loss, storage replication or independent power.
+and restores the worker. It also tests separate uplinks in one physical zone.
+This validates Kubernetes scheduling behavior; it does not emulate WAN packet
+loss, storage replication or independent power.

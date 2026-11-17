@@ -36,6 +36,8 @@ spec:
           env:
             - name: FLASH_ZONE_SPREAD
               value: {{ .Values.controller.zoneSpread | quote }}
+            - name: FLASH_NETWORK_SPREAD
+              value: {{ .Values.controller.networkSpread | quote }}
             - name: FLASH_BACKUP_DESTINATIONS_ENABLED
               value: {{ .Values.backups.destinations.enabled | quote }}
             {{- if .Values.capacity.enabled }}

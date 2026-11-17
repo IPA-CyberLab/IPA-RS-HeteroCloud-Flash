@@ -12,6 +12,10 @@
         "zoneSpread": {
           "type": "string",
           "enum": ["disabled", "preferred", "required"]
+        },
+        "networkSpread": {
+          "type": "string",
+          "enum": ["disabled", "preferred", "required"]
         }
       }
     },

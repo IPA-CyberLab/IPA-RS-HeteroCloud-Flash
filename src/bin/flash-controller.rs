@@ -143,6 +143,10 @@ async fn run() -> Result<()> {
             zone_spread: ZoneSpreadMode::parse(
                 &optional("FLASH_ZONE_SPREAD").unwrap_or_else(|| "preferred".into()),
             )?,
+            network_spread: ZoneSpreadMode::parse_named(
+                &optional("FLASH_NETWORK_SPREAD").unwrap_or_else(|| "preferred".into()),
+                "FLASH_NETWORK_SPREAD",
+            )?,
         },
     )
     .await
