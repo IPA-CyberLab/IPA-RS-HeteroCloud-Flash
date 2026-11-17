@@ -33,7 +33,7 @@ jobs:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
-      FLASH_ZONE_E2E_OUTPUT: ${{ runner.temp }}/flash-zone-fixtures
+      FLASH_ZONE_E2E_OUTPUT: /tmp/flash-zone-fixtures
       FLASH_ZONE_E2E: kind-only
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
