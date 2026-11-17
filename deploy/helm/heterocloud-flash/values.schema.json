@@ -2,6 +2,19 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "properties": {
+    "controller": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "string",
+          "pattern": "^(|\\S+@sha256:[a-f0-9]{64})$"
+        },
+        "zoneSpread": {
+          "type": "string",
+          "enum": ["disabled", "preferred", "required"]
+        }
+      }
+    },
     "api": {
       "type": "object",
       "properties": {

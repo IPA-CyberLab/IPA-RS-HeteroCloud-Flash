@@ -40,6 +40,11 @@ publicDomain: ""
 
 controller:
   replicaCount: 2
+  # Optional digest-pinned controller image for independent rollouts.
+  image: ""
+  # preferred preserves availability with one site; required keeps excess
+  # replicas pending unless at least two eligible, labelled zones exist.
+  zoneSpread: preferred
   resources:
     requests:
       cpu: 100m

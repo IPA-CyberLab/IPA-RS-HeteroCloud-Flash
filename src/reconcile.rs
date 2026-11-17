@@ -68,6 +68,26 @@ const MIN_ROOTFS_STORAGE_BYTES: u64 = 64 * MIB_BYTES;
 const MAX_ROOTFS_STORAGE_BYTES: u64 = GIB_BYTES;
 const MAX_ADMIN_VOLUME_MOUNTS_PER_SERVICE: usize = 8;
 
+/// Zone placement is an operator policy, not a claim that sites are independent.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ZoneSpreadMode {
+    Disabled,
+    #[default]
+    Preferred,
+    Required,
+}
+
+impl ZoneSpreadMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "preferred" => Ok(Self::Preferred),
+            "required" => Ok(Self::Required),
+            _ => anyhow::bail!("FLASH_ZONE_SPREAD must be disabled, preferred, or required"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdminVolumeMount {
@@ -165,6 +185,7 @@ pub struct ControllerContext {
     activator_namespace: String,
     activator_service: String,
     activator_port: u16,
+    zone_spread: ZoneSpreadMode,
 }
 
 pub struct ControllerConfig {
@@ -183,6 +204,7 @@ pub struct ControllerConfig {
     pub activator_namespace: String,
     pub activator_service: String,
     pub activator_port: u16,
+    pub zone_spread: ZoneSpreadMode,
 }
 
 impl ControllerContext {
@@ -206,6 +228,7 @@ impl ControllerContext {
             activator_namespace: config.activator_namespace,
             activator_service: config.activator_service,
             activator_port: config.activator_port,
+            zone_spread: config.zone_spread,
         }
     }
 }
@@ -1141,6 +1164,7 @@ async fn reconcile(
                 .unwrap_or_default(),
             gpu_assignment,
             workload_identity_endpoint: context.workload_identity_endpoint.as_deref(),
+            zone_spread: context.zone_spread,
         },
     )?;
     let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
@@ -1479,6 +1503,10 @@ fn preserve_legacy_probe_fields(current: &Deployment, desired: &mut Deployment) 
         return;
     };
     if let Some(spec) = new.template.spec.as_mut() {
+        // A controller upgrade or operator policy change must not recreate an
+        // existing user's containers. New service generations use the current
+        // placement policy.
+        spec.topology_spread_constraints = old.topology_spread_constraints.clone();
         for container in &mut spec.containers {
             if let Some(previous) = old.containers.iter().find(|c| c.name == container.name) {
                 container.readiness_probe = previous.readiness_probe.clone();
@@ -1786,6 +1814,7 @@ struct DeploymentOptions<'a> {
     admin_volume_mounts: &'a [AdminVolumeMount],
     gpu_assignment: Option<&'a FlashGpuAssignment>,
     workload_identity_endpoint: Option<&'a str>,
+    zone_spread: ZoneSpreadMode,
 }
 
 fn flash_secret_service_account_name(flash: &FlashService) -> Result<String, ReconcileError> {
@@ -2048,6 +2077,38 @@ fn desired_deployment(
         }],
         "containers": [container]
     });
+    let multi_replica = workload.replicas > 1
+        || workload
+            .autoscaling
+            .as_ref()
+            .is_some_and(|scaling| scaling.max_replicas > 1);
+    // A single persistent home is a ReadWriteOnce volume. Do not claim that
+    // its simultaneous users can run in separate zones.
+    if multi_replica
+        && options.persistent_volume_claim.is_none()
+        && options.zone_spread != ZoneSpreadMode::Disabled
+    {
+        let mut constraint = json!({
+            "maxSkew": 1,
+            "topologyKey": "topology.kubernetes.io/zone",
+            "whenUnsatisfiable": if options.zone_spread == ZoneSpreadMode::Required {
+                "DoNotSchedule"
+            } else {
+                "ScheduleAnyway"
+            },
+            "nodeAffinityPolicy": "Honor",
+            "nodeTaintsPolicy": "Honor",
+            "labelSelector": {"matchLabels": {"flash.heterocloud.io/instance": flash.spec.service_instance_id}}
+        });
+        if options.zone_spread == ZoneSpreadMode::Required {
+            // Without two eligible domains, leave excess replicas pending
+            // instead of silently presenting a single site as redundant.
+            constraint["minDomains"] = json!(2);
+        }
+        if let Some(constraints) = pod_spec["topologySpreadConstraints"].as_array_mut() {
+            constraints.push(constraint);
+        }
+    }
     if workload.task_role.is_some() {
         pod_spec["serviceAccountName"] = json!(secret_account_name);
         pod_spec["serviceAccount"] = json!(secret_account_name);
@@ -4008,6 +4069,109 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[test]
+    fn zone_spread_uses_eligible_domains_and_preserves_existing_revisions() -> anyhow::Result<()> {
+        let mut flash = service(TrafficMode::Forwarded);
+        flash.spec.workload.replicas = 2;
+        let render = |flash: &FlashService, mode, claim| {
+            desired_deployment(
+                flash,
+                &owner(),
+                "example.invalid/app:v1",
+                GIB_BYTES,
+                DeploymentOptions {
+                    zone_spread: mode,
+                    persistent_volume_claim: claim,
+                    ..Default::default()
+                },
+            )
+        };
+        let preferred = render(&flash, super::ZoneSpreadMode::Preferred, None)?;
+        let required = render(&flash, super::ZoneSpreadMode::Required, None)?;
+        let constraints = serde_json::to_value(&required)?;
+        let zone = &constraints["spec"]["template"]["spec"]["topologySpreadConstraints"][1];
+        assert_eq!(zone["topologyKey"], "topology.kubernetes.io/zone");
+        assert_eq!(zone["whenUnsatisfiable"], "DoNotSchedule");
+        assert_eq!(zone["minDomains"], 2);
+        assert_eq!(zone["nodeTaintsPolicy"], "Honor");
+        assert_eq!(zone["nodeAffinityPolicy"], "Honor");
+        assert_eq!(
+            zone["labelSelector"]["matchLabels"]["flash.heterocloud.io/instance"],
+            flash.spec.service_instance_id
+        );
+        let soft = serde_json::to_value(&preferred)?;
+        assert_eq!(
+            soft["spec"]["template"]["spec"]["topologySpreadConstraints"][1]["whenUnsatisfiable"],
+            "ScheduleAnyway"
+        );
+        assert!(
+            soft["spec"]["template"]["spec"]["topologySpreadConstraints"][1]
+                .get("minDomains")
+                .is_none()
+        );
+
+        let persistent = serde_json::to_value(render(
+            &flash,
+            super::ZoneSpreadMode::Required,
+            Some("home"),
+        )?)?;
+        assert_eq!(
+            persistent["spec"]["template"]["spec"]["topologySpreadConstraints"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        flash.spec.workload.replicas = 1;
+        let single = serde_json::to_value(render(&flash, super::ZoneSpreadMode::Required, None)?)?;
+        assert_eq!(
+            single["spec"]["template"]["spec"]["topologySpreadConstraints"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        flash.spec.workload.autoscaling = Some(crate::domain::FlashAutoscaling {
+            min_replicas: 1,
+            max_replicas: 2,
+            target_cpu_utilization_percent: Some(80),
+            target_memory_utilization_percent: None,
+            idle_timeout_seconds: 900,
+        });
+        let autoscaled =
+            serde_json::to_value(render(&flash, super::ZoneSpreadMode::Preferred, None)?)?;
+        assert_eq!(
+            autoscaled["spec"]["template"]["spec"]["topologySpreadConstraints"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+
+        flash.spec.workload.autoscaling = None;
+        flash.spec.workload.replicas = 2;
+        let old = render(&flash, super::ZoneSpreadMode::Disabled, None)?;
+        let mut next = render(&flash, super::ZoneSpreadMode::Required, None)?;
+        super::preserve_legacy_probe_fields(&old, &mut next);
+        assert_eq!(
+            old.spec.as_ref().map(|s| &s.template.spec),
+            next.spec.as_ref().map(|s| &s.template.spec)
+        );
+
+        // The isolated multi-node scheduler test consumes manifests generated
+        // by the real controller rather than duplicating its scheduling policy.
+        if let Some(directory) = std::env::var_os("FLASH_ZONE_E2E_OUTPUT") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(
+                directory.join("preferred.json"),
+                serde_json::to_vec(&preferred)?,
+            )?;
+            std::fs::write(
+                directory.join("required.json"),
+                serde_json::to_vec(&required)?,
+            )?;
+        }
+        Ok(())
     }
 
     #[test]

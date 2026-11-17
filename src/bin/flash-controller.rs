@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, env, fs, process::ExitCode};
 use anyhow::{Context, Result};
 use heterocloud_flash::image::ImageInspector;
 use heterocloud_flash::reconcile::{
-    AdminVolumeMounts, ControllerConfig, run_controller, validate_admin_volume_mounts,
-    validate_public_domain,
+    AdminVolumeMounts, ControllerConfig, ZoneSpreadMode, run_controller,
+    validate_admin_volume_mounts, validate_public_domain,
 };
 use ipnet::IpNet;
 use tracing_subscriber::EnvFilter;
@@ -140,6 +140,9 @@ async fn run() -> Result<()> {
             activator_namespace,
             activator_service,
             activator_port,
+            zone_spread: ZoneSpreadMode::parse(
+                &optional("FLASH_ZONE_SPREAD").unwrap_or_else(|| "preferred".into()),
+            )?,
         },
     )
     .await

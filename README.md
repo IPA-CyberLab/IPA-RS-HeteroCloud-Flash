@@ -20,6 +20,9 @@ FlashService CRD -> Deployment(runtimeClassName=gvisor|nvidia) -> Service
 
 ## Properties
 
+Multi-replica stateless services support [zone-aware placement](docs/zone-placement.md)
+when operators configure real node failure domains.
+
 - `spec.network` attaches services to a HeteroCloud VPC. Private DNS, directional
   TCP/UDP rules and optional outbound NAT are managed by
   [HeteroCloud VPC](https://github.com/IPA-CyberLab/IPA-RS-HeteroCloud-VPC).

@@ -30,10 +30,12 @@ spec:
         {{- include "flash.affinity" (dict "root" . "component" "controller") | nindent 8 }}
       containers:
         - name: controller
-          image: {{ include "flash.image" . }}
+          image: {{ .Values.controller.image | default (include "flash.image" .) | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/flash-controller"]
           env:
+            - name: FLASH_ZONE_SPREAD
+              value: {{ .Values.controller.zoneSpread | quote }}
             - name: FLASH_BACKUP_DESTINATIONS_ENABLED
               value: {{ .Values.backups.destinations.enabled | quote }}
             {{- if .Values.capacity.enabled }}
