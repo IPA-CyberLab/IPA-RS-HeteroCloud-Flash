@@ -69,10 +69,25 @@ def main():
     if names != {CONTROL, *WORKERS}:
         raise RuntimeError("refusing to test a cluster without the exact disposable kind node names")
     fixtures = Path(sys.argv[1])
+    for node in (CONTROL, *WORKERS):
+        kubectl("patch", "node", node, "--type=merge", "-p", json.dumps({
+            "metadata": {"labels": {"topology.kubernetes.io/region": None,
+                                     "topology.kubernetes.io/zone": None}}}))
+    kubectl("create", "namespace", NAMESPACE)
+    apply(deployment("unknown-preferred", fixtures / "preferred.json"))
+    wait("preferred placement with unknown zones", lambda: len(ready_nodes("unknown-preferred")) == 2)
+    kubectl("-n", NAMESPACE, "delete", "deployment", "unknown-preferred", "--wait=true", "--timeout=90s")
+    apply(deployment("unknown-required", fixtures / "required.json"))
+    wait("strict placement to reject unknown zones", lambda: len(pods("unknown-required")) == 2 and all(
+        any(condition.get("type") == "PodScheduled" and condition.get("reason") == "Unschedulable"
+            for condition in pod.get("status", {}).get("conditions", []))
+        for pod in pods("unknown-required")))
+    if ready_nodes("unknown-required"):
+        raise RuntimeError("strict placement accepted nodes without known zones")
+    kubectl("-n", NAMESPACE, "delete", "deployment", "unknown-required", "--wait=true", "--timeout=90s")
     for node, zone in ((CONTROL, "control-only"), (WORKERS[0], "site-a"), (WORKERS[1], "site-b")):
         kubectl("label", "node", node, "topology.kubernetes.io/region=region-a",
                 f"topology.kubernetes.io/zone={zone}", "--overwrite")
-    kubectl("create", "namespace", NAMESPACE)
 
     apply(deployment("required", fixtures / "required.json"))
     wait("required replicas in distinct zones", lambda: set(ready_nodes("required")) == set(WORKERS))
