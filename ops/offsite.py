@@ -25,6 +25,10 @@ from capacity import Kube, NS
 GIB = 1024**3
 MAX_OBJECT = 64*1024**2
 HASH = re.compile(r"^[0-9a-f]{64}$")
+DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+DNS_SUBDOMAIN = re.compile(rf"{DNS_LABEL.pattern}(?:\.{DNS_LABEL.pattern})*")
+BACKUP_HANDLE = re.compile(r"bak://[a-z0-9][a-z0-9.-]*/backup-[a-z0-9][a-z0-9-]*")
+CSI_VERSION = "snapshot.storage.k8s.io/v1"
 LOCK = "flash.heterocloud.io/offsite-lock-until"
 LOCK_OWNER = "flash.heterocloud.io/offsite-lock-owner"
 
@@ -185,10 +189,74 @@ def copy_generation(source, destination, key, catalog_metadata, max_bytes=128*GI
     return generation,catalog
 
 
-def restore_generation(source, destination, catalog_key, signing_key):
+def snapshot_index(catalog, field):
+    result = {}
+    for item in catalog.get(field, []):
+        name = item["metadata"]["name"]
+        if len(name) > 253 or not DNS_SUBDOMAIN.fullmatch(name) or name in result:
+            raise RuntimeError("invalid or duplicate CSI catalog resource")
+        result[name] = item
+    return result
+
+
+def snapshot_manifest(catalog, namespace):
+    """Prepare static CSI bindings for the verified copy on a replacement cluster."""
+    if not DNS_LABEL.fullmatch(namespace):
+        raise ValueError("invalid Flash workload namespace")
+    snapshots = snapshot_index(catalog, "snapshots")
+    contents = snapshot_index(catalog, "snapshot_contents")
+    resources = []
+    bound_contents = set()
+    for name, backup in snapshot_index(catalog, "backups").items():
+        # Older catalogs may contain records for buckets this job never copied.
+        if backup["spec"].get("destination_id") is not None:
+            continue
+        snapshot = snapshots.get(name, {})
+        snapshot_status = snapshot.get("status", {})
+        content_name = snapshot_status.get("boundVolumeSnapshotContentName")
+        content = contents.get(content_name, {})
+        spec = content.get("spec", {})
+        status = content.get("status", {})
+        ref = spec.get("volumeSnapshotRef", {})
+        snapshot_class = backup["spec"]["snapshot_class"]
+        handle = status.get("snapshotHandle") or spec.get("source", {}).get("snapshotHandle", "")
+        if (backup.get("status", {}).get("phase") != "ready"
+                or snapshot_status.get("readyToUse") is not True or status.get("readyToUse") is not True
+                or content_name in bound_contents or ref.get("name") != name or ref.get("namespace") != namespace
+                or len(snapshot_class) > 253 or not DNS_SUBDOMAIN.fullmatch(snapshot_class)
+                or snapshot.get("spec", {}).get("volumeSnapshotClassName") != snapshot_class
+                or spec.get("volumeSnapshotClassName") != snapshot_class
+                or spec.get("driver") != "driver.longhorn.io"
+                or not BACKUP_HANDLE.fullmatch(handle)):
+            raise RuntimeError("catalog does not contain a ready Longhorn backup binding")
+        bound_contents.add(content_name)
+        content_spec = {
+            "volumeSnapshotClassName": snapshot_class,
+            "driver": "driver.longhorn.io",
+            "deletionPolicy": "Retain",
+            "source": {"snapshotHandle": handle},
+            "volumeSnapshotRef": {"name": name, "namespace": namespace},
+        }
+        if spec.get("sourceVolumeMode") in ("Filesystem", "Block"):
+            content_spec["sourceVolumeMode"] = spec["sourceVolumeMode"]
+        resources.extend([
+            {"apiVersion": CSI_VERSION, "kind": "VolumeSnapshotContent",
+             "metadata": {"name": content_name}, "spec": content_spec},
+            {"apiVersion": CSI_VERSION, "kind": "VolumeSnapshot",
+             "metadata": {"name": name, "namespace": namespace},
+             "spec": {"volumeSnapshotClassName": snapshot_class,
+                      "source": {"volumeSnapshotContentName": content_name}}},
+        ])
+    return {"apiVersion": "v1", "kind": "List", "items": resources}
+
+
+def restore_generation(source, destination, catalog_key, signing_key, *, snapshot_namespace=None):
     if not catalog_key.startswith("catalogs/") or not catalog_key.endswith(".json"):
         raise RuntimeError("an explicit committed catalog is required")
     catalog=decode_catalog(source.request("GET",catalog_key),signing_key)
+    result = {k: v for k, v in catalog.items() if k != "objects"}
+    if snapshot_namespace is not None:
+        result["snapshot_manifest"] = snapshot_manifest(catalog, snapshot_namespace)
     if next(destination.listing(),None) is not None:
         raise RuntimeError("disaster restore requires an empty replacement bucket")
     lease="leases/restore-"+os.urandom(16).hex()+".json"
@@ -208,7 +276,7 @@ def restore_generation(source, destination, catalog_key, signing_key):
         source.request("DELETE",lease)
     # The operator imports this verified tenant/CSI catalog only after restoring
     # the control-plane database and configuring the new private backup target.
-    return {k:v for k,v in catalog.items() if k!="objects"}
+    return result
 
 
 def prune_catalogs(destination, signing_key, keep=7, now=None):
@@ -257,7 +325,10 @@ class SourceLock:
 
     def acquire(self):
         self.renew_lease()
-        self.backups=[b for b in self.kube.call(self.base)["items"] if b.get("status",{}).get("phase")=="ready" and not b["metadata"].get("deletionTimestamp")]
+        self.backups = [b for b in self.kube.call(self.base)["items"]
+                        if b.get("status", {}).get("phase") == "ready"
+                        and not b["metadata"].get("deletionTimestamp")
+                        and b["spec"].get("destination_id") is None]
         self.renew(force=True)
 
     def renew(self,force=False):
@@ -331,6 +402,12 @@ def read_config(path):
     return value
 
 
+def write_json(path, value):
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+        json.dump(value, output, indent=2)
+        output.write("\n")
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",choices=["copy","restore","list"])
@@ -341,6 +418,7 @@ def main():
     parser.add_argument("--max-source-gib",type=int,default=128)
     parser.add_argument("--max-destination-gib",type=int,default=512)
     parser.add_argument("--metadata-output")
+    parser.add_argument("--snapshot-manifest-output", type=pathlib.Path)
     parser.add_argument("--keep-catalogs",type=int,default=7)
     args=parser.parse_args()
     try:
@@ -352,10 +430,16 @@ def main():
             raise RuntimeError("source and disaster recovery store must be independent")
         if args.command=="restore":
             if not args.catalog:raise RuntimeError("select a committed backup catalog")
-            result=restore_generation(source,destination,args.catalog,key)
+            outputs = [pathlib.Path(p) for p in (args.metadata_output, args.snapshot_manifest_output) if p]
+            if len({p.resolve() for p in outputs}) != len(outputs) or any(p.exists() or p.is_symlink() for p in outputs):
+                raise RuntimeError("restore output files must use distinct unused paths")
+            result = restore_generation(source, destination, args.catalog, key,
+                                        snapshot_namespace=NS if args.snapshot_manifest_output else None)
+            manifest = result.pop("snapshot_manifest", None)
             if args.metadata_output:
-                with os.fdopen(os.open(args.metadata_output,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"w") as output:
-                    json.dump(result,output,indent=2)
+                write_json(args.metadata_output, result)
+            if args.snapshot_manifest_output:
+                write_json(args.snapshot_manifest_output, manifest)
             print(json.dumps({"restored":True,"objects_verified":True,"backups":len(result.get("backups",[]))}))
         elif args.command=="list":
             print(json.dumps({"catalogs":[i["key"] for i in source.listing("catalogs/")]}))

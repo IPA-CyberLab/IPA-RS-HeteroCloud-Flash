@@ -88,7 +88,9 @@ The copier deduplicates blocks by SHA-256, verifies new and reused objects, and
 commits HMAC-authenticated catalogs only after all reads succeed. A Kubernetes
 lease prevents overlapping exports. Per-backup locks delay deletion while an
 export reads immutable ready backups. Catalogs include CSI snapshot metadata, not
-Pod environment values. Keep seven catalogs by default, preserving active restore
+Pod environment values. The operator export covers the managed backup bucket.
+Backups sent to organization-specific buckets use those destinations' recovery
+procedures. Keep seven catalogs by default, preserving active restore
 leases; unreferenced blocks are removed only after a two-day grace period.
 Limits default to 40 GiB of source objects and 512 GiB of destination objects.
 The independent bucket must also have a provider-enforced spending/storage cap
@@ -107,15 +109,21 @@ python3 -B /usr/local/lib/flash-ops/offsite.py restore \
   --destination-config /protected/replacement.json \
   --signing-key-file /protected/catalog.key \
   --catalog catalogs/SELECTED.json \
-  --metadata-output /protected/recovered-csi-metadata.json
+  --metadata-output /protected/recovered-csi-metadata.json \
+  --snapshot-manifest-output /protected/recovered-snapshots.json
 ```
 
 It refuses a nonempty destination, checks the authenticated catalog and all block
 hashes, verifies copied objects and holds a renewable source lease against
-retention. Configure the replacement Longhorn backup target and recreate/import
-the recovered CSI catalog under the platform's disaster-recovery procedure.
-This restores backup-store data; it does not replace control-plane PostgreSQL,
-IAM or Secret Manager backups. Test that wider recovery procedure separately.
+retention. The optional snapshot manifest validates ready Longhorn backup
+bindings before writing to the bucket and emits static CSI bindings with
+`Retain` after verification. It also ignores external destinations listed in
+older catalogs. Install the original snapshot class and set the replacement
+Longhorn backup target to the recovered bucket. Create the bindings on the
+replacement cluster with `kubectl create -f /protected/recovered-snapshots.json`
+and wait for the snapshots to report `readyToUse` before restoring disks into
+new PVCs. Restore PostgreSQL, tenant records and Secret Manager separately.
+[Longhorn CSI backup recovery](https://longhorn.io/docs/1.12.1/snapshots-and-backups/csi-snapshot-support/csi-volume-snapshot-associated-with-longhorn-backup/)
 
 ## Checks
 

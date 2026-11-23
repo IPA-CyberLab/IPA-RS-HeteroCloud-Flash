@@ -27,6 +27,64 @@ class MemoryS3:
 
 
 class OffsiteTests(unittest.TestCase):
+    def test_recovery_generates_static_bindings_for_only_managed_ready_backups(self):
+        namespace = o.NS
+        snapshot_class = "backup.longhorn"
+        handle = "bak://pvc-fixture/backup-a004e0"
+        default = {"metadata": {"name": "managed"}, "spec": {"snapshot_class": snapshot_class},
+                   "status": {"phase": "ready"}}
+        tenant = {"metadata": {"name": "tenant"}, "spec": {"destination_id": "external"},
+                  "status": {"phase": "ready"}}
+        deleting = copy.deepcopy(default)
+        deleting["metadata"].update(name="deleting", deletionTimestamp="2026-01-01T00:00:00Z")
+
+        class Kube:
+            def call(self, path):
+                self.path = path
+                return {"items": [default, tenant, deleting]}
+
+        lock = o.SourceLock(Kube())
+        lock.renew_lease = lambda: None
+        lock.renew = lambda **_: None
+        lock.acquire()
+        self.assertEqual(lock.backups, [default])
+
+        catalog_metadata = {
+            "backups": [default, tenant],  # Older catalogs included external destinations.
+            "snapshots": [{"metadata": {"name": "managed"},
+                           "spec": {"volumeSnapshotClassName": snapshot_class,
+                                    "source": {"persistentVolumeClaimName": "old-home"}},
+                           "status": {"readyToUse": True, "boundVolumeSnapshotContentName": "content"}}],
+            "snapshot_contents": [{"metadata": {"name": "content"},
+                                   "spec": {"volumeSnapshotClassName": snapshot_class,
+                                            "volumeSnapshotRef": {"name": "managed", "namespace": namespace,
+                                                                  "uid": "original-cluster-uid"},
+                                            "driver": "driver.longhorn.io", "deletionPolicy": "Delete",
+                                            "source": {"volumeHandle": "pvc-fixture"},
+                                            "sourceVolumeMode": "Filesystem"},
+                                   "status": {"readyToUse": True, "snapshotHandle": handle}}],
+        }
+        offsite = MemoryS3()
+        generation, _ = o.copy_generation(MemoryS3({"backup-object": b"fixture"}), offsite, KEY, catalog_metadata)
+        target = MemoryS3()
+        result = o.restore_generation(offsite, target, generation, KEY, snapshot_namespace=namespace)
+        self.assertEqual(target.objects, {"backup-object": b"fixture"})
+        content, snapshot = result["snapshot_manifest"]["items"]
+        self.assertEqual(content["kind"], "VolumeSnapshotContent")
+        self.assertEqual(content["spec"]["volumeSnapshotRef"], {"name": "managed", "namespace": namespace})
+        self.assertEqual(content["spec"]["deletionPolicy"], "Retain")
+        self.assertEqual(content["spec"]["source"], {"snapshotHandle": handle})
+        self.assertEqual(snapshot["kind"], "VolumeSnapshot")
+        self.assertEqual(snapshot["spec"]["source"], {"volumeSnapshotContentName": "content"})
+        self.assertNotIn("status", snapshot)
+
+        catalog_metadata["snapshot_contents"][0]["status"]["snapshotHandle"] = "snap://pvc-fixture/local"
+        generation, _ = o.copy_generation(MemoryS3({"backup-object": b"fixture"}), offsite, KEY, catalog_metadata)
+        target = MemoryS3()
+        with self.assertRaisesRegex(RuntimeError, "ready Longhorn"):
+            o.restore_generation(offsite, target, generation, KEY, snapshot_namespace=namespace)
+        self.assertEqual(target.objects, {})
+
     def test_s3_prefix_and_temporary_credentials_are_scoped_and_signed(self):
         class Response:
             def __init__(self, url, body): self.url, self.body = url, body
