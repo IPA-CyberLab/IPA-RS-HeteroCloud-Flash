@@ -494,7 +494,9 @@ class Guard:
                 "desired_storage_replicas": replicas, "degraded_storage": allowed and len(selected) < replicas}
 
     def evaluate(self, kind, obj, identity, dry_run=False, replaces=None, replicas=None):
-        with bounded_lock(self.lock):
+        # Read-only previews must never hold the admission writer lock while
+        # estimating rollout capacity or waiting for a storage lookup.
+        with contextlib.nullcontext() if dry_run else bounded_lock(self.lock):
             nodes, pods, summaries = self.snapshot()
             for _ in range(8):
                 path, ledger, records = self.ledger(pods, summaries)

@@ -298,6 +298,7 @@ class ReservationTests(unittest.TestCase):
         server = c.BoundedServer(("127.0.0.1", 0), c.handler(guard))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        guard.lock.acquire()
         try:
             for replicas, allowed, reason in [(1, True, None), (2, False, "insufficient_compute_capacity"), (1, True, None)]:
                 request = urllib.request.Request(
@@ -308,6 +309,7 @@ class ReservationTests(unittest.TestCase):
                 with urllib.request.urlopen(request, timeout=5) as response:
                     self.assertEqual(json.load(response), {"allowed": allowed, "reason": reason, "checked_replicas": replicas})
         finally:
+            guard.lock.release()
             server.shutdown(); server.server_close(); thread.join(timeout=5)
         self.assertEqual(kube.value, before)
 

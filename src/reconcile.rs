@@ -321,9 +321,14 @@ impl PlacementConfig {
                         reason: "image_exceeds_disk_budget",
                     });
                 }
-                Ok(Err(error)) if !error.allows_verified_cache() => {
+                Ok(Err(error)) if error.blocks_placement() => {
                     return Ok(PlacementVerdict::Blocked {
                         reason: "image_unavailable",
+                    });
+                }
+                Ok(Err(error)) if !error.allows_verified_cache() => {
+                    return Ok(PlacementVerdict::Unavailable {
+                        reason: "image_capacity_unknown",
                     });
                 }
                 _ => {

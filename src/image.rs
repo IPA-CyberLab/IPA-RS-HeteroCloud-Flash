@@ -215,6 +215,7 @@ pub enum ImageInspectionError {
         image: String,
         reason: String,
         allow_verified_cache: bool,
+        definite_placement_failure: bool,
     },
     #[error("OCI image index for `{image}` has no Linux manifest")]
     NoLinuxManifest { image: String },
@@ -244,10 +245,20 @@ impl ImageInspectionError {
             OciDistributionError::RequestError(error) => error.is_timeout() || error.is_connect(),
             _ => false,
         };
+        let definite_placement_failure = matches!(
+            &error,
+            OciDistributionError::ServerError {
+                code: 401 | 403 | 404,
+                ..
+            } | OciDistributionError::UnauthorizedError { .. }
+                | OciDistributionError::AuthenticationFailure(_)
+                | OciDistributionError::ManifestParsingError(_)
+        );
         Self::Registry {
             image: image.to_owned(),
             reason: error.to_string(),
             allow_verified_cache,
+            definite_placement_failure,
         }
     }
 
@@ -264,6 +275,17 @@ impl ImageInspectionError {
     #[must_use]
     pub const fn retryable(&self) -> bool {
         matches!(self, Self::Registry { .. })
+    }
+
+    #[must_use]
+    pub const fn blocks_placement(&self) -> bool {
+        !matches!(
+            self,
+            Self::Registry {
+                definite_placement_failure: false,
+                ..
+            }
+        )
     }
 }
 
@@ -284,6 +306,16 @@ mod tests {
             };
             assert!(ImageInspectionError::registry("image", error).allows_verified_cache());
         }
+        let busy = ImageInspectionError::registry(
+            "image",
+            OciDistributionError::ServerError {
+                code: 429,
+                url: "https://registry.example.test/v2/".into(),
+                message: "rate limited".into(),
+            },
+        );
+        assert!(!busy.blocks_placement());
+        assert!(!busy.allows_verified_cache());
         for error in [
             OciDistributionError::ServerError {
                 code: 404,
@@ -296,7 +328,9 @@ mod tests {
             OciDistributionError::AuthenticationFailure("denied".into()),
             OciDistributionError::ManifestParsingError("invalid manifest".into()),
         ] {
-            assert!(!ImageInspectionError::registry("image", error).allows_verified_cache());
+            let failure = ImageInspectionError::registry("image", error);
+            assert!(!failure.allows_verified_cache());
+            assert!(failure.blocks_placement());
         }
         assert!(!ImageInspectionError::InvalidImageConfig.allows_verified_cache());
     }
