@@ -205,7 +205,7 @@ class HTTPTests(unittest.TestCase):
         count = [0]
 
         class Guard:
-            def evaluate(self, *_):
+            def evaluate(self, *_, **__):
                 with lock:
                     count[0] += 1
                     if count[0] == 16:

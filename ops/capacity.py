@@ -493,10 +493,10 @@ class Guard:
                 "storage_nodes": selected, "delta": delta,
                 "desired_storage_replicas": replicas, "degraded_storage": allowed and len(selected) < replicas}
 
-    def evaluate(self, kind, obj, identity, dry_run=False, replaces=None, replicas=None):
+    def evaluate(self, kind, obj, identity, dry_run=False, replaces=None, replicas=None, *, preview=False):
         # Read-only previews must never hold the admission writer lock while
         # estimating rollout capacity or waiting for a storage lookup.
-        with contextlib.nullcontext() if dry_run else bounded_lock(self.lock):
+        with contextlib.nullcontext() if dry_run and preview else bounded_lock(self.lock):
             nodes, pods, summaries = self.snapshot()
             for _ in range(8):
                 path, ledger, records = self.ledger(pods, summaries)
@@ -639,7 +639,8 @@ def handler(guard):
                     replicas = value.get("replicas")
                     if replicas is not None and value["kind"] != "Pod":
                         raise ValueError("invalid replica preview kind")
-                    result = guard.evaluate(value["kind"], value["object"], "preflight", True, replacing, replicas)
+                    result = guard.evaluate(value["kind"], value["object"], "preflight", True, replacing, replicas,
+                                            preview=True)
                     # Physical node names and reservations are platform-private.
                     reply = {"allowed": result["allowed"], "reason": result.get("reason")}
                     if replicas is not None:
