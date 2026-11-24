@@ -34,7 +34,7 @@ use heterocloud_flash::{
     },
     domain::FlashSpec,
     gpu_scheduler::{gpu_device_available, validate_gpu_inventory_models, visible_gpu_catalog},
-    reconcile::{projected_weekly_usage, utc_week_start},
+    reconcile::{PlacementConfig, PlacementVerdict, projected_weekly_usage, utc_week_start},
     workload_runtime_class,
 };
 use k8s_openapi::api::core::v1::{Pod, Secret};
@@ -103,6 +103,8 @@ struct AppState {
     draining: Arc<AtomicBool>,
     public_domain: Option<String>,
     backup_snapshot_class: String,
+    placement: Option<PlacementConfig>,
+    placement_slots: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -154,6 +156,10 @@ async fn run() -> Result<()> {
             .ok()
             .filter(|s| !s.is_empty()),
         backup_snapshot_class: env::var("FLASH_BACKUP_SNAPSHOT_CLASS").unwrap_or_default(),
+        placement: env::var_os("FLASH_CAPACITY_ENDPOINT")
+            .map(|_| PlacementConfig::from_env())
+            .transpose()?,
+        placement_slots: Arc::new(Semaphore::new(4)),
     });
     let app = app_router(Arc::clone(&state));
     let listener = TcpListener::bind(&bind_addr)
@@ -216,6 +222,10 @@ fn app_router(state: Arc<AppState>) -> Router {
         .route(
             "/internal/v1/service-instances/{service_instance_id}",
             put(reconcile).delete(remove).get(get_status),
+        )
+        .route(
+            "/internal/v1/service-instances/{service_instance_id}/preflight",
+            post(placement_preflight),
         )
         .route(
             "/internal/v1/service-instances/{service_instance_id}/load-balancer/secrets/{name}",
@@ -739,6 +749,86 @@ struct ReconcileRequest {
     quota_user_id: Option<Uuid>,
     #[serde(default)]
     quota_only: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlacementRequest {
+    name: String,
+    spec: FlashSpec,
+    existing: bool,
+}
+
+async fn placement_preflight(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(request): Json<PlacementRequest>,
+) -> Result<Json<PlacementVerdict>, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, "flash.placement.check")?;
+    validate_command(&claims, id, claims.generation)?;
+    if id.is_nil()
+        || claims.organization_id.is_nil()
+        || claims.project_id.is_nil()
+        || claims.generation < 1
+        || (!request.existing && claims.generation != 1)
+    {
+        return Err(ApiError::Forbidden);
+    }
+    validate_display_name(&request.name)?;
+    request
+        .spec
+        .validate()
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    let Some(placement) = &state.placement else {
+        return Ok(Json(PlacementVerdict::unavailable()));
+    };
+    let Ok(_slot) = state.placement_slots.try_acquire() else {
+        return Ok(Json(PlacementVerdict::unavailable()));
+    };
+    let result = time::timeout(Duration::from_secs(18), async {
+        let name = resource_name(id);
+        let existing = state.services.get_opt(&name).await?;
+        if let Some(service) = &existing {
+            if !request.existing
+                || service.spec.organization_id != claims.organization_id.to_string()
+                || service.spec.service_instance_id != id.to_string()
+            {
+                return Err(ApiError::Forbidden);
+            }
+            if service.spec.desired_generation > claims.generation
+                || service.metadata.deletion_timestamp.is_some()
+            {
+                return Ok(PlacementVerdict::unavailable());
+            }
+        }
+        let flash = FlashService::new(
+            &name,
+            FlashServiceSpec {
+                desired_generation: claims.generation,
+                display_name: request.name,
+                organization_id: claims.organization_id.to_string(),
+                project_id: claims.project_id.to_string(),
+                service_instance_id: id.to_string(),
+                subject_id: requester_user_id(&claims),
+                quota_user_id: None,
+                policy: FlashServicePolicy::default(),
+                workload: request.spec,
+            },
+        );
+        Ok(placement
+            .preview(&state.client, &state.namespace, &flash, existing.as_ref())
+            .await
+            .unwrap_or_else(|_| PlacementVerdict::unavailable()))
+    })
+    .await;
+    Ok(Json(match result {
+        Ok(Ok(verdict)) => verdict,
+        Ok(Err(ApiError::Forbidden)) => return Err(ApiError::Forbidden),
+        Ok(Err(_)) | Err(_) => PlacementVerdict::unavailable(),
+    }))
 }
 
 fn quota_only_patch(
@@ -2210,6 +2300,8 @@ mod tests {
         let app = super::app_router(Arc::new(super::AppState {
             public_domain: Some("flash.example.org".into()),
             backup_snapshot_class: String::new(),
+            placement: None,
+            placement_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             client: client.clone(),
             namespace: "test".into(),
             services: Api::namespaced(client.clone(), "test"),
@@ -2616,6 +2708,8 @@ mod tests {
         let app = super::app_router(Arc::new(super::AppState {
             public_domain: Some("flash.example.org".into()),
             backup_snapshot_class: String::new(),
+            placement: None,
+            placement_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             client: client.clone(),
             namespace: "test".into(),
             services: Api::namespaced(client.clone(), "test"),

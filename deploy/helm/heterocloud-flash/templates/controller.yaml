@@ -34,30 +34,17 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/flash-controller"]
           env:
-            - name: FLASH_ZONE_SPREAD
-              value: {{ .Values.controller.zoneSpread | quote }}
-            - name: FLASH_NETWORK_SPREAD
-              value: {{ .Values.controller.networkSpread | quote }}
+            {{- include "flash.placement.env" . | nindent 12 }}
             - name: FLASH_BACKUP_DESTINATIONS_ENABLED
               value: {{ .Values.backups.destinations.enabled | quote }}
-            {{- if .Values.capacity.enabled }}
-            - name: FLASH_CAPACITY_ENDPOINT
-              value: {{ printf "https://%s-capacity.%s.svc/" (include "flash.fullname" .) .Release.Namespace | quote }}
-            - name: FLASH_CAPACITY_CA_FILE
-              value: /capacity-ca/ca.crt
-            {{- end }}
             - name: FLASH_BACKUP_STORAGE_NAMESPACE
               value: {{ .Values.backups.storageNamespace | quote }}
             - name: FLASH_BACKUP_SNAPSHOT_CLASS
               value: {{ .Values.backups.snapshotClass | quote }}
-            - name: FLASH_WORKLOAD_IDENTITY_ENDPOINT
-              value: {{ .Values.workloadIdentity.endpoint | quote }}
             - name: FLASH_PUBLIC_DOMAIN
               value: {{ .Values.publicDomain | quote }}
             - name: FLASH_WORKLOAD_NAMESPACE
               value: {{ .Values.workloadNamespace | quote }}
-            - name: FLASH_HELPER_IMAGE
-              value: {{ default (include "flash.image" .) .Values.workloadHelperImage | quote }}
             - name: FLASH_ACTIVATOR_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: FLASH_ACTIVATOR_SERVICE
@@ -72,61 +59,18 @@ spec:
               value: {{ .Values.networkPolicy.vpcGuardCidrs | toJson | quote }}
             - name: FLASH_SECRET_MANAGER_CIDRS_JSON
               value: {{ .Values.networkPolicy.secretManagerCidrs | toJson | quote }}
-            {{- if .Values.persistence.enabled }}
-            - name: FLASH_PERSISTENT_STORAGE_CLASS
-              value: {{ required "persistence.storageClass is required" .Values.persistence.storageClass | quote }}
-            {{- end }}
-            {{- if .Values.adminVolumeMounts }}
-            - name: FLASH_ADMIN_VOLUME_MOUNTS_JSON
-              value: {{ .Values.adminVolumeMounts | toJson | quote }}
-            {{- end }}
-            {{- if .Values.registry.enabled }}
-            - name: FLASH_REGISTRY_HOST
-              value: {{ required "registry.host is required" .Values.registry.host | quote }}
-            - name: FLASH_REGISTRY_USERNAME
-              value: {{ required "registry.username is required" .Values.registry.username | quote }}
-            - name: FLASH_REGISTRY_PASSWORD_FILE
-              value: /var/run/secrets/registry/password
-            - name: FLASH_REGISTRY_PULL_SECRET
-              value: {{ required "registry.workloadPullSecretName is required" .Values.registry.workloadPullSecretName | quote }}
-            {{- end }}
           {{- if or .Values.registry.enabled .Values.capacity.enabled }}
           volumeMounts:
-            {{- if .Values.capacity.enabled }}
-            - name: capacity-ca
-              mountPath: /capacity-ca
-              readOnly: true
-            {{- end }}
-            {{- if .Values.registry.enabled }}
-            - name: registry-auth
-              mountPath: /var/run/secrets/registry
-              readOnly: true
+            {{- include "flash.placement.mounts" . | nindent 12 }}
           {{- end }}
-            {{- end }}
           securityContext:
             {{- include "flash.containerSecurityContext" . | nindent 12 }}
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
       {{- if or .Values.registry.enabled .Values.capacity.enabled }}
       volumes:
-        {{- if .Values.capacity.enabled }}
-        - name: capacity-ca
-          secret:
-            secretName: {{ include "flash.fullname" . }}-capacity-tls
-            items:
-              - key: ca.crt
-                path: ca.crt
-        {{- end }}
-        {{- if .Values.registry.enabled }}
-        - name: registry-auth
-          secret:
-            secretName: {{ required "registry.authSecretName is required" .Values.registry.authSecretName }}
-            defaultMode: 0440
-            items:
-              - key: {{ required "registry.passwordKey is required" .Values.registry.passwordKey }}
-                path: password
+        {{- include "flash.placement.volumes" . | nindent 8 }}
       {{- end }}
-        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

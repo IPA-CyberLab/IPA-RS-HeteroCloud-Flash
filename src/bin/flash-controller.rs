@@ -1,10 +1,8 @@
-use std::{collections::BTreeSet, env, fs, process::ExitCode};
+use std::{collections::BTreeSet, env, process::ExitCode};
 
 use anyhow::{Context, Result};
-use heterocloud_flash::image::ImageInspector;
 use heterocloud_flash::reconcile::{
-    AdminVolumeMounts, ControllerConfig, ZoneSpreadMode, run_controller,
-    validate_admin_volume_mounts, validate_public_domain,
+    ControllerConfig, PlacementConfig, run_controller, validate_public_domain,
 };
 use ipnet::IpNet;
 use tracing_subscriber::EnvFilter;
@@ -30,68 +28,17 @@ async fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let namespace =
         env::var("FLASH_WORKLOAD_NAMESPACE").context("FLASH_WORKLOAD_NAMESPACE is required")?;
-    let helper_image = env::var("FLASH_HELPER_IMAGE").context("FLASH_HELPER_IMAGE is required")?;
-    let registry_host = optional("FLASH_REGISTRY_HOST");
-    let registry_username = optional("FLASH_REGISTRY_USERNAME");
-    let registry_password_file = optional("FLASH_REGISTRY_PASSWORD_FILE");
-    let registry_pull_secret = optional("FLASH_REGISTRY_PULL_SECRET");
-    let persistent_storage_class = optional("FLASH_PERSISTENT_STORAGE_CLASS");
+    let placement = PlacementConfig::from_env()?;
     let public_domain = optional("FLASH_PUBLIC_DOMAIN");
     if let Some(domain) = &public_domain {
         validate_public_domain(domain)?;
     }
-    if let Some(endpoint) = optional("FLASH_WORKLOAD_IDENTITY_ENDPOINT") {
-        let url = url::Url::parse(&endpoint).context("invalid workload identity endpoint")?;
-        anyhow::ensure!(
-            url.scheme() == "https"
-                && url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none(),
-            "workload identity endpoint must be HTTPS without credentials/query/fragment"
-        );
-    }
-    let admin_volume_mounts = optional("FLASH_ADMIN_VOLUME_MOUNTS_JSON")
-        .map(|value| serde_json::from_str::<AdminVolumeMounts>(&value))
-        .transpose()
-        .context("FLASH_ADMIN_VOLUME_MOUNTS_JSON is invalid")?
-        .unwrap_or_default();
-    validate_admin_volume_mounts(&admin_volume_mounts)?;
     let additional_protected_networks = network_cidrs("FLASH_ADDITIONAL_PROTECTED_CIDRS_JSON")?;
     let dns_networks = network_cidrs("FLASH_DNS_CIDRS_JSON")?;
     let secret_manager_networks = network_cidrs("FLASH_SECRET_MANAGER_CIDRS_JSON")?;
     if dns_networks.is_empty() {
         anyhow::bail!("FLASH_DNS_CIDRS_JSON must contain at least one DNS service address");
     }
-    let configured = [
-        registry_host.is_some(),
-        registry_username.is_some(),
-        registry_password_file.is_some(),
-        registry_pull_secret.is_some(),
-    ];
-    if configured.iter().any(|value| *value) && !configured.iter().all(|value| *value) {
-        anyhow::bail!(
-            "FLASH_REGISTRY_HOST, FLASH_REGISTRY_USERNAME, FLASH_REGISTRY_PASSWORD_FILE and FLASH_REGISTRY_PULL_SECRET must be configured together"
-        );
-    }
-    let image_inspector = match (registry_host, registry_username, registry_password_file) {
-        (Some(host), Some(username), Some(password_file)) => {
-            if host.contains('/') || host.chars().any(char::is_whitespace) {
-                anyhow::bail!("FLASH_REGISTRY_HOST must be a registry host without a URL scheme");
-            }
-            let password = fs::read_to_string(&password_file)
-                .with_context(|| format!("read registry password from {password_file}"))?
-                .trim_end_matches(['\r', '\n'])
-                .to_owned();
-            if username.is_empty() || password.is_empty() {
-                anyhow::bail!("registry username and password must not be empty");
-            }
-            ImageInspector::with_basic_auth(host, username, password)
-        }
-        (None, None, None) => ImageInspector::new(),
-        _ => unreachable!("registry configuration completeness was checked"),
-    };
     let client = kube::Client::try_default()
         .await
         .context("create Kubernetes client")?;
@@ -123,30 +70,17 @@ async fn run() -> Result<()> {
     }
     run_controller(
         client,
-        image_inspector,
         ControllerConfig {
-            capacity: heterocloud_flash::capacity::CapacityClient::from_env()?,
+            placement,
             namespace,
-            helper_image,
-            registry_pull_secret,
-            persistent_storage_class,
-            admin_volume_mounts,
             additional_protected_networks,
             dns_networks,
             secret_manager_networks,
             vpc_guard_networks: network_cidrs("FLASH_VPC_GUARD_CIDRS_JSON")?,
             public_domain,
-            workload_identity_endpoint: optional("FLASH_WORKLOAD_IDENTITY_ENDPOINT"),
             activator_namespace,
             activator_service,
             activator_port,
-            zone_spread: ZoneSpreadMode::parse(
-                &optional("FLASH_ZONE_SPREAD").unwrap_or_else(|| "preferred".into()),
-            )?,
-            network_spread: ZoneSpreadMode::parse_named(
-                &optional("FLASH_NETWORK_SPREAD").unwrap_or_else(|| "preferred".into()),
-                "FLASH_NETWORK_SPREAD",
-            )?,
         },
     )
     .await

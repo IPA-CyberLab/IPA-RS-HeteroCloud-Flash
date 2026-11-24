@@ -38,6 +38,9 @@ spec:
             - name: http
               containerPort: {{ .Values.api.port }}
           env:
+            {{- if .Values.capacity.enabled }}
+            {{- include "flash.placement.env" . | nindent 12 }}
+            {{- end }}
             - name: FLASH_BACKUP_DESTINATIONS_ENABLED
               value: {{ .Values.backups.destinations.enabled | quote }}
             {{- if .Values.backups.destinations.enabled }}
@@ -85,14 +88,23 @@ spec:
             {{- include "flash.containerSecurityContext" . | nindent 12 }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
-          {{- if .Values.backups.destinations.enabled }}
+          {{- if or .Values.backups.destinations.enabled .Values.capacity.enabled }}
           volumeMounts:
+            {{- if .Values.capacity.enabled }}
+            {{- include "flash.placement.mounts" . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.backups.destinations.enabled }}
             - name: backup-s3-proxy-key
               mountPath: /var/run/flash-backup-s3-proxy
               readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if .Values.backups.destinations.enabled }}
+      {{- if or .Values.backups.destinations.enabled .Values.capacity.enabled }}
       volumes:
+        {{- if .Values.capacity.enabled }}
+        {{- include "flash.placement.volumes" . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.backups.destinations.enabled }}
         - name: backup-s3-proxy-key
           secret:
             secretName: {{ .Values.backups.destinations.proxySecret | quote }}
@@ -100,6 +112,7 @@ spec:
             items:
               - key: {{ .Values.backups.destinations.proxySecretKey | quote }}
                 path: hmac-key
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

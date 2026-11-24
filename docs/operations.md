@@ -53,6 +53,17 @@ Existing thin-provisioned volumes can still grow, caches can expand, and host
 system processes can consume space. Continue monitoring host and Longhorn free
 space; this guard does not guarantee capacity under every future write pattern.
 
+## Placement preview
+
+With `capacity.enabled`, the authenticated provider API exposes a placement
+preview that builds the same workload template as reconciliation. New or resized
+home disks are checked against the Longhorn replica policy. Each requested
+initial replica is accounted for in a temporary scheduling model. Rolling
+updates also check if one new replica fits alongside the running revision.
+The response contains a verdict and a reason code. Host names, device IDs and
+reservations stay inside the provider. The preview performs read-only checks
+and leaves the admission ledger untouched.
+
 ## Disposable restore verification
 
 Set `backups.snapshotClass`, `backups.verification.enabled` and optionally

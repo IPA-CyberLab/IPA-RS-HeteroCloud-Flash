@@ -289,6 +289,44 @@ class FakeKube:
 
 
 class ReservationTests(unittest.TestCase):
+    def test_http_preview_checks_every_replica_without_reservation_or_node_disclosure(self):
+        kube = FakeKube()
+        before = copy.deepcopy(kube.value)
+        workload = pod()
+        workload["spec"]["containers"][0]["resources"]["requests"]["cpu"] = "9"
+        guard = c.Guard(kube, POLICY)
+        server = c.BoundedServer(("127.0.0.1", 0), c.handler(guard))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for replicas, allowed, reason in [(1, True, None), (2, False, "insufficient_compute_capacity"), (1, True, None)]:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/preflight",
+                    data=json.dumps({"kind": "Pod", "object": workload, "replicas": replicas}).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(json.load(response), {"allowed": allowed, "reason": reason, "checked_replicas": replicas})
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=5)
+        self.assertEqual(kube.value, before)
+
+    def test_placement_preview_respects_required_network_domains(self):
+        workload = pod()
+        domain = "heteronetwork.io/network-domain"
+        workload["spec"]["topologySpreadConstraints"] = [{
+            "topologyKey": domain, "whenUnsatisfiable": "DoNotSchedule", "minDomains": 2,
+            "maxSkew": 1, "labelSelector": {"matchLabels": workload["metadata"]["labels"]},
+        }]
+        first, second = node("worker-a"), node("worker-b")
+        summaries = {"worker-a": summary(), "worker-b": summary()}
+        first["metadata"]["labels"][domain] = "shared"
+        second["metadata"]["labels"][domain] = "shared"
+        self.assertEqual(c.preview_replicas(workload, [first, second], summaries, [], {}, POLICY, c.GIB, 2)["reason"],
+                         "insufficient_topology_capacity")
+        second["metadata"]["labels"][domain] = "independent"
+        self.assertTrue(c.preview_replicas(workload, [first, second], summaries, [], {}, POLICY, c.GIB, 2)["allowed"])
+
     def test_recreate_preflight_releases_accounted_running_pod_without_a_ledger_write(self):
         old = pod()
         old['metadata'].update(uid='old-pod', annotations={c.RESERVATION: 'old-reservation'})

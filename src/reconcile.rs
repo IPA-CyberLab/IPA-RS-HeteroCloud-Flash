@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env, fs,
     sync::Arc,
     time::Duration,
 };
@@ -35,13 +36,14 @@ use uuid::Uuid;
 use crate::{
     GPU_READY_LABEL, GPU_RESOURCE_NAME, LOAD_BALANCER_CLASS, TRAFFIC_MODE_ANNOTATION,
     crd::{
-        FlashEndpoint, FlashGpuAssignment, FlashGpuJob, FlashGpuJobPhase, FlashGpuJobSpec,
-        FlashGpuSchedulingStatus, FlashGpuWeeklyUsage, FlashService, FlashServicePhase,
-        FlashServiceStatus, FlashUsageRecord, FlashUsageRecordSpec, FlashWeeklyUsage,
+        FlashEndpoint, FlashGpuAssignment, FlashGpuDevice, FlashGpuHealth, FlashGpuJob,
+        FlashGpuJobPhase, FlashGpuJobSpec, FlashGpuSchedulingStatus, FlashGpuWeeklyUsage,
+        FlashService, FlashServicePhase, FlashServiceStatus, FlashUsageRecord,
+        FlashUsageRecordSpec, FlashWeeklyUsage,
     },
     domain::{EndpointMode, ExposureType, TrafficMode, ValidationError},
-    gpu_scheduler::run_gpu_scheduler,
-    image::{GIB_BYTES, ImageInspection, ImageInspector},
+    gpu_scheduler::{device_visible_to, gpu_device_available, run_gpu_scheduler},
+    image::{GIB_BYTES, ImageInspection, ImageInspectionError, ImageInspector},
     lb_auth::{self, SecurityPolicy},
     web::{
         GATEWAY_NAME, GATEWAY_NAMESPACE, GATEWAY_SECTION, HTTPRoute, PROXY_NAMESPACE,
@@ -171,80 +173,392 @@ fn valid_admin_mount_path(value: &str) -> bool {
 }
 
 #[derive(Clone)]
-pub struct ControllerContext {
+pub struct PlacementConfig {
     capacity: Option<crate::capacity::CapacityClient>,
-    client: Client,
-    namespace: String,
     image_inspector: ImageInspector,
     helper_image: String,
     registry_pull_secret: Option<String>,
     persistent_storage_class: Option<String>,
     admin_volume_mounts: AdminVolumeMounts,
+    workload_identity_endpoint: Option<String>,
+    zone_spread: ZoneSpreadMode,
+    network_spread: ZoneSpreadMode,
+}
+
+impl PlacementConfig {
+    pub fn from_env() -> Result<Self> {
+        let optional = |name| {
+            env::var(name)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let helper_image =
+            env::var("FLASH_HELPER_IMAGE").context("FLASH_HELPER_IMAGE is required")?;
+        let registry_pull_secret = optional("FLASH_REGISTRY_PULL_SECRET");
+        let image_inspector = match (
+            optional("FLASH_REGISTRY_HOST"),
+            optional("FLASH_REGISTRY_USERNAME"),
+            optional("FLASH_REGISTRY_PASSWORD_FILE"),
+            &registry_pull_secret,
+        ) {
+            (Some(host), Some(username), Some(password_file), Some(_)) => {
+                anyhow::ensure!(
+                    !host.contains('/') && !host.chars().any(char::is_whitespace),
+                    "FLASH_REGISTRY_HOST must be a registry host without a URL scheme"
+                );
+                let password = fs::read_to_string(&password_file)
+                    .with_context(|| format!("read registry password from {password_file}"))?;
+                let password = password.trim_end_matches(['\r', '\n']);
+                anyhow::ensure!(!password.is_empty(), "registry password must not be empty");
+                ImageInspector::with_basic_auth(host, username, password.to_owned())
+            }
+            (None, None, None, None) => ImageInspector::new(),
+            _ => anyhow::bail!(
+                "registry host, credentials, and workload pull secret must be configured together"
+            ),
+        };
+        let admin_volume_mounts = optional("FLASH_ADMIN_VOLUME_MOUNTS_JSON")
+            .map(|value| serde_json::from_str::<AdminVolumeMounts>(&value))
+            .transpose()
+            .context("FLASH_ADMIN_VOLUME_MOUNTS_JSON is invalid")?
+            .unwrap_or_default();
+        validate_admin_volume_mounts(&admin_volume_mounts)?;
+        let workload_identity_endpoint = optional("FLASH_WORKLOAD_IDENTITY_ENDPOINT");
+        if let Some(endpoint) = &workload_identity_endpoint {
+            let url = url::Url::parse(endpoint).context("invalid workload identity endpoint")?;
+            anyhow::ensure!(
+                url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none(),
+                "workload identity endpoint must be HTTPS without credentials/query/fragment"
+            );
+        }
+        Ok(Self {
+            capacity: crate::capacity::CapacityClient::from_env()?,
+            image_inspector,
+            helper_image,
+            registry_pull_secret,
+            persistent_storage_class: optional("FLASH_PERSISTENT_STORAGE_CLASS"),
+            admin_volume_mounts,
+            workload_identity_endpoint,
+            zone_spread: ZoneSpreadMode::parse(
+                &optional("FLASH_ZONE_SPREAD").unwrap_or_else(|| "preferred".into()),
+            )?,
+            network_spread: ZoneSpreadMode::parse_named(
+                &optional("FLASH_NETWORK_SPREAD").unwrap_or_else(|| "preferred".into()),
+                "FLASH_NETWORK_SPREAD",
+            )?,
+        })
+    }
+
+    fn workload_deployment(
+        &self,
+        flash: &FlashService,
+        owner: &OwnerReference,
+        image: &ImageInspection,
+        rootfs_bytes: u64,
+        home_claim: Option<&str>,
+        gpu_assignment: Option<&FlashGpuAssignment>,
+    ) -> Result<Deployment, ReconcileError> {
+        desired_deployment(
+            flash,
+            owner,
+            &image.resolved_image,
+            rootfs_bytes,
+            DeploymentOptions {
+                image_entrypoint: &image.image_entrypoint,
+                image_cmd: &image.image_cmd,
+                image_architecture: Some(&image.architecture),
+                helper_image: Some(&self.helper_image),
+                persistent_volume_claim: home_claim,
+                registry_pull_secret: self.registry_pull_secret.as_deref(),
+                admin_volume_mounts: self
+                    .admin_volume_mounts
+                    .get(&flash.spec.service_instance_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                gpu_assignment,
+                workload_identity_endpoint: self.workload_identity_endpoint.as_deref(),
+                zone_spread: self.zone_spread,
+                network_spread: self.network_spread,
+            },
+        )
+    }
+
+    /// Estimate placement for the proposed workload using read-only API calls.
+    pub async fn preview(
+        &self,
+        client: &Client,
+        namespace: &str,
+        flash: &FlashService,
+        existing: Option<&FlashService>,
+    ) -> Result<PlacementVerdict> {
+        let Some(capacity) = &self.capacity else {
+            return Ok(PlacementVerdict::unavailable());
+        };
+        let name = flash.name_any();
+        let workload = &flash.spec.workload;
+        let budget = u64::from(workload.ephemeral_storage_gib) * GIB_BYTES;
+        let services = Api::namespaced(client.clone(), namespace);
+        let image = if let Some(image) =
+            existing.and_then(|old| verified_image_from_peer(flash, old, budget))
+        {
+            image
+        } else {
+            match tokio::time::timeout(
+                Duration::from_secs(8),
+                self.image_inspector.inspect(&workload.image, budget),
+            )
+            .await
+            {
+                Ok(Ok(image)) => image,
+                Ok(Err(ImageInspectionError::DiskLimitExceeded { .. })) => {
+                    return Ok(PlacementVerdict::Blocked {
+                        reason: "image_exceeds_disk_budget",
+                    });
+                }
+                Ok(Err(error)) if !error.allows_verified_cache() => {
+                    return Ok(PlacementVerdict::Blocked {
+                        reason: "image_unavailable",
+                    });
+                }
+                _ => {
+                    let Some(image) =
+                        verified_peer_image_inspection(&services, flash, budget).await?
+                    else {
+                        return Ok(PlacementVerdict::Unavailable {
+                            reason: "image_capacity_unknown",
+                        });
+                    };
+                    image
+                }
+            }
+        };
+        let claims = Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace);
+        let existing_storage = if self.persistent_storage_class.is_some() && existing.is_some() {
+            claims
+                .get_opt(&format!("{name}-home"))
+                .await?
+                .as_ref()
+                .map(claim_storage)
+                .transpose()?
+        } else {
+            None
+        };
+        let stateless = workload
+            .deployment
+            .as_ref()
+            .is_some_and(|policy| policy.stateless);
+        let home_class = self
+            .persistent_storage_class
+            .as_deref()
+            .filter(|_| !stateless || existing_storage.is_some());
+        let storage = match storage_allocation_retaining(
+            image.writable_storage_bytes,
+            home_class.is_some(),
+            workload.rootfs_storage_gib,
+            workload.persistent_storage_gib,
+            existing_storage.map_or(0, |(requested, _)| requested),
+        ) {
+            Ok(storage) => storage,
+            Err(ReconcileError::PersistentStorageCannotShrink) => {
+                return Ok(PlacementVerdict::Blocked {
+                    reason: "persistent_disk_cannot_shrink",
+                });
+            }
+            Err(ReconcileError::PersistentStorageUnavailable) => {
+                return Ok(PlacementVerdict::Blocked {
+                    reason: "persistent_storage_unavailable",
+                });
+            }
+            Err(_) => {
+                return Ok(PlacementVerdict::Blocked {
+                    reason: "invalid_disk_layout",
+                });
+            }
+        };
+        // Used only to construct the same manifests the controller would use.
+        let owner = OwnerReference {
+            api_version: "flash.heterocloud.io/v1alpha1".into(),
+            kind: "FlashService".into(),
+            name: name.clone(),
+            uid: flash.spec.service_instance_id.clone(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let claim = home_class
+            .map(|class| {
+                desired_persistent_volume_claim(flash, &owner, class, storage.persistent_bytes)
+            })
+            .transpose()?;
+        if let Some(claim) = &claim
+            && claim_needs_storage_update(existing_storage, storage.persistent_bytes)
+            && let Some(code) = capacity
+                .check("PersistentVolumeClaim", serde_json::to_value(claim)?, false)
+                .await?
+        {
+            return Ok(PlacementVerdict::from_capacity(&code));
+        }
+        let deployment = match self.workload_deployment(
+            flash,
+            &owner,
+            &image,
+            storage.rootfs_bytes,
+            claim
+                .as_ref()
+                .filter(|_| !stateless)
+                .and_then(|claim| claim.metadata.name.as_deref()),
+            None,
+        ) {
+            Ok(deployment) => deployment,
+            Err(_) => {
+                return Ok(PlacementVerdict::Blocked {
+                    reason: "invalid_deployment",
+                });
+            }
+        };
+        let deployment = deployment.spec.context("missing workload template")?;
+        let recreate = deployment
+            .strategy
+            .as_ref()
+            .and_then(|strategy| strategy.type_.as_deref())
+            == Some("Recreate");
+        let mut template = serde_json::to_value(deployment.template)?;
+        template["metadata"]["annotations"]["flash.heterocloud.io/image-size-bytes"] =
+            json!(image.image_size_bytes.to_string());
+        if workload.effective_gpu_count() > 0 {
+            let devices = Api::<FlashGpuDevice>::all(client.clone())
+                .list(&ListParams::default())
+                .await?;
+            let now = Utc::now().timestamp();
+            let nodes = devices
+                .items
+                .iter()
+                .filter(|device| {
+                    device_visible_to(device, flash.spec.subject_id.as_deref().unwrap_or_default())
+                        && workload
+                            .gpu_type
+                            .as_ref()
+                            .is_none_or(|requested| requested == &device.spec.gpu_type)
+                        && (gpu_device_available(device, now)
+                            || device.status.as_ref().is_some_and(|status| {
+                                status.health == FlashGpuHealth::Healthy
+                                    && status.reservation.as_ref().is_some_and(|reservation| {
+                                        reservation.service_instance_id
+                                            == flash.spec.service_instance_id
+                                            && reservation.lease_expires_at > now
+                                    })
+                            }))
+                })
+                .map(|device| &device.spec.node_name)
+                .collect::<BTreeSet<_>>();
+            if nodes.is_empty() {
+                return Ok(PlacementVerdict::Blocked {
+                    reason: "gpu_unavailable",
+                });
+            }
+            template["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"] = json!({
+                "nodeSelectorTerms": [{"matchExpressions": [{"key":"kubernetes.io/hostname","operator":"In","values":nodes}]}]
+            });
+        }
+        if existing.is_some() && !recreate {
+            let deployments = Api::<Deployment>::namespaced(client.clone(), namespace);
+            let has_running_revision = deployments
+                .get_opt(&name)
+                .await?
+                .and_then(|deployment| deployment.spec)
+                .is_some_and(|spec| spec.replicas.unwrap_or(1) > 0);
+            if has_running_revision
+                && let Some(code) = capacity.check_replicas(template.clone(), false, 1).await?
+            {
+                return Ok(PlacementVerdict::from_capacity(&code));
+            }
+        }
+        Ok(
+            match capacity
+                .check_replicas(template, existing.is_some(), workload.replicas)
+                .await?
+            {
+                Some(code) => PlacementVerdict::from_capacity(&code),
+                None => PlacementVerdict::Feasible,
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PlacementVerdict {
+    Feasible,
+    Blocked { reason: &'static str },
+    Unavailable { reason: &'static str },
+}
+
+impl PlacementVerdict {
+    pub fn unavailable() -> Self {
+        Self::Unavailable {
+            reason: "capacity_metrics_unavailable",
+        }
+    }
+
+    fn from_capacity(code: &str) -> Self {
+        let reason = match code {
+            "insufficient_compute_capacity" => "insufficient_compute_capacity",
+            "insufficient_pod_capacity" => "insufficient_pod_capacity",
+            "insufficient_disk_capacity" => "insufficient_disk_capacity",
+            "insufficient_inodes" => "insufficient_inodes",
+            "insufficient_replicated_storage" => "insufficient_replicated_storage",
+            "insufficient_topology_capacity" => "insufficient_topology_capacity",
+            "no_eligible_node" => "no_eligible_node",
+            "storage_replica_policy_unavailable" => {
+                return Self::Unavailable {
+                    reason: "storage_replica_policy_unavailable",
+                };
+            }
+            "image_capacity_unknown" => {
+                return Self::Unavailable {
+                    reason: "image_capacity_unknown",
+                };
+            }
+            _ => return Self::unavailable(),
+        };
+        Self::Blocked { reason }
+    }
+}
+
+#[derive(Clone)]
+pub struct ControllerContext {
+    client: Client,
+    placement: PlacementConfig,
+    namespace: String,
     additional_protected_networks: Vec<IpNet>,
     dns_networks: Vec<IpNet>,
     secret_manager_networks: Vec<IpNet>,
     vpc_guard_networks: Vec<IpNet>,
     public_domain: Option<String>,
-    workload_identity_endpoint: Option<String>,
     activator_namespace: String,
     activator_service: String,
     activator_port: u16,
-    zone_spread: ZoneSpreadMode,
-    network_spread: ZoneSpreadMode,
 }
 
 pub struct ControllerConfig {
-    pub capacity: Option<crate::capacity::CapacityClient>,
+    pub placement: PlacementConfig,
     pub namespace: String,
-    pub helper_image: String,
-    pub registry_pull_secret: Option<String>,
-    pub persistent_storage_class: Option<String>,
-    pub admin_volume_mounts: AdminVolumeMounts,
     pub additional_protected_networks: Vec<IpNet>,
     pub dns_networks: Vec<IpNet>,
     pub secret_manager_networks: Vec<IpNet>,
     pub vpc_guard_networks: Vec<IpNet>,
     pub public_domain: Option<String>,
-    pub workload_identity_endpoint: Option<String>,
     pub activator_namespace: String,
     pub activator_service: String,
     pub activator_port: u16,
-    pub zone_spread: ZoneSpreadMode,
-    pub network_spread: ZoneSpreadMode,
 }
 
-impl ControllerContext {
-    #[must_use]
-    pub fn new(client: Client, image_inspector: ImageInspector, config: ControllerConfig) -> Self {
-        Self {
-            capacity: config.capacity,
-            client,
-            image_inspector,
-            helper_image: config.helper_image,
-            namespace: config.namespace,
-            registry_pull_secret: config.registry_pull_secret,
-            persistent_storage_class: config.persistent_storage_class,
-            admin_volume_mounts: config.admin_volume_mounts,
-            additional_protected_networks: config.additional_protected_networks,
-            dns_networks: config.dns_networks,
-            secret_manager_networks: config.secret_manager_networks,
-            vpc_guard_networks: config.vpc_guard_networks,
-            public_domain: config.public_domain,
-            workload_identity_endpoint: config.workload_identity_endpoint,
-            activator_namespace: config.activator_namespace,
-            activator_service: config.activator_service,
-            activator_port: config.activator_port,
-            zone_spread: config.zone_spread,
-            network_spread: config.network_spread,
-        }
-    }
-}
-
-pub async fn run_controller(
-    client: Client,
-    image_inspector: ImageInspector,
-    config: ControllerConfig,
-) -> Result<()> {
+pub async fn run_controller(client: Client, config: ControllerConfig) -> Result<()> {
     let namespace = config.namespace.clone();
     let services = Api::<FlashService>::namespaced(client.clone(), &namespace);
     let gpu_jobs = Api::<FlashGpuJob>::namespaced(client.clone(), &namespace);
@@ -261,7 +575,19 @@ pub async fn run_controller(
     let oidc_secrets = Api::<Secret>::namespaced(client.clone(), &namespace);
     let domains =
         Api::<crate::custom_domains::FlashDomain>::namespaced(client.clone(), &config.namespace);
-    let context = Arc::new(ControllerContext::new(client, image_inspector, config));
+    let context = Arc::new(ControllerContext {
+        client,
+        placement: config.placement,
+        namespace: config.namespace,
+        additional_protected_networks: config.additional_protected_networks,
+        dns_networks: config.dns_networks,
+        secret_manager_networks: config.secret_manager_networks,
+        vpc_guard_networks: config.vpc_guard_networks,
+        public_domain: config.public_domain,
+        activator_namespace: config.activator_namespace,
+        activator_service: config.activator_service,
+        activator_port: config.activator_port,
+    });
 
     info!("FlashService controller started");
     let scheduler_client = context.client.clone();
@@ -863,6 +1189,7 @@ async fn reconcile(
     // only remove the HPA and drain replicas before releasing the GPU lease.
     if flash.spec.workload.restore_from_backup_id.is_some() {
         let storage_class = context
+            .placement
             .persistent_storage_class
             .as_deref()
             .ok_or(ReconcileError::PersistentStorageUnavailable)?;
@@ -1036,6 +1363,7 @@ async fn reconcile(
             tokio::time::timeout(
                 Duration::from_secs(30),
                 context
+                    .placement
                     .image_inspector
                     .inspect(&flash.spec.workload.image, disk_budget_bytes),
             )
@@ -1095,7 +1423,7 @@ async fn reconcile(
 
     let persistent_volume_claims =
         Api::<PersistentVolumeClaim>::namespaced(context.client.clone(), &context.namespace);
-    let existing_claim = if context.persistent_storage_class.is_some() {
+    let existing_claim = if context.placement.persistent_storage_class.is_some() {
         persistent_volume_claims
             .get_opt(&format!("{name}-home"))
             .await?
@@ -1109,8 +1437,8 @@ async fn reconcile(
         .deployment
         .as_ref()
         .is_some_and(|p| p.stateless);
-    let allocate_home =
-        context.persistent_storage_class.is_some() && (!stateless || existing_claim.is_some());
+    let allocate_home = context.placement.persistent_storage_class.is_some()
+        && (!stateless || existing_claim.is_some());
     let storage = match storage_allocation_retaining(
         inspection.writable_storage_bytes,
         allocate_home,
@@ -1142,6 +1470,7 @@ async fn reconcile(
         }
     };
     let persistent_volume_claim = context
+        .placement
         .persistent_storage_class
         .as_deref()
         .filter(|_| allocate_home)
@@ -1149,31 +1478,16 @@ async fn reconcile(
             desired_persistent_volume_claim(&flash, &owner, storage_class, storage.persistent_bytes)
         })
         .transpose()?;
-    let mut deployment = desired_deployment(
+    let mut deployment = context.placement.workload_deployment(
         &flash,
         &owner,
-        &inspection.resolved_image,
+        &inspection,
         storage.rootfs_bytes,
-        DeploymentOptions {
-            image_entrypoint: &inspection.image_entrypoint,
-            image_cmd: &inspection.image_cmd,
-            image_architecture: Some(&inspection.architecture),
-            helper_image: Some(&context.helper_image),
-            persistent_volume_claim: persistent_volume_claim
-                .as_ref()
-                .filter(|_| !stateless)
-                .and_then(|claim| claim.metadata.name.as_deref()),
-            registry_pull_secret: context.registry_pull_secret.as_deref(),
-            admin_volume_mounts: context
-                .admin_volume_mounts
-                .get(&flash.spec.service_instance_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            gpu_assignment,
-            workload_identity_endpoint: context.workload_identity_endpoint.as_deref(),
-            zone_spread: context.zone_spread,
-            network_spread: context.network_spread,
-        },
+        persistent_volume_claim
+            .as_ref()
+            .filter(|_| !stateless)
+            .and_then(|claim| claim.metadata.name.as_deref()),
+        gpu_assignment,
     )?;
     let deployments = Api::<Deployment>::namespaced(context.client.clone(), &context.namespace);
     let current_deployment = deployments.get_opt(&name).await?;
@@ -1197,7 +1511,7 @@ async fn reconcile(
     } else if let Some(current) = &current_deployment {
         preserve_legacy_probe_fields(current, &mut deployment);
     }
-    if let Some(capacity) = &context.capacity {
+    if let Some(capacity) = &context.placement.capacity {
         let mut shortage = None;
         if let Some(claim) = &persistent_volume_claim
             && claim_needs_storage_update(existing_storage, storage.persistent_bytes)
@@ -1704,7 +2018,7 @@ async fn observe_allocation(
     let (cpu, memory, gpu) = running_allocation(&pods)?;
     let serving =
         u32::try_from(pods.iter().filter(|p| pod_is_ready(p)).count()).unwrap_or(u32::MAX);
-    let disk = if let Some(capacity) = &context.capacity {
+    let disk = if let Some(capacity) = &context.placement.capacity {
         capacity.disk_usage(&flash.spec.service_instance_id).await
     } else {
         None

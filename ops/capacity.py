@@ -130,7 +130,8 @@ def requests(pod):
 def matches_node(pod, node):
     spec, meta = pod.get("spec", {}), node["metadata"]
     labels = meta.get("labels", {})
-    if labels.get("heteronetwork.io/control-plane-only") == "true":
+    if (labels.get("heteronetwork.io/control-plane-only") == "true"
+            or labels.get("heteronetwork.io/lifecycle") == "stopped"):
         return False
     if node.get("spec", {}).get("unschedulable"):
         return False
@@ -264,6 +265,59 @@ def select_node(pod, nodes, summaries, pods, reservations, now, policy, image_by
             "cached_image_only": image_bytes is None,
             "disk_bytes": int(need.get("ephemeral-storage", 0)) + peak,
             "requests": {k: str(v) for k, v in need.items()}}
+
+
+def spread_candidates(pod, nodes, bound):
+    eligible = [node for node in nodes if matches_node(pod, node)]
+    candidates = eligible
+    for constraint in pod["spec"].get("topologySpreadConstraints", []):
+        if constraint["whenUnsatisfiable"] != "DoNotSchedule":
+            continue
+        key = constraint["topologyKey"]
+        by_node = {node["metadata"]["name"]: node["metadata"].get("labels", {}).get(key)
+                   for node in eligible}
+        counts = {domain: 0 for domain in by_node.values() if domain is not None}
+        if not counts:
+            return []
+        selector = constraint["labelSelector"]["matchLabels"]
+        for existing in bound:
+            domain = by_node.get(existing.get("spec", {}).get("nodeName"))
+            labels = existing.get("metadata", {}).get("labels", {})
+            if (domain is not None and alive(existing)
+                    and all(labels.get(k) == value for k, value in selector.items())):
+                counts[domain] += 1
+        minimum = min(counts.values()) if len(counts) >= constraint.get("minDomains", 1) else 0
+        candidates = [node for node in candidates
+                      if (domain := by_node[node["metadata"]["name"]]) is not None
+                      and counts[domain] + 1 - minimum <= constraint["maxSkew"]]
+    return candidates
+
+
+def preview_replicas(pod, nodes, summaries, pods, reservations, policy, image_bytes, replicas):
+    """Account for each proposed replica within this request's snapshot only."""
+    if type(replicas) is not int or not 1 <= replicas <= 100_000 or image_bytes is None:
+        raise ValueError("invalid replica preview")
+    if replicas > sum(int(node.get("status", {}).get("allocatable", {}).get("pods", 0)) for node in nodes):
+        return {"allowed": False, "reason": "insufficient_pod_capacity"}
+    bound, ledger = list(pods), dict(reservations)
+    now, deadline = time.time(), time.monotonic() + 3
+    for index in range(replicas):
+        if time.monotonic() >= deadline:
+            raise Unavailable("capacity_preview_deadline")
+        candidates = spread_candidates(pod, nodes, bound)
+        result = select_node(pod, candidates, summaries, bound, ledger, now, policy, image_bytes)
+        if not result["allowed"]:
+            if result["reason"] == "no_eligible_node" and any(matches_node(pod, node) for node in nodes):
+                return {"allowed": False, "reason": "insufficient_topology_capacity"}
+            return result
+        # Use a simulated bound Pod and ledger entry so subsequent replicas see
+        # both the writable-disk commitment and the pending image pull peak.
+        identity = f"preview-{index}"
+        bound.append({"metadata": {"uid": identity, "labels": pod["metadata"].get("labels", {}),
+                                   "annotations": {RESERVATION: identity}},
+                      "spec": {**pod["spec"], "nodeName": result["node"]}})
+        ledger[identity] = dict(result, id=identity, kind="Pod")
+    return {"allowed": True}
 
 
 class Kube:
@@ -439,7 +493,7 @@ class Guard:
                 "storage_nodes": selected, "delta": delta,
                 "desired_storage_replicas": replicas, "degraded_storage": allowed and len(selected) < replicas}
 
-    def evaluate(self, kind, obj, identity, dry_run=False, replaces=None):
+    def evaluate(self, kind, obj, identity, dry_run=False, replaces=None, replicas=None):
         with bounded_lock(self.lock):
             nodes, pods, summaries = self.snapshot()
             for _ in range(8):
@@ -463,6 +517,13 @@ class Guard:
                     if image_bytes is not None and not 0 < int(image_bytes) < 1024**5:
                         return {"allowed": False, "reason": "image_capacity_unknown"}
                     candidates = [p for p in pods if not (dry_run and replaces and p.get("metadata", {}).get("labels", {}).get(INSTANCE) == replaces)]
+                    if dry_run and replicas is not None:
+                        if replaces:
+                            replaced = {p.get("metadata", {}).get("annotations", {}).get(RESERVATION)
+                                        for p in pods if p.get("metadata", {}).get("labels", {}).get(INSTANCE) == replaces}
+                            records = {key: value for key, value in records.items() if key not in replaced}
+                        return preview_replicas(obj, nodes, summaries, candidates, records, self.policy,
+                                                None if image_bytes is None else int(image_bytes), replicas)
                     result = select_node(obj, nodes, summaries, candidates, records, time.time(), self.policy, None if image_bytes is None else int(image_bytes))
                 if not result["allowed"] or dry_run:
                     return result
@@ -573,9 +634,15 @@ def handler(guard):
                     self.send(200, admission(guard, value))
                 elif route == "/preflight":
                     replacing = value["object"].get("metadata", {}).get("labels", {}).get(INSTANCE) if value.get("recreate") else None
-                    result = guard.evaluate(value["kind"], value["object"], "preflight", True, replacing)
+                    replicas = value.get("replicas")
+                    if replicas is not None and value["kind"] != "Pod":
+                        raise ValueError("invalid replica preview kind")
+                    result = guard.evaluate(value["kind"], value["object"], "preflight", True, replacing, replicas)
                     # Physical node names and reservations are platform-private.
-                    self.send(200, {"allowed": result["allowed"], "reason": result.get("reason")})
+                    reply = {"allowed": result["allowed"], "reason": result.get("reason")}
+                    if replicas is not None:
+                        reply["checked_replicas"] = replicas
+                    self.send(200, reply)
                 elif route == "/usage":
                     sid = str(uuid.UUID(value["service_instance_id"]))
                     _, _, summaries = guard.usage_snapshot()
